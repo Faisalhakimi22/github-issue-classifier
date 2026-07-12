@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Collected/derived data — reproducible from collect.py + a token, so not versioned.
+# Keep the directory structure via .gitkeep but ignore contents.
+data/raw/*
+data/processed/*
+data/logs/*
+data/*.log
+data/predictions.jsonl
+!data/**/.gitkeep
+
+# Model artifacts (30MB joblib pipelines — rebuild with `python -m ghic.train`,
+# or attach to a GitHub Release). The auto-generated model card IS tracked.
+# reports/ is tracked too: the README links to the report and its figures.
+models/*
+!models/MODEL_CARD.md
+
+# Local-only archive of course/personal files, not part of the published project
+_archive/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/

@@ -1,0 +1,148 @@
+# config.yaml
+# Single source of truth for collection, labeling, and feature toggles.
+# Read by src/config.py; do not import directly elsewhere.
+
+project:
+  name: github-issue-classifier
+  random_seed: 42
+
+# ---------------------------------------------------------------------------
+# GitHub data collection (src/collect.py)
+# ---------------------------------------------------------------------------
+collection:
+  api: graphql                    # GraphQL only — REST timeline is too costly per issue
+  page_size: 50                   # issues per GraphQL search page (max 100, but 50 keeps point cost low)
+  rate_limit_floor: 100           # sleep until reset when remaining < this
+  backoff_max_attempts: 5
+  backoff_base_seconds: 1.0
+  date_window_months: 3           # slice search by created:YYYY-MM-DD..YYYY-MM-DD windows to stay under search's 1000-result cap
+  cache_dir: data/raw             # content-addressed by SHA256(query + variables)
+  max_runtime_minutes: 90         # collect.py aborts cleanly past this; resume from cache on next run
+
+# 12-month windows per repo (decision 2026-05-24): keep the lab dataset tight,
+# faster end-to-end iteration. Widen later if model is data-starved.
+repos:
+  - owner: microsoft
+    name: vscode
+    created_after: "2024-01-01"
+    created_before: "2024-12-31"
+  - owner: facebook
+    name: react
+    created_after: "2024-01-01"
+    created_before: "2024-12-31"
+  - owner: tensorflow
+    name: tensorflow
+    created_after: "2024-01-01"
+    created_before: "2024-12-31"
+
+# ---------------------------------------------------------------------------
+# Labeling (src/label.py)
+# ---------------------------------------------------------------------------
+labeling:
+  # Bot logins are excluded from the dataset entirely (audit rule: drop_bot).
+  bot_logins:
+    - "dependabot[bot]"
+    - "renovate[bot]"
+    - "github-actions[bot]"
+    - "stale[bot]"
+    - "codecov[bot]"
+    - "greenkeeper[bot]"
+    - "mergify[bot]"
+
+  # Class 1 trigger when paired with state_reason == COMPLETED (Rule 2).
+  bug_labels:
+    - "bug"
+    - "defect"
+    - "regression"
+    - "type:bug"
+    - "type: bug"
+    - "kind/bug"
+    - "bug report"
+
+  # Class 0 trigger (Rule 3).
+  non_actionable_labels:
+    - "duplicate"
+    - "invalid"
+    - "wontfix"
+    - "won't fix"
+    - "not-a-bug"
+    - "not a bug"
+    - "cannot reproduce"
+    - "cannot-reproduce"
+    - "stale"
+    - "no-repro"
+    - "needs-info"
+    - "needs more info"
+
+  # Question-labeled issues are DROPPED, not mapped to Class 0.
+  # Rationale: support requests are a different population than the bug/non-bug
+  # binary target. Drop count is reported in the labeling audit.
+  question_labels:
+    - "question"
+    - "support"
+    - "type:support"
+    - "type: support"
+    - "discussion"
+    - "kind/support"
+  drop_question_labeled_issues: true
+
+  # Drop locked issues from the dataset.
+  # DISABLED 2026-05-29 after the labeling audit: microsoft/vscode auto-locks
+  # ~91% of its closed issues as routine hygiene (react 0.8%, tensorflow 1.6%).
+  # With this on, drop_locked removed 3752/6175 issues — 61% of the dataset —
+  # almost entirely from one repo, which would bias the model toward learning
+  # the repo rather than issue quality. "locked" is noise here, not signal.
+  drop_locked_issues: false
+
+  # Rule 1b: applied to merged-PR bodies surfaced via CROSS_REFERENCED_EVENT
+  # in the same GraphQL query (no separate scrape). `{issue_number}` is
+  # substituted per issue at label time.
+  # Matches: Fix/Fixes/Fixed, Close/Closes/Closed, Resolve/Resolves/Resolved
+  # followed by whitespace and #<issue_number>. Case-insensitive.
+  pr_fix_issue_regex_template: '(?i)\b(fix(es|ed)?|close[sd]?|resolve[sd]?)\s+#{issue_number}\b'
+
+# ---------------------------------------------------------------------------
+# Feature engineering (src/features.py) — V1 feature set
+# ---------------------------------------------------------------------------
+# DELIBERATELY ABSENT from V1:
+#   - number_of_labels_at_open: dropped as leakage. Production sees zero labels
+#     at inference time, so any non-zero training value is a signal absent
+#     from real traffic.
+features:
+  text:
+    enabled: true
+    tfidf_max_features: 5000
+    tfidf_ngram_range: [1, 2]
+    # char_wb 3-5 grams: capture stack-trace/version/identifier shapes that
+    # word tokens miss. Used by the v2 (champion) model zoo.
+    tfidf_char_ngrams: true
+    tfidf_char_max_features: 3000
+    title_body_length: true
+    code_block_presence: true
+    link_and_image_presence: true
+    repro_keywords:
+      - "steps to reproduce"
+      - "expected"
+      - "actual"
+      - "error"
+      - "traceback"
+      - "stack trace"
+
+  author:
+    enabled: true
+    # Note: account_age_days / public_repos / followers are CURRENT API snapshots,
+    # not point-in-time at issue open. Documented limitation.
+    account_age_days: true
+    public_repos: true
+    followers: true
+    first_time_contributor_to_repo: true   # computed chronologically from this dataset
+
+  temporal:
+    enabled: true
+    day_of_week_utc: true
+    hour_of_day_utc: true
+    days_since_last_release: true
+
+  structural:
+    enabled: true
+    opened_via_template_heuristic: true    # presence of template headers in body

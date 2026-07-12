@@ -1,0 +1,128 @@
+{
+  "winner": "rf_balanced",
+  "cv": {
+    "logreg_balanced": {
+      "fold_pr_aucs": [
+        0.6891156900519007,
+        0.7025774514998934,
+        0.7387593156218005
+      ],
+      "mean_pr_auc": 0.7101508190578648,
+      "std_pr_auc": 0.020962495272226944
+    },
+    "rf_balanced": {
+      "fold_pr_aucs": [
+        0.7711848375226945,
+        0.7766983334540246,
+        0.7529215242225044
+      ],
+      "mean_pr_auc": 0.7669348983997412,
+      "std_pr_auc": 0.010161386100318987
+    },
+    "svd_hgb": {
+      "fold_pr_aucs": [
+        0.7125438031234741,
+        0.721625877607136,
+        0.742592985591403
+      ],
+      "mean_pr_auc": 0.7255875554406711,
+      "std_pr_auc": 0.012583309320690454
+    },
+    "ensemble": {
+      "fold_pr_aucs": [
+        0.7561557850996582,
+        0.7661983725853468,
+        0.752357128978478
+      ],
+      "mean_pr_auc": 0.7582370955544944,
+      "std_pr_auc": 0.005839172090472523
+    }
+  },
+  "test_uncalibrated": {
+    "n": 1177,
+    "positives": 261,
+    "threshold": 0.5,
+    "precision": 0.8160919540229885,
+    "recall": 0.5440613026819924,
+    "f1": 0.6528735632183909,
+    "roc_auc": 0.8870798407201057,
+    "pr_auc": 0.7592350650911608,
+    "accuracy": 0.8717077315208156,
+    "tn": 884,
+    "fp": 32,
+    "fn": 119,
+    "tp": 142,
+    "brier": 0.10078425375247804
+  },
+  "test_calibrated": {
+    "n": 1177,
+    "positives": 261,
+    "threshold": 0.5,
+    "precision": 0.7978723404255319,
+    "recall": 0.5747126436781609,
+    "f1": 0.6681514476614699,
+    "roc_auc": 0.8811173016112033,
+    "pr_auc": 0.7171679835782717,
+    "accuracy": 0.8734069668649108,
+    "tn": 878,
+    "fp": 38,
+    "fn": 111,
+    "tp": 150,
+    "brier": 0.10368711464692669
+  },
+  "per_repo": {
+    "facebook/react": {
+      "n": 129,
+      "positives": 23,
+      "threshold": 0.5,
+      "precision": 0.72,
+      "recall": 0.782608695652174,
+      "f1": 0.75,
+      "roc_auc": 0.8935602953240361,
+      "pr_auc": 0.6630680896111084,
+      "accuracy": 0.9069767441860465,
+      "tn": 99,
+      "fp": 7,
+      "fn": 5,
+      "tp": 18,
+      "brier": 0.08971102747160056
+    },
+    "microsoft/vscode": {
+      "n": 820,
+      "positives": 125,
+      "threshold": 0.5,
+      "precision": 0.72,
+      "recall": 0.288,
+      "f1": 0.4114285714285714,
+      "roc_auc": 0.8327539568345323,
+      "pr_auc": 0.4516447524454543,
+      "accuracy": 0.874390243902439,
+      "tn": 681,
+      "fp": 14,
+      "fn": 89,
+      "tp": 36,
+      "brier": 0.10437777545003812
+    },
+    "tensorflow/tensorflow": {
+      "n": 228,
+      "positives": 113,
+      "threshold": 0.5,
+      "precision": 0.8495575221238938,
+      "recall": 0.8495575221238938,
+      "f1": 0.8495575221238938,
+      "roc_auc": 0.9290496344747978,
+      "pr_auc": 0.920010764173236,
+      "accuracy": 0.8508771929824561,
+      "tn": 98,
+      "fp": 17,
+      "fn": 17,
+      "tp": 96,
+      "brier": 0.10911068213405693
+    }
+  },
+  "protocol": {
+    "selection": "walk-forward CV (3 expanding folds) by mean PR-AUC, training window only",
+    "calibration": "isotonic on the newest 15% of train (older than all test issues)",
+    "test": "single evaluation on the untouched chronological test set"
+  }
+}
