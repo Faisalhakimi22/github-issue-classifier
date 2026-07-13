@@ -51,6 +51,7 @@ dev = [
 Repository = "https://github.com/Faisalhakimi22/github-issue-classifier"
 
 [project.scripts]
+ghic = "ghic.cli:main"
 ghic-collect = "ghic.collect:main"
 ghic-label = "ghic.label:main"
 ghic-train = "ghic.train:main"

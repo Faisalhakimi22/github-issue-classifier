@@ -102,7 +102,42 @@ service references one.
 
 ## Phase 17 — Priority / Severity / Effort — pending
 
-## Phase 18 — GitHub API Surface — pending
+## Phase 18 — GitHub API Surface (2026-07-14)
+
+- **`issues.edited`** — BUILT: re-scores with the edited text and updates
+  the pending ledger entry (so close-time grading judges the text
+  maintainers actually triaged). Never posts/labels on edit — one issue,
+  at most one comment. Surfaced as `rescored_after_edit` in `/stats`.
+- **Label events (`labeled`/`unlabeled`)** — BUILT: recorded to the ledger
+  (`type: "label_event"`), replayed on restart, counted in `/stats`. This
+  is deliberate data collection: category labels are early ground truth
+  for the category head, and timestamped duplicate labels are exactly the
+  pairwise signal `DUPLICATE_CARD.md` names as missing.
+- **Projects v2** — BUILT: `GHIC_PROJECT_ID` (board node ID) adds issues
+  predicted actionable to the board via the GraphQL mutation (v2 has no
+  REST API). Dry-run-respecting, audited like every write.
+- **Checks API — documented as inapplicable, not built.** A check run
+  requires a commit `head_sha`; it attaches to commits/PRs, not issues.
+  For an issues-only App the only way to "show a check" is to pin issue
+  predictions onto unrelated commits — misleading UX and permission scope
+  creep (checks:write). If the product ever scores PRs, this is the first
+  thing to build; for issues it is the wrong API, and building it anyway
+  to tick a checklist line is exactly what the ground rules prohibit.
+
+**Gate: PASSED** — a live test per event/API (edited re-score + pending
+update, label-event record + replay, project add on positive/dry-run/
+negative paths). 135 tests green. Committed.
+
+## Phase 19 — CLI (2026-07-14)
+
+`ghic` console entry (`ghic/cli.py`): `train` / `collect` / `label` /
+`benchmark` (→ the backtest replay) / `serve` pass through to the existing
+module CLIs; `predict` / `explain` score one issue end-to-end against the
+local model artifact; `dashboard` opens the running service's dashboard.
+No new logic — routing only. The `ghic-*` per-stage scripts remain.
+
+**Gate: PASSED** — subcommand tests incl. real end-to-end predict/explain
+against the trained champion (auto-skip when no artifact). Committed.
 
 ## Phase 19 — CLI — pending
 
