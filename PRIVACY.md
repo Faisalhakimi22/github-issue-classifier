@@ -8,14 +8,23 @@ close reason — plus, for enrichment, the author's public profile fields
 (account creation date, public repo count, follower count) and the repo's
 latest release date via the GitHub API.
 
-**What it stores:** one line per prediction in a local ledger
-(`data/predictions.jsonl`): repository name, issue number, predicted
-probability, and — when the issue closes — the rule-derived outcome. No issue
-text, no author data, and no tokens are ever persisted. Disable even this
-with `GHIC_LEDGER=""` (metrics then live in memory only).
+**What it stores:** an append-only local ledger (`data/predictions.jsonl`)
+with one line per event: predictions (repository name, issue number,
+predicted probability, timestamp), rule-derived outcomes at close, an audit
+record for each write the bot performs (action type + timestamp), and
+maintainer label events (label name + timestamp — these are future training
+ground truth). No issue text, no author data, and no tokens are ever
+persisted. Disable even this with `GHIC_LEDGER=""` (metrics then live in
+memory only).
 
-**What it sends:** only back to GitHub — an optional prediction comment
-and/or label on the scored issue. Nothing is transmitted to any third party.
+**What it sends:** back to GitHub — an optional prediction comment, label,
+and/or project placement on the scored issue. One optional exception: if the
+operator enables LLM drafting (`GHIC_DRAFT_MISSING_INFO=true` **and**
+configures `ANTHROPIC_API_KEY`), the title/body of under-specified issues
+and the titles of similar prior issues are sent to the Anthropic API to
+draft the "missing information" comment. This is off by default, and without
+an API key the feature uses a local template and transmits nothing. No other
+third-party transmission exists.
 
 **Data deletion:** delete the ledger file; there is nothing else to delete.
 Uninstalling the App stops all data flow immediately.

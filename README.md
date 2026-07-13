@@ -16,10 +16,13 @@ minute on it.
 issue opened ──▶ webhook (HMAC-verified) ──▶ enrich ──▶ featurize ──▶ score
                                                                         │
               P(actionable bug) = 0.87 ────────────────────────────────┤
+              suggested category: bug (assistive, never auto-applied) ─┤
               likely duplicates of prior issues (assistive) ───────────┤
+              coarse resolution-time bucket (API only) ────────────────┤
               "missing info" draft when under-specified (LLM, scoped) ─┤
                                                                         ▼
-                                              comment + label on the issue
+                                    comment · label · project (opt-in each)
+issue edited ──▶ re-scored on the improved text (never re-posted)
 issue closed ──▶ outcome derived from close labels ──▶ the bot grades its
                                                        own prediction, live
 ```
@@ -81,6 +84,9 @@ explicitly enables actions.
 | `GHIC_ENRICH` | `true` | fetch author profile + latest release |
 | `GHIC_LEDGER` | `data/predictions.jsonl` | online-evaluation ledger (`""` = in-memory) |
 | `GHIC_SUGGEST_RELATED` | `true` | surface likely-duplicate prior issues (needs `dup_index.joblib`) |
+| `GHIC_SUGGEST_CATEGORY` | `true` | assistive category suggestion (needs `category.joblib`) |
+| `GHIC_ESTIMATE_EFFORT` | `true` | coarse resolution-time bucket, API response only (needs `effort.joblib`) |
+| `GHIC_PROJECT_ID` | — | add predicted-actionable issues to a Projects v2 board |
 | `GHIC_DRAFT_MISSING_INFO` | `false` | LLM-drafted info request on vague issues (template without a key) |
 
 ## How the ground truth was built
@@ -175,6 +181,27 @@ score; the full negative result, mechanism, and the ground-truth work that
 would change it are in
 [models/DUPLICATE_CARD.md](models/DUPLICATE_CARD.md).
 
+**Category suggestion** (`ghic/category.py`): a second head predicts the
+category label a maintainer will eventually apply (bug / feature / question
+/ docs / duplicate / invalid) — real ground truth, 2,747 labeled issues,
+same walk-forward protocol. Test macro-F1 is a modest 0.470 (bug F1 0.69,
+per-class table and full confusion matrix in
+[models/CATEGORY_CARD.md](models/CATEGORY_CARD.md)), which is why it ships
+as an assistive suggestion in the comment and **never applies a label
+itself**. Priority and severity heads were deliberately *not* built — the
+corpus has zero ground truth for either, and the tempting keyword-proxy for
+severity is circular; the reasoning is recorded in
+[models/PRIORITY_CARD.md](models/PRIORITY_CARD.md) and
+[models/SEVERITY_CARD.md](models/SEVERITY_CARD.md).
+
+**Resolution-time estimate** (`ghic/effort.py`): time-to-close is a weak
+effort proxy, so the experiment ran against a pre-declared ship bar
+(Spearman ≥ 0.30 + ≥ 10% MAE improvement over a constant baseline) and only
+shipped because it cleared it — Spearman 0.492 on the chronological test.
+It surfaces as four coarse buckets in the API response only, never in the
+public comment: the validated claim is rank-informativeness, not a promise
+([models/EFFORT_CARD.md](models/EFFORT_CARD.md)).
+
 **Scoped LLM drafting** (`ghic/service/drafting.py`): when a deterministic,
 tested trigger says an issue is under-specified (no repro steps, no
 trace/code, near-empty body), Claude drafts the "could you add…" comment a
@@ -184,10 +211,16 @@ calibrated classifier — and everything degrades to a deterministic template
 without an API key. Off by default.
 
 **Operations**: structured request logs, per-endpoint latency percentiles
-and 5xx counts in `/stats`, a read-only `/dashboard`, an audit record for
-every GitHub write in the ledger, and the OpenAPI spec exported to
-[docs/openapi.json](docs/openapi.json) (`python -m ghic.service.app
---openapi`).
+and 5xx counts in `/stats`, a read-only `/dashboard` with six analytics
+facets computed from real ledger data (issue trends, duplicate rate,
+resolution analytics, confidence histogram, label stats, per-repo
+analytics), an audit record for every GitHub write in the ledger, maintainer
+label events recorded live as future ground truth, and the OpenAPI spec
+exported to [docs/openapi.json](docs/openapi.json) (`python -m
+ghic.service.app --openapi`). Retraining is one command
+(`python -m ghic.retrain`) that snapshots every run and appends to
+[models/REGISTRY.md](models/REGISTRY.md) with artifact hashes. All
+benchmark numbers live in one place: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 **Measured performance** (real load test, single worker —
 `reports/loadtest.json`): one prediction costs ~600 ms CPU; p95 is 626 ms at
@@ -229,18 +262,23 @@ ghic/
   evaluate.py    metrics incl. Brier, plots incl. reliability diagram, explanations
   demo.py        CLI walkthrough: metrics, worked examples, live scoring
   dupdetect.py   duplicate detection: index, query, honest evaluation
+  category.py    category head: train, card, serving (assistive suggestion)
+  effort.py      resolution-time head, gated by a pre-declared ship bar
+  assign.py      assignment recommender: collection + causal hit@k evaluation
+  retrain.py     one-command retraining + run snapshots + model registry
+  cli.py         the unified `ghic` CLI (train/predict/explain/benchmark/serve/…)
   service/
     app.py         FastAPI: /webhook, /healthz, /stats, /dashboard, /api/predict
-    github_app.py  App auth (JWT → installation token) + REST helpers
+    github_app.py  App auth (JWT → installation token) + REST/GraphQL helpers
     inference.py   single-issue prediction + top-feature explanations
-    tracking.py    the self-grading ledger + GitHub-write audit trail
+    tracking.py    the self-grading ledger + audit trail + dashboard analytics
     drafting.py    scoped LLM comment drafting (never the decision)
     settings.py    GHIC_* env config, safe-by-default
 scripts/         loadtest.py — real latency percentiles against a live instance
 notebook/        the pipeline as three narrative notebooks
-tests/           107 tests: labeling, features, collection, service, duplicates, drafting
-reports/         metrics, figures, backtest/champion/loadtest artifacts
-docs/            DEPLOYMENT.md · PRD.md (roadmap, design decisions) · openapi.json
+tests/           155 tests: labeling, features, collection, service, heads, CLI, analytics
+reports/         metrics, figures, backtest/champion/loadtest artifacts, runs/
+docs/            DEPLOYMENT.md · PRD.md · BENCHMARKS.md · openapi.json · assets/
 ```
 
 Rebuild everything from a bare clone and a GitHub token:
@@ -249,9 +287,9 @@ Rebuild everything from a bare clone and a GitHub token:
 pip install -e ".[dev]"
 cp .env.example .env                    # add a read-only PAT
 python -m ghic.collect                  # cached, resumable, budget-aware
-python -m ghic.label                    # prints the audit histogram
-python -m ghic.train --champion         # CV -> calibration -> model card
-python -m ghic.backtest                 # verify through the service path
+python -m ghic.retrain                  # label -> champion -> backtest ->
+                                        # category -> dup index; snapshots the
+                                        # run and appends models/REGISTRY.md
 ```
 
 ## Honest limitations

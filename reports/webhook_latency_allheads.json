@@ -1,0 +1,12 @@
+{
+  "source": "backtest replay of 1177 held-out issues through the real /webhook path (in-process TestClient, sequential), 2026-07-14",
+  "configuration": "champion + category + effort heads + duplicate index, dry-run (explanations off)",
+  "n": 1177,
+  "latency_ms": {
+    "mean": 357.0,
+    "p50": 300.0,
+    "p95": 682.8,
+    "p99": 988.4,
+    "max": 2366.5
+  }
+}

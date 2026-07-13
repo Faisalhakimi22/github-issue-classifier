@@ -5,8 +5,11 @@ App that anyone can install — and, optionally, a GitHub Marketplace listing.
 
 ## 1. Prerequisites
 
-- A trained model at `models/rf_balanced.joblib` (`python -m ghic.train`, or
-  copy one from a release artifact).
+- Trained model artifacts in `models/` — one `python -m ghic.retrain` run
+  produces all of them (`champion.joblib` + `rf_balanced.joblib` required;
+  `category.joblib`, `effort.joblib`, `dup_index.joblib` optional heads), or
+  copy them from a GitHub Release. They are gitignored, so publish them as
+  Release assets when you push the repo.
 - A host with a public HTTPS URL (any of: Fly.io, Render, Railway, a VPS
   behind a reverse proxy, or a tunnel like `smee.io` / `ngrok` for testing).
 
@@ -24,10 +27,14 @@ GitHub → Settings → Developer settings → **GitHub Apps** → *New GitHub A
 | **Subscribe to events** | Issues |
 
 **Why each permission** (Marketplace review asks): *Issues read* — receive
-`issues.opened`/`closed` events and read labels for the online-evaluation
-loop; *Issues write* — post the prediction comment and apply the triage
-label; *Metadata read* — GitHub's implicit baseline for any App. Nothing
-else is requested: no code, PR, or member access.
+`issues.opened`/`edited`/`closed` and label events, and read labels for the
+online-evaluation loop; *Issues write* — post the prediction comment and
+apply the triage label; *Metadata read* — GitHub's implicit baseline for
+any App. Nothing else is requested: no code, PR, or member access. One
+exception, opt-in: setting `GHIC_PROJECT_ID` (add triaged issues to a
+Projects v2 board) additionally requires Organization/Repository
+**Projects: Read & write** — leave it unset and the permission is not
+needed.
 | Where can it be installed? | Any account (required for Marketplace) |
 
 After creating the app:
@@ -91,19 +98,24 @@ Every `issues.opened` event from those repos now flows to your webhook.
 
 ## 5. (Optional) List on GitHub Marketplace
 
-Marketplace requirements ([docs](https://docs.github.com/en/apps/github-marketplace)):
+Marketplace requirements ([docs](https://docs.github.com/en/apps/github-marketplace)),
+checked against the actual repo state (2026-07-14):
 
-- [ ] The app is owned by an **organization** you own, or your personal account
-- [ ] It's installed on at least **1 account** other than your own... typically
-      GitHub asks for ~100 installations for paid plans; **free listings** have
-      a much lower bar
-- [ ] Webhook events are processed over HTTPS with a verified domain
-- [ ] The app has a logo, description, and at least one screenshot
-- [ ] Support and privacy-policy URLs (a `SUPPORT.md` + `PRIVACY.md` in the
-      repo work)
-- [ ] Customer data handling statement — this app stores **nothing**: each
-      webhook is scored in memory and only the prediction comment/label is
-      sent back to GitHub
+- [ ] The app is owned by an **organization** you own, or your personal
+      account — *blocked on deployment: the App isn't registered yet*
+- [ ] It's installed on at least **1 account** other than your own —
+      *blocked on deployment*
+- [ ] Webhook events are processed over HTTPS with a verified domain —
+      *blocked on deployment (host choice)*
+- [x] Logo — `docs/assets/logo.svg` (original artwork)
+- [x] Description / feature card — drafted in `docs/assets/listing.md`
+- [ ] At least one screenshot — *blocked on deployment; per
+      `docs/assets/listing.md` screenshots come from a real deployment,
+      never mockups*
+- [x] Support and privacy-policy URLs — `SUPPORT.md` + `PRIVACY.md`
+- [x] Customer data handling statement — `PRIVACY.md`; the service stores
+      predictions/outcomes in its own ledger (repo, issue number, score —
+      no issue text) and sends only the comment/label back to GitHub
 
 Then: App settings → *List in Marketplace* → draft the listing (category:
 **Project management** or **Utilities**), submit for review. Start with a
@@ -128,16 +140,29 @@ Then: App settings → *List in Marketplace* → draft the listing (category:
 - The webhook responds in well under GitHub's 10s limit (model inference is
   ~50ms; the two enrichment API calls dominate). If GitHub reports delivery
   timeouts, set `GHIC_ENRICH=false` — the pipeline imputes the missing fields.
-- Retrain periodically: issue-triage vocabulary drifts. Re-run the pipeline
-  (`collect` → `label` → `train --champion`) and swap the `.joblib` artifact.
+- Retrain periodically: issue-triage vocabulary drifts. One command:
+  `python -m ghic.retrain` (label → champion protocol → backtest →
+  category head → duplicate index). Each run snapshots its cards/metrics to
+  `reports/runs/<timestamp>/` and appends a row to `models/REGISTRY.md`, so
+  any deployed artifact traces back to the run that produced it (sha256).
+  Retraining is operator-triggered by design — the training data is not in
+  the repo, so CI can't do it; schedule it with cron on the box that holds
+  `data/` if you want it periodic.
 - Capacity: one prediction costs ~600 ms CPU; a single worker sustains
   ~1.7 predictions/s (measured — `reports/loadtest.json`), far above any
   single repo's issue rate. If you ever need more, run multiple workers or
   replicas — but move the ledger off JSONL first (see docs/PRD.md §9).
 - Optional features: `GHIC_SUGGEST_RELATED` surfaces likely-duplicate prior
-  issues (ship `models/dup_index.joblib`); `GHIC_DRAFT_MISSING_INFO=true` +
-  `ANTHROPIC_API_KEY` drafts a "missing information" request on
-  under-specified issues (template fallback without a key).
+  issues (ship `models/dup_index.joblib`); `GHIC_SUGGEST_CATEGORY` adds an
+  assistive category suggestion (ship `models/category.joblib`; never
+  auto-labeled); `GHIC_DRAFT_MISSING_INFO=true` + `ANTHROPIC_API_KEY`
+  drafts a "missing information" request on under-specified issues
+  (template fallback without a key); `GHIC_PROJECT_ID` files predicted-
+  actionable issues onto a Projects v2 board.
+- Edited issues are re-scored automatically (never re-commented), so a
+  report improved after the bot's nudge is graded on its improved text.
+  Maintainer label events are recorded to the ledger as future ground
+  truth (`label_events_observed` in `/stats`).
 
 ## Security posture
 

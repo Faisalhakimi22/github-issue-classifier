@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- GHIC logo: an issue dot being sorted into a triage funnel -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1f6feb"/>
+      <stop offset="1" stop-color="#0d419d"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="24" fill="url(#bg)"/>
+  <!-- funnel -->
+  <path d="M28 36 h72 l-26 30 v26 l-20 10 v-36 z"
+        fill="none" stroke="#ffffff" stroke-width="7"
+        stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- issue dot (GitHub open-issue glyph) above the funnel -->
+  <circle cx="64" cy="26" r="9" fill="none" stroke="#7ee787" stroke-width="6"/>
+  <circle cx="64" cy="26" r="2.6" fill="#7ee787"/>
+  <!-- sorted tick at the funnel mouth -->
+  <path d="M55 88 l7 7 l13 -14" fill="none" stroke="#7ee787"
+        stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

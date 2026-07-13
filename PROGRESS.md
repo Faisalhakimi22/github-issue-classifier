@@ -165,7 +165,63 @@ against the trained champion (auto-skip when no artifact). Committed.
 
 ## Phase 19 — CLI — pending
 
-## Phase 20 — MLOps — pending
+## Phase 20 — MLOps (2026-07-14)
+
+- **Retraining pipeline**: `python -m ghic.retrain` = label → champion
+  protocol → service-path backtest → category head → duplicate index →
+  snapshot → registry. Operator-triggered by design (training data is
+  deliberately not in the repo, so CI can't retrain); cron wrapper is a
+  deployment choice, documented in DEPLOYMENT.md.
+- **Versioning / experiment tracking**: per-run immutable snapshot in
+  `reports/runs/<utc-ts>/` (both cards + all metric JSONs) plus one row in
+  `models/REGISTRY.md` — run time, winner, headline metrics, artifact
+  sha256. The lightest tool that answers "what changed, when, what did it
+  score"; an experiment-tracking server at one model family and one
+  operator would be process for its own sake.
+- **The documented run** (the gate): run `2026-07-13T19-41-30Z`, executed
+  end-to-end (~2 h wall, of which ~1.5 h was one CV fold stalled by
+  machine throttling — pipeline recovered unaided). Produced a fresh
+  `models/MODEL_CARD.md`, registry row (`rf_balanced`, test PR-AUC 0.7172,
+  sha `5538c3115ba7`), and the snapshot dir. Metrics reproduced the
+  original run exactly — seeded determinism verified.
+
+**Gate: PASSED** — documented retraining run + new model card + registry
+entry + snapshot; registry/snapshot mechanics covered by tests.
+
+## Phase 22 — Docs, Benchmarks, Marketplace (2026-07-14)
+
+- **`docs/BENCHMARKS.md`**: every number from Phases 2, 15–17 and the load
+  tests in one place, each section naming the artifact that produced it;
+  negative results listed with equal prominence. Includes a new real
+  measurement: full-webhook-path latency with ALL heads enabled (p50
+  300 ms / p95 683 ms / p99 988 ms over the 1,177-issue replay) — and the
+  explanation of why that is *faster* than the explain-enabled API path.
+- **Architecture diagrams**: two mermaid diagrams in `docs/PRD.md` §2
+  (component flow + event sequence) reflecting the actual current
+  structure, tree updated with the new modules.
+- **Marketplace assets**: original logo (`docs/assets/logo.svg`), listing
+  copy / feature card (`docs/assets/listing.md` — claims cross-checked
+  against BENCHMARKS), checklist in DEPLOYMENT.md checked against real
+  repo state — logo/description/support/privacy ✅; registration,
+  installs, HTTPS domain, and screenshots explicitly *blocked on
+  deployment* (screenshots come from a real deployment, never mockups).
+- **Doc corrections found during the pass**: PRIVACY.md now discloses the
+  optional Anthropic transmission when LLM drafting is enabled (was
+  wrongly absolute before) and the ledger's action/label-event records;
+  Dockerfile ships the new heads (`.dockerignore`); README/PRD/DEPLOYMENT
+  updated for category/effort/edited/label-events/Projects/CLI/retrain.
+
+**Gate: PASSED** — docs render (plain GFM + mermaid), checklist fully
+checked or explicitly blocked-on-deployment. 155 tests, ruff clean.
+
+---
+
+## Post-plan status (2026-07-14)
+
+Phases 14–22 complete except the **Phase 16 live evaluation**, which is
+blocked on a fresh `GH_TOKEN` (the one in `.env` is revoked — verified
+401 on `/rate_limit`). To finish it:
+`python -m ghic.assign --collect && python -m ghic.assign --evaluate`.
 
 ## Phase 21 — Dashboard (2026-07-14)
 
