@@ -100,7 +100,31 @@ will not be invented. **To unblock:** refresh `GH_TOKEN` in `.env`, then
 (~5 min). Until then no assignment feature ships, and nothing in the
 service references one.
 
-## Phase 17 — Priority / Severity / Effort — pending
+## Phase 17 — Priority / Severity / Effort (2026-07-14)
+
+One card per head, as the gate requires — two correctly-not-shipped, one
+shipped after clearing a pre-declared bar:
+
+- **Priority — not shipped** (`models/PRIORITY_CARD.md`): zero priority
+  labels in the corpus; every candidate proxy (time-to-close, response
+  latency, reactions) fails for a stated reason. Buildable with repos that
+  use P0–P3 labels (e.g. flutter/flutter) — a data problem, not a model one.
+- **Severity — not shipped** (`models/SEVERITY_CARD.md`): no severity
+  ground truth, and the tempting keyword-proxy is circular (labels derived
+  from the model's own input text ⇒ near-tautological accuracy). Refused.
+- **Effort — SHIPPED, bar met** (`models/EFFORT_CARD.md`): proxy =
+  log1p(days-to-close), declared weak up front, with a pre-declared ship
+  bar (Spearman ≥ 0.30 AND ≥ 10% MAE improvement over constant-median).
+  Result on the chronological test (n=1,227): winner `rf_regressor`,
+  **Spearman 0.492**, MAE improvement **11.8%** — bar met. Ships as four
+  coarse buckets in the **API response only**, never the public comment
+  (a time estimate shown to reporters reads as a commitment; the validated
+  claim is rank-informativeness, MAE ≈ 1.5 log-days ≈ 4× typical factor).
+  Engineering note: sklearn's RF-regression default `max_features=1.0`
+  was intractable on the ~8k-dim sparse block; `sqrt` (set before any
+  test-set look) made it tractable.
+
+**Gate: PASSED** — three cards with real numbers/decisions. 155 tests.
 
 ## Phase 18 — GitHub API Surface (2026-07-14)
 
@@ -143,6 +167,26 @@ against the trained champion (auto-skip when no artifact). Committed.
 
 ## Phase 20 — MLOps — pending
 
-## Phase 21 — Dashboard — pending
+## Phase 21 — Dashboard (2026-07-14)
+
+All six facets render from real ledger data (`tracker.analytics()`,
+surfaced in `/stats` and drawn by `/dashboard`):
+
+1. **Issue trends** — predictions/day (ledger records now carry
+   timestamps; old lines replay without a trend point, never invented).
+2. **Duplicate rate** — share of predictions with similar-prior
+   candidates (`related_count` now recorded) + duplicate labels observed
+   live via label events.
+3. **Resolution analytics** — resolved actionable / non-actionable /
+   awaiting, from graded outcomes.
+4. **Confidence metrics** — P(actionable) decile histogram + mean.
+5. **Label stats** — top maintainer-applied labels, observed live.
+6. **Component analytics** — per-repo scored / positive rate / mean P
+   (the component boundary this service actually has; finer component
+   labels appear in label stats as maintainers apply them).
+
+Facets a fresh deploy hasn't earned data for show zeros/empty — no
+placeholders. **Gate: PASSED** — tests assert each facet reports real
+counted numbers from webhook activity, incl. rebuild-from-ledger.
 
 ## Phase 22 — Docs / Benchmarks / Marketplace — pending

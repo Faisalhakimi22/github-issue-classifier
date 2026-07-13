@@ -64,9 +64,10 @@ def create_app(
     gh_client: GitHubAppClient | None = None,
     dup_index: Any = None,
     category_predictor: Any = None,
+    effort_predictor: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
-    `category_predictor` are injectable for tests."""
+    `category_predictor` / `effort_predictor` are injectable for tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -130,6 +131,14 @@ def create_app(
         if category_predictor is not None:
             logger.info("category model loaded (%s)", ", ".join(category_predictor.classes))
     app.state.category_predictor = category_predictor
+    # Effort head: the artifact exists only if a run met the declared ship bar.
+    if effort_predictor is None and settings.estimate_effort:
+        from ..effort import load_effort_predictor
+
+        effort_predictor = load_effort_predictor()
+        if effort_predictor is not None:
+            logger.info("effort model loaded")
+    app.state.effort_predictor = effort_predictor
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -169,6 +178,7 @@ def create_app(
                 for path, samples in app.state.latencies.items()
             },
             "errors_5xx": app.state.errors["count"],
+            "analytics": app.state.tracker.analytics(),
             "recent": list(app.state.recent)[-20:],
         }
 
@@ -302,11 +312,25 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         threshold=s.threshold_for(repo),
         explain=s.post_comment and not s.dry_run,  # only pay for it if it ships
     )
+    # Assistive duplicate candidates — surfaced for a maintainer to confirm,
+    # never acted on automatically (pairwise ground truth doesn't exist).
+    # Computed before the ledger write so the duplicate-rate facet is real.
+    related: list[dict[str, Any]] = []
+    if s.suggest_related and app.state.dup_index is not None:
+        try:
+            related = app.state.dup_index.query(
+                repo, issue.get("title", ""), issue.get("body") or "",
+                min_sim=s.related_min_similarity,
+            )
+        except Exception as e:  # index problems must never block a prediction
+            logger.warning("duplicate lookup failed: %s", e)
+
     totals = app.state.totals
     totals["scored"] += 1
     totals["positive"] += pred.predicted_label
     totals["proba_sum"] += pred.proba
-    app.state.tracker.record_prediction(repo, number, pred.proba, pred.predicted_label)
+    app.state.tracker.record_prediction(repo, number, pred.proba, pred.predicted_label,
+                                        related_count=len(related))
     app.state.recent.append({
         "repo": repo,
         "issue": number,
@@ -320,12 +344,15 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         " [dry-run]" if s.dry_run else "",
     )
 
-    # Assistive category suggestion (Phase 15 head). Reuses the same
-    # engineered feature frame; a category failure never blocks the prediction.
+    # Assistive auxiliary heads (category suggestion, coarse resolution-time
+    # bucket). One shared feature frame; any failure degrades to None and
+    # never blocks the main prediction.
     category: dict[str, Any] | None = None
-    if app.state.category_predictor is not None:
+    effort: dict[str, Any] | None = None
+    if app.state.category_predictor is not None or app.state.effort_predictor is not None:
         from .inference import build_feature_frame
 
+        frame = None
         try:
             frame = build_feature_frame(
                 predictor.cfg,
@@ -340,21 +367,18 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
                 author_followers=author_followers,
                 latest_release_iso=latest_release,
             )
-            category = app.state.category_predictor.predict_frame(frame)
         except Exception as e:
-            logger.warning("category prediction failed: %s", e)
-
-    # Assistive duplicate candidates — surfaced for a maintainer to confirm,
-    # never acted on automatically (pairwise ground truth doesn't exist).
-    related: list[dict[str, Any]] = []
-    if s.suggest_related and app.state.dup_index is not None:
-        try:
-            related = app.state.dup_index.query(
-                repo, issue.get("title", ""), issue.get("body") or "",
-                min_sim=s.related_min_similarity,
-            )
-        except Exception as e:  # index problems must never block a prediction
-            logger.warning("duplicate lookup failed: %s", e)
+            logger.warning("aux feature frame failed: %s", e)
+        if frame is not None and app.state.category_predictor is not None:
+            try:
+                category = app.state.category_predictor.predict_frame(frame)
+            except Exception as e:
+                logger.warning("category prediction failed: %s", e)
+        if frame is not None and app.state.effort_predictor is not None:
+            try:
+                effort = app.state.effort_predictor.predict_frame(frame)
+            except Exception as e:
+                logger.warning("effort estimate failed: %s", e)
 
     # Optional LLM-drafted "missing information" request. Triggered only by
     # the deterministic under-specified check; the classifier's decision is
@@ -388,6 +412,7 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         app.state.tracker.record_action(repo, number, action)
 
     return {"ok": True, "prediction": pred.as_dict(), "category": category,
+            "estimated_resolution": effort,   # API-only by design; see EFFORT_CARD.md
             "related_issues": related, "missing_info": info_request,
             "actions": actions, "dry_run": s.dry_run}
 
@@ -527,6 +552,17 @@ _DASHBOARD_HTML = """<!doctype html>
  </div>
  <h2>Model</h2><p id="model" class="muted"></p>
  <h2>Online evaluation</h2><p id="online" class="muted"></p>
+ <h2>Issue trends <span class="muted">(predictions/day, last 30d)</span></h2>
+ <table><thead><tr><th>date</th><th>predictions</th></tr></thead><tbody id="trends"></tbody></table>
+ <h2>Duplicate rate</h2><p id="duprate" class="muted"></p>
+ <h2>Resolution analytics</h2><p id="resolutions" class="muted"></p>
+ <h2>Confidence distribution <span class="muted">(P(actionable) deciles)</span></h2>
+ <p id="confhist" style="font-family: ui-monospace, monospace; white-space: pre;"></p>
+ <h2>Label stats <span class="muted">(applied by maintainers, observed live)</span></h2>
+ <table><thead><tr><th>label</th><th>added</th></tr></thead><tbody id="labelstats"></tbody></table>
+ <h2>Component analytics <span class="muted">(per repo)</span></h2>
+ <table><thead><tr><th>repo</th><th>scored</th><th>positive rate</th><th>mean P</th></tr></thead>
+ <tbody id="components"></tbody></table>
  <h2>Recent predictions</h2>
  <table><thead><tr><th>repo</th><th>issue</th><th>P(bug)</th><th>predicted</th><th>at</th></tr></thead>
  <tbody id="recent"></tbody></table>
@@ -559,6 +595,33 @@ async function load() {
       'resolved ' + (oe.resolved ?? 0) + ' · awaiting outcome ' + (oe.awaiting_outcome ?? 0) +
       ' · confusion ' + JSON.stringify(oe.confusion) + ' · audited GitHub writes ' +
       (oe.github_writes_audited ?? 0) + ' — ' + (oe.note || '');
+    const a = stats.analytics || {};
+    const trends = (a.issue_trends || {}).predictions_per_day || {};
+    document.getElementById('trends').innerHTML = Object.keys(trends).map(d =>
+      '<tr><td>' + d + '</td><td>' + trends[d] + '</td></tr>').join('') ||
+      '<tr><td colspan="2" class="muted">no predictions yet</td></tr>';
+    const dr = a.duplicate_rate || {};
+    document.getElementById('duprate').textContent =
+      (dr.predictions_with_related_candidates ?? 0) + ' predictions had similar-prior candidates (rate ' +
+      fmt(dr.rate) + ') · duplicate labels observed live: ' + (dr.duplicate_labels_observed_live ?? 0);
+    const rs = a.resolution_analytics || {};
+    document.getElementById('resolutions').textContent =
+      'resolved actionable ' + (rs.resolved_actionable ?? 0) + ' · resolved non-actionable ' +
+      (rs.resolved_non_actionable ?? 0) + ' · awaiting outcome ' + (rs.awaiting_outcome ?? 0);
+    const histo = ((a.confidence_metrics || {}).proba_histogram_deciles) || [];
+    const hmax = Math.max(1, ...histo);
+    document.getElementById('confhist').textContent = histo.map((n, i) =>
+      (i / 10).toFixed(1) + '–' + ((i + 1) / 10).toFixed(1) + ' ' +
+      '█'.repeat(Math.round(20 * n / hmax)).padEnd(20, '·') + ' ' + n).join('\\n') || 'no data';
+    const ls = ((a.label_stats || {}).top_labels_added) || {};
+    document.getElementById('labelstats').innerHTML = Object.keys(ls).map(k =>
+      '<tr><td>' + k + '</td><td>' + ls[k] + '</td></tr>').join('') ||
+      '<tr><td colspan="2" class="muted">no label events yet</td></tr>';
+    const comp = a.component_analytics || {};
+    document.getElementById('components').innerHTML = Object.keys(comp).map(k =>
+      '<tr><td>' + k + '</td><td>' + comp[k].scored + '</td><td>' + fmt(comp[k].positive_rate) +
+      '</td><td>' + (comp[k].mean_proba ?? 'n/a') + '</td></tr>').join('') ||
+      '<tr><td colspan="4" class="muted">no predictions yet</td></tr>';
     document.getElementById('recent').innerHTML = (stats.recent || []).slice().reverse().map(r =>
       '<tr><td>' + r.repo + '</td><td>#' + r.issue + '</td><td>' + r.proba.toFixed(3) +
       '</td><td>' + r.predicted + '</td><td>' + r.at.replace('T', ' ').slice(0, 19) + '</td></tr>'
@@ -581,7 +644,8 @@ def export_openapi(path: Any = None) -> Any:
 
     spec_app = create_app(
         ServiceSettings(model_path=Path("unused.joblib"), webhook_secret="spec",
-                        suggest_related=False, suggest_category=False),
+                        suggest_related=False, suggest_category=False,
+                        estimate_effort=False),
         predictor=object(),  # never called during spec generation
     )
     spec = spec_app.openapi()

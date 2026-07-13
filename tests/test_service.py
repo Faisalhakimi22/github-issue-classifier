@@ -83,6 +83,7 @@ def make_settings(**overrides: Any) -> ServiceSettings:
         dry_run=True,
         suggest_related=False,   # tests must not depend on models/dup_index.joblib
         suggest_category=False,  # ...nor on models/category.joblib
+        estimate_effort=False,   # ...nor on models/effort.joblib
     )
     defaults.update(overrides)
     return ServiceSettings(**defaults)
@@ -635,6 +636,82 @@ class TestProjectsV2:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard analytics: the six facets, from real ledger data
+# ---------------------------------------------------------------------------
+class TestDashboardAnalytics:
+    def _client_with_activity(self) -> TestClient:
+        app = create_app(make_settings(suggest_related=True),
+                         predictor=StubPredictor(proba=0.9),
+                         dup_index=StubDupIndex())
+        client = TestClient(app)
+        post_webhook(client, issue_opened_payload(number=1))   # has dup candidates
+        app.state.dup_index = None                             # second one won't
+        post_webhook(client, issue_opened_payload(number=2))
+        post_webhook(client, issue_closed_payload(number=1, state_reason="not_planned"))
+        label_event = issue_opened_payload(number=2)
+        label_event["action"] = "labeled"
+        label_event["label"] = {"name": "comp:editor"}
+        post_webhook(client, label_event)
+        return client
+
+    def test_all_six_facets_report_real_numbers(self):
+        client = self._client_with_activity()
+        a = client.get("/stats", headers={"X-GHIC-Token": SECRET}).json()["analytics"]
+        # 1. issue trends: both predictions land on today's date bucket
+        assert sum(a["issue_trends"]["predictions_per_day"].values()) == 2
+        # 2. duplicate rate: exactly one prediction had candidates
+        assert a["duplicate_rate"]["predictions_with_related_candidates"] == 1
+        assert a["duplicate_rate"]["rate"] == 0.5
+        # 3. resolution analytics: one graded close, one pending
+        assert a["resolution_analytics"]["resolved_non_actionable"] == 1
+        assert a["resolution_analytics"]["awaiting_outcome"] == 1
+        # 4. confidence metrics: histogram mass equals predictions
+        assert sum(a["confidence_metrics"]["proba_histogram_deciles"]) == 2
+        assert a["confidence_metrics"]["proba_histogram_deciles"][9] == 2  # 0.9s
+        # 5. label stats
+        assert a["label_stats"]["top_labels_added"] == {"comp:editor": 1}
+        # 6. component analytics
+        assert a["component_analytics"]["acme/widgets"]["scored"] == 2
+        assert a["component_analytics"]["acme/widgets"]["positive_rate"] == 1.0
+
+    def test_analytics_rebuilt_from_ledger_on_restart(self, tmp_path):
+        from ghic.service.tracking import PredictionTracker
+
+        ledger = tmp_path / "ledger.jsonl"
+        t1 = PredictionTracker(ledger_path=ledger)
+        t1.record_prediction("a/b", 1, 0.85, 1, related_count=2)
+        t1.record_label_event("a/b", 1, "*duplicate", True)
+        t1.record_outcome("a/b", 1, 1)
+
+        t2 = PredictionTracker(ledger_path=ledger)
+        a = t2.analytics()
+        assert sum(a["issue_trends"]["predictions_per_day"].values()) == 1
+        assert a["duplicate_rate"]["predictions_with_related_candidates"] == 1
+        assert a["duplicate_rate"]["duplicate_labels_observed_live"] == 1
+        assert a["resolution_analytics"]["resolved_actionable"] == 1
+
+    def test_old_ledger_lines_without_timestamps_still_replay(self, tmp_path):
+        from ghic.service.tracking import PredictionTracker
+
+        ledger = tmp_path / "ledger.jsonl"
+        ledger.write_text(
+            '{"type": "prediction", "repo": "a/b", "number": 1, "proba": 0.7, "predicted": 1}\n',
+            encoding="utf-8",
+        )
+        t = PredictionTracker(ledger_path=ledger)
+        a = t.analytics()
+        assert a["issue_trends"]["predictions_per_day"] == {}   # no timestamp -> no trend point
+        assert a["component_analytics"]["a/b"]["scored"] == 1   # still counted everywhere else
+
+    def test_dashboard_page_renders_all_facets(self):
+        client = make_client(make_settings())
+        html = client.get("/dashboard").text
+        for element_id in ("trends", "duprate", "resolutions", "confhist",
+                           "labelstats", "components"):
+            assert f'id="{element_id}"' in html
+
+
+# ---------------------------------------------------------------------------
 # Category suggestion (assistive, never auto-labeled)
 # ---------------------------------------------------------------------------
 class StubCategoryPredictor:
@@ -710,6 +787,49 @@ class TestCategoryDerivation:
 
         assert derive_category(["stale", "comp:lite", "tf 2.16"]) is None
         assert derive_category([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Effort head (ships only because its run met the pre-declared bar)
+# ---------------------------------------------------------------------------
+class TestEffortEstimate:
+    class StubEffort:
+        def predict_frame(self, feats):
+            return {"bucket": "1–3 weeks", "basis": "test"}
+
+    def test_bucket_boundaries(self):
+        from ghic.effort import bucket_for_days
+
+        assert bucket_for_days(0.5) == "a few days"
+        assert bucket_for_days(3.0) == "a few days"
+        assert bucket_for_days(10) == "1–3 weeks"
+        assert bucket_for_days(45) == "1–3 months"
+        assert bucket_for_days(400) == "3+ months"
+
+    def test_estimate_in_response_but_never_in_comment(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh,
+                         effort_predictor=self.StubEffort())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.json()["estimated_resolution"]["bucket"] == "1–3 weeks"
+        # deliberate: a public time estimate reads as a commitment
+        assert "1–3 weeks" not in gh.comments[0][2]
+
+    def test_absent_when_disabled(self):
+        resp = post_webhook(make_client(make_settings()), issue_opened_payload())
+        assert resp.json()["estimated_resolution"] is None
+
+    def test_effort_failure_never_blocks_prediction(self):
+        class Broken:
+            def predict_frame(self, feats):
+                raise RuntimeError("boom")
+
+        app = create_app(make_settings(), predictor=StubPredictor(),
+                         effort_predictor=Broken())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.status_code == 200
+        assert resp.json()["estimated_resolution"] is None
 
 
 # ---------------------------------------------------------------------------
