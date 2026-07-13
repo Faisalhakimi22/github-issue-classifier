@@ -32,6 +32,8 @@ dependencies = [
 
 [project.optional-dependencies]
 plots = ["matplotlib>=3.8"]
+embeddings = ["sentence-transformers>=3.0"]
+llm = ["anthropic>=0.60"]
 service = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",

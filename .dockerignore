@@ -12,6 +12,7 @@ tests/
 models/*
 !models/rf_balanced.joblib
 !models/champion.joblib
+!models/dup_index.joblib
 .env
 *.pem
 Proposal.pdf

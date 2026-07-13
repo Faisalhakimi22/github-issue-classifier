@@ -71,6 +71,7 @@ def make_settings(**overrides: Any) -> ServiceSettings:
         model_path=Path("unused.joblib"),
         webhook_secret=SECRET,
         dry_run=True,
+        suggest_related=False,   # tests must not depend on models/dup_index.joblib
     )
     defaults.update(overrides)
     return ServiceSettings(**defaults)
@@ -490,6 +491,123 @@ class TestChampionProtocol:
         assert unwrap_pipeline(FakePipe()) is not None
         assert unwrap_pipeline(FakeCalibrated()) is not None
         assert unwrap_pipeline(object()) is None
+
+
+# ---------------------------------------------------------------------------
+# Duplicate surfacing (assistive candidates on issues.opened)
+# ---------------------------------------------------------------------------
+class StubDupIndex:
+    meta = [{"repo": "acme/widgets"}]
+
+    def query(self, repo, title, body, k=3, min_sim=0.55):
+        return [{"number": 7, "title": "Old crash on save", "similarity": 0.83}]
+
+
+class TestRelatedIssues:
+    def test_related_candidates_in_response_and_comment(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True,
+                                       suggest_related=True),
+                         predictor=StubPredictor(), gh_client=gh,
+                         dup_index=StubDupIndex())
+        client = TestClient(app)
+        resp = post_webhook(client, issue_opened_payload())
+        assert resp.json()["related_issues"][0]["number"] == 7
+        assert "#7" in gh.comments[0][2]
+        assert "please verify" in gh.comments[0][2]
+
+    def test_dup_index_failure_never_blocks_prediction(self):
+        class BrokenIndex:
+            meta = []
+
+            def query(self, *a, **k):
+                raise RuntimeError("index corrupt")
+
+        app = create_app(make_settings(suggest_related=True),
+                         predictor=StubPredictor(), dup_index=BrokenIndex())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.status_code == 200
+        assert resp.json()["related_issues"] == []
+
+
+# ---------------------------------------------------------------------------
+# Missing-information drafting (trigger is the load-bearing part)
+# ---------------------------------------------------------------------------
+class TestDrafting:
+    def test_vague_issue_triggers(self):
+        from ghic.service.drafting import needs_more_info
+
+        assert needs_more_info("app broken", "it doesnt work pls fix")
+
+    def test_detailed_report_does_not_trigger(self):
+        from ghic.service.drafting import needs_more_info
+
+        body = ("Steps to reproduce:\n1. open\n2. crash\n\n```\nTraceback (most recent "
+                "call last)\n```\nExpected: no crash. Actual: crash on every launch "
+                "since upgrading to v2.1 on Windows 11 with Python 3.12.")
+        assert not needs_more_info("Crash on save", body)
+
+    def test_template_fallback_lists_concrete_gaps(self):
+        from ghic.service.drafting import draft_missing_info
+
+        result = draft_missing_info("broken", "fix pls")
+        assert result is not None
+        assert result["source"] in ("template", "llm")
+        assert "steps to reproduce" in result["missing"]
+        assert "steps to reproduce" in result["draft"] or result["source"] == "llm"
+
+    def test_well_specified_issue_returns_none(self):
+        from ghic.service.drafting import draft_missing_info
+
+        body = ("Steps to reproduce: 1. run `foo --bar` 2. observe error\n"
+                "```\nValueError: bad input\n```\n"
+                "Expected the command to complete; instead it raises on every "
+                "run with version 3.2 on Ubuntu 24.04. Happy to add more detail.")
+        assert draft_missing_info("ValueError in foo", body) is None
+
+    def test_handler_attaches_draft_when_enabled(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        client = make_client(make_settings(draft_missing_info=True))
+        resp = post_webhook(client, issue_opened_payload(
+            title="app broken", body="pls fix"))
+        info = resp.json()["missing_info"]
+        assert info is not None and len(info["missing"]) >= 2
+
+    def test_handler_skips_draft_when_disabled(self):
+        client = make_client(make_settings())
+        resp = post_webhook(client, issue_opened_payload(
+            title="app broken", body="pls fix"))
+        assert resp.json()["missing_info"] is None
+
+
+# ---------------------------------------------------------------------------
+# Observability: latency percentiles, dashboard, OpenAPI export
+# ---------------------------------------------------------------------------
+class TestObservability:
+    def test_stats_reports_latency_percentiles(self):
+        client = make_client(make_settings())
+        for n in range(3):
+            post_webhook(client, issue_opened_payload(number=n + 1))
+        stats = client.get("/stats", headers={"X-GHIC-Token": SECRET}).json()
+        lat = stats["latency_ms"]["/webhook"]
+        assert lat["n"] == 3 and lat["p50"] >= 0 and lat["p99"] >= lat["p50"]
+
+    def test_dashboard_serves_html_without_token(self):
+        client = make_client(make_settings())
+        resp = client.get("/dashboard")
+        assert resp.status_code == 200
+        assert "Issue Triage Bot" in resp.text
+        assert "X-GHIC-Token" in resp.text     # data still requires the token
+
+    def test_openapi_spec_covers_all_endpoints(self, tmp_path):
+        import json
+
+        from ghic.service.app import export_openapi
+
+        path = export_openapi(tmp_path / "openapi.json")
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        for route in ("/webhook", "/healthz", "/stats", "/api/predict", "/dashboard"):
+            assert route in spec["paths"], route
 
 
 # ---------------------------------------------------------------------------

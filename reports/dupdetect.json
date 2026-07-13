@@ -1,0 +1,59 @@
+{
+  "task": "predict duplicate-labeled closure from max similarity to prior same-repo issues",
+  "test_n": 1177,
+  "test_positives": 60,
+  "representations": {
+    "tfidf_cosine": {
+      "overall": {
+        "n": 1177,
+        "positives": 60,
+        "roc_auc": 0.555,
+        "pr_auc": 0.0583
+      },
+      "facebook/react": {
+        "n": 129,
+        "positives": 0,
+        "roc_auc": null,
+        "pr_auc": null
+      },
+      "microsoft/vscode": {
+        "n": 820,
+        "positives": 60,
+        "roc_auc": 0.5226,
+        "pr_auc": 0.0762
+      },
+      "tensorflow/tensorflow": {
+        "n": 228,
+        "positives": 0,
+        "roc_auc": null,
+        "pr_auc": null
+      }
+    },
+    "minilm (all-MiniLM-L6-v2)": {
+      "overall": {
+        "n": 1177,
+        "positives": 60,
+        "roc_auc": 0.5266,
+        "pr_auc": 0.0556
+      },
+      "facebook/react": {
+        "n": 129,
+        "positives": 0,
+        "roc_auc": null,
+        "pr_auc": null
+      },
+      "microsoft/vscode": {
+        "n": 820,
+        "positives": 60,
+        "roc_auc": 0.5316,
+        "pr_auc": 0.0757
+      },
+      "tensorflow/tensorflow": {
+        "n": 228,
+        "positives": 0,
+        "roc_auc": null,
+        "pr_auc": null
+      }
+    }
+  }
+}

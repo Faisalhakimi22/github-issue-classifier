@@ -34,6 +34,7 @@ class PredictionTracker:
         # (repo, number) -> predicted label at open time
         self.pending: dict[tuple[str, int], dict[str, Any]] = {}
         self.confusion = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        self.actions = 0            # GitHub writes performed (audit records)
         if ledger_path and ledger_path.exists():
             self._replay()
 
@@ -60,6 +61,8 @@ class PredictionTracker:
                     self._note_prediction(rec)
                 elif rec.get("type") == "outcome":
                     self._note_outcome(rec)
+                elif rec.get("type") == "action":
+                    self.actions += 1
                 n += 1
         logger.info("replayed %d ledger records from %s", n, self.ledger_path)
 
@@ -86,6 +89,22 @@ class PredictionTracker:
             self._note_prediction(rec)
             self._append(rec)
 
+    def record_action(self, repo: str, number: int, action: str,
+                      detail: str = "") -> None:
+        """Audit trail: every write the bot performs on GitHub, who/what/when.
+
+        `who` is implicit (the bot is the only writer); `when` is recorded at
+        append time so the ledger line is the authoritative timestamp.
+        """
+        from datetime import datetime, timezone
+
+        rec = {"type": "action", "repo": repo, "number": number,
+               "action": action, "detail": detail,
+               "at": datetime.now(tz=timezone.utc).isoformat()}
+        with self._lock:
+            self.actions += 1
+            self._append(rec)
+
     def record_outcome(self, repo: str, number: int, truth: int) -> bool:
         """Returns True when the outcome matched a tracked prediction."""
         rec = {"type": "outcome", "repo": repo, "number": number, "truth": truth}
@@ -105,6 +124,7 @@ class PredictionTracker:
         accuracy = (c["tp"] + c["tn"]) / resolved if resolved else None
         return {
             "awaiting_outcome": len(self.pending),
+            "github_writes_audited": self.actions,
             "resolved": resolved,
             "confusion": dict(c),
             "live_precision": round(precision, 4) if precision is not None else None,

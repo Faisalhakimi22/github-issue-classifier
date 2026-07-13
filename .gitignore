@@ -15,6 +15,7 @@ data/predictions.jsonl
 # reports/ is tracked too: the README links to the report and its figures.
 models/*
 !models/MODEL_CARD.md
+!models/DUPLICATE_CARD.md
 
 # Local-only archive of course/personal files, not part of the published project
 _archive/

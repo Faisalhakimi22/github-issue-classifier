@@ -1,0 +1,15 @@
+{
+  "model": "champion",
+  "requests_ok": 200,
+  "errors": 0,
+  "concurrency": 8,
+  "wall_seconds": 121.26,
+  "throughput_rps": 1.65,
+  "latency_ms": {
+    "mean": 4784.5,
+    "p50": 4810.5,
+    "p95": 5308.9,
+    "p99": 5875.1,
+    "max": 5880.7
+  }
+}

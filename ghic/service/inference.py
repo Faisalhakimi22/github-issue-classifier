@@ -130,7 +130,7 @@ class IssuePredictor:
         )
 
 
-def format_comment(pred: Prediction) -> str:
+def format_comment(pred: Prediction, related: list[dict[str, Any]] | None = None) -> str:
     """Markdown comment the bot posts on a scored issue."""
     verdict = (
         "likely an **actionable bug**"
@@ -160,6 +160,12 @@ def format_comment(pred: Prediction) -> str:
             for item in pred.top_features
         ]
         lines += ["", "</details>"]
+    if related:
+        lines += ["", "**Possibly related prior issues** (by text similarity — please verify):"]
+        lines += [
+            f"- #{r['number']} — {r['title']} (similarity {r['similarity']:.2f})"
+            for r in related
+        ]
     lines += [
         "",
         "_Automated prediction from issue text and metadata at open time — "

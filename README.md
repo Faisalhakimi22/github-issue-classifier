@@ -15,7 +15,9 @@ minute on it.
 ```
 issue opened ──▶ webhook (HMAC-verified) ──▶ enrich ──▶ featurize ──▶ score
                                                                         │
-                                              P(actionable bug) = 0.87 ─┤
+              P(actionable bug) = 0.87 ────────────────────────────────┤
+              likely duplicates of prior issues (assistive) ───────────┤
+              "missing info" draft when under-specified (LLM, scoped) ─┤
                                                                         ▼
                                               comment + label on the issue
 issue closed ──▶ outcome derived from close labels ──▶ the bot grades its
@@ -78,6 +80,8 @@ explicitly enables actions.
 | `GHIC_POST_COMMENT` / `GHIC_APPLY_LABEL` | `false` | write actions, individually gated |
 | `GHIC_ENRICH` | `true` | fetch author profile + latest release |
 | `GHIC_LEDGER` | `data/predictions.jsonl` | online-evaluation ledger (`""` = in-memory) |
+| `GHIC_SUGGEST_RELATED` | `true` | surface likely-duplicate prior issues (needs `dup_index.joblib`) |
+| `GHIC_DRAFT_MISSING_INFO` | `false` | LLM-drafted info request on vague issues (template without a key) |
 
 ## How the ground truth was built
 
@@ -155,6 +159,44 @@ model keeps a small ranking edge (0.902) from seeing 15% more training data
 and ships alongside the champion; we default to calibrated probabilities
 because comments and thresholds depend on them meaning what they say.
 
+## Beyond the classifier
+
+**Duplicate candidates** (`ghic/dupdetect.py`): every new issue is compared
+against all prior same-repo issues by exact cosine search — at ~6k issues a
+normalized matrix product beats any vector database, and the query interface
+is the seam where an ANN index would slot in at 100× the corpus. Candidates
+above `GHIC_RELATED_MIN_SIM` are surfaced in the comment as *assistive*
+suggestions, never acted on automatically — and the evaluation is why:
+`python -m ghic.dupdetect --evaluate` tested both MiniLM embeddings and a
+TF-IDF baseline causally against rule-derived duplicate labels, and **both
+came out near chance** at predicting duplicate closure (ROC ≈ 0.53, with
+MiniLM failing to beat TF-IDF). So no "likely duplicate" flag ships off this
+score; the full negative result, mechanism, and the ground-truth work that
+would change it are in
+[models/DUPLICATE_CARD.md](models/DUPLICATE_CARD.md).
+
+**Scoped LLM drafting** (`ghic/service/drafting.py`): when a deterministic,
+tested trigger says an issue is under-specified (no repro steps, no
+trace/code, near-empty body), Claude drafts the "could you add…" comment a
+triager would write, grounded in similar prior issues from the duplicate
+index. The LLM never makes the actionability decision — that stays with the
+calibrated classifier — and everything degrades to a deterministic template
+without an API key. Off by default.
+
+**Operations**: structured request logs, per-endpoint latency percentiles
+and 5xx counts in `/stats`, a read-only `/dashboard`, an audit record for
+every GitHub write in the ledger, and the OpenAPI spec exported to
+[docs/openapi.json](docs/openapi.json) (`python -m ghic.service.app
+--openapi`).
+
+**Measured performance** (real load test, single worker —
+`reports/loadtest.json`): one prediction costs ~600 ms CPU; p95 is 626 ms at
+concurrency 1 and a single worker sustains ~1.7 predictions/s. Concurrency
+beyond that queues (p50 4.8 s at c=8, throughput flat) — still far above any
+single repo's issue rate; the scaling path and the honest roadmap
+(multi-tenancy, Kubernetes, billing — each gated on a named usage signal)
+live in [docs/PRD.md](docs/PRD.md).
+
 ## Validation is a command, not a waiting period
 
 ```bash
@@ -186,15 +228,19 @@ ghic/
   backtest.py    held-out replay through the real webhook + threshold calibration
   evaluate.py    metrics incl. Brier, plots incl. reliability diagram, explanations
   demo.py        CLI walkthrough: metrics, worked examples, live scoring
+  dupdetect.py   duplicate detection: index, query, honest evaluation
   service/
-    app.py         FastAPI: /webhook, /healthz, /stats, /api/predict
+    app.py         FastAPI: /webhook, /healthz, /stats, /dashboard, /api/predict
     github_app.py  App auth (JWT → installation token) + REST helpers
     inference.py   single-issue prediction + top-feature explanations
-    tracking.py    the self-grading ledger
+    tracking.py    the self-grading ledger + GitHub-write audit trail
+    drafting.py    scoped LLM comment drafting (never the decision)
     settings.py    GHIC_* env config, safe-by-default
+scripts/         loadtest.py — real latency percentiles against a live instance
 notebook/        the pipeline as three narrative notebooks
-tests/           96 tests: every labeling branch, features, collection, service
-reports/         metrics, evaluation figures, backtest + champion artifacts
+tests/           107 tests: labeling, features, collection, service, duplicates, drafting
+reports/         metrics, figures, backtest/champion/loadtest artifacts
+docs/            DEPLOYMENT.md · PRD.md (roadmap, design decisions) · openapi.json
 ```
 
 Rebuild everything from a bare clone and a GitHub token:

@@ -60,8 +60,9 @@ def create_app(
     settings: ServiceSettings | None = None,
     predictor: IssuePredictor | None = None,
     gh_client: GitHubAppClient | None = None,
+    dup_index: Any = None,
 ) -> FastAPI:
-    """Build the app. `predictor` / `gh_client` are injectable for tests."""
+    """Build the app. `predictor` / `gh_client` / `dup_index` are injectable for tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -78,12 +79,45 @@ def create_app(
     app.state.settings = settings
     app.state.predictor = predictor
     app.state.gh = gh_client
+    # Per-endpoint latency samples (ms) for /stats percentiles, plus a
+    # structured one-line log per request: method, path, status, duration.
+    app.state.latencies = {}
+    app.state.errors = {"count": 0}
+
+    @app.middleware("http")
+    async def observe(request: Request, call_next: Any) -> Any:
+        import time as _time
+
+        started = _time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            app.state.errors["count"] += 1
+            raise
+        elapsed_ms = (_time.perf_counter() - started) * 1000
+        path = request.url.path
+        app.state.latencies.setdefault(path, deque(maxlen=1000)).append(elapsed_ms)
+        if response.status_code >= 500:
+            app.state.errors["count"] += 1
+        logger.info(
+            '{"method": "%s", "path": "%s", "status": %d, "ms": %.1f}',
+            request.method, path, response.status_code, elapsed_ms,
+        )
+        return response
     # Rolling in-memory observability: totals survive for the process
     # lifetime, `recent` keeps the last 500 scored issues for /stats.
     app.state.totals = {"scored": 0, "positive": 0, "proba_sum": 0.0}
     app.state.recent = deque(maxlen=500)
     # Online evaluation ledger: predictions at open time, graded at close time.
     app.state.tracker = PredictionTracker(ledger_path=settings.ledger_path)
+    # Duplicate-candidate index (optional; assistive only).
+    if dup_index is None and settings.suggest_related:
+        from ..dupdetect import load_index
+
+        dup_index = load_index()
+        if dup_index is not None:
+            logger.info("duplicate index loaded (%d issues)", len(dup_index.meta))
+    app.state.dup_index = dup_index
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -117,8 +151,21 @@ def create_app(
             "mean_proba": round(t["proba_sum"] / t["scored"], 4) if t["scored"] else None,
             "dry_run": app.state.settings.dry_run,
             "online_evaluation": app.state.tracker.summary(),
+            "latency_ms": {
+                path: _percentiles(samples)
+                for path, samples in app.state.latencies.items()
+            },
+            "errors_5xx": app.state.errors["count"],
             "recent": list(app.state.recent)[-20:],
         }
+
+    @app.get("/dashboard")
+    def dashboard() -> Any:
+        """Read-only operator view over /stats (data loads with the token,
+        client-side; the page itself carries no repo data)."""
+        from fastapi.responses import HTMLResponse
+
+        return HTMLResponse(_DASHBOARD_HTML)
 
     @app.post("/webhook")
     async def webhook(request: Request) -> dict[str, Any]:
@@ -170,6 +217,17 @@ def _utcnow_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _percentiles(samples: Any) -> dict[str, float]:
+    values = sorted(samples)
+    if not values:
+        return {}
+
+    def pct(p: float) -> float:
+        return round(values[min(len(values) - 1, int(len(values) * p))], 1)
+
+    return {"n": len(values), "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99)}
 
 
 # ---------------------------------------------------------------------------
@@ -235,17 +293,48 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         " [dry-run]" if s.dry_run else "",
     )
 
+    # Assistive duplicate candidates — surfaced for a maintainer to confirm,
+    # never acted on automatically (pairwise ground truth doesn't exist).
+    related: list[dict[str, Any]] = []
+    if s.suggest_related and app.state.dup_index is not None:
+        try:
+            related = app.state.dup_index.query(
+                repo, issue.get("title", ""), issue.get("body") or "",
+                min_sim=s.related_min_similarity,
+            )
+        except Exception as e:  # index problems must never block a prediction
+            logger.warning("duplicate lookup failed: %s", e)
+
+    # Optional LLM-drafted "missing information" request. Triggered only by
+    # the deterministic under-specified check; the classifier's decision is
+    # never delegated to the generator.
+    info_request: dict[str, Any] | None = None
+    if s.draft_missing_info:
+        from .drafting import draft_missing_info
+
+        try:
+            info_request = draft_missing_info(
+                issue.get("title", ""), issue.get("body") or "", related=related
+            )
+        except Exception as e:  # drafting must never block a prediction
+            logger.warning("missing-info draft failed: %s", e)
+
     actions: list[str] = []
     if not s.dry_run and gh is not None and installation_id:
         if s.post_comment:
-            gh.post_comment(repo, number, format_comment(pred), installation_id)
+            comment = format_comment(pred, related)
+            if info_request:
+                comment += "\n\n---\n\n" + info_request["draft"]
+            gh.post_comment(repo, number, comment, installation_id)
             actions.append("comment")
         if s.apply_label and pred.predicted_label == 1:
             gh.add_labels(repo, number, [s.label_name], installation_id)
             actions.append("label")
+    for action in actions:
+        app.state.tracker.record_action(repo, number, action)
 
-    return {"ok": True, "prediction": pred.as_dict(), "actions": actions,
-            "dry_run": s.dry_run}
+    return {"ok": True, "prediction": pred.as_dict(), "related_issues": related,
+            "missing_info": info_request, "actions": actions, "dry_run": s.dry_run}
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +377,115 @@ def _handle_issue_closed(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
             "matched_prediction": matched}
 
 
+# ---------------------------------------------------------------------------
+# Dashboard page (self-contained; token entered client-side, sent as header)
+# ---------------------------------------------------------------------------
+_DASHBOARD_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>GHIC dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+ body { margin: 2rem auto; max-width: 60rem; padding: 0 1rem; line-height: 1.45; }
+ h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 1.6rem; }
+ .tiles { display: flex; gap: 1rem; flex-wrap: wrap; }
+ .tile { border: 1px solid #8884; border-radius: 8px; padding: .8rem 1.1rem; min-width: 9rem; }
+ .tile b { display: block; font-size: 1.5rem; }
+ table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+ td, th { border-bottom: 1px solid #8883; padding: .35rem .5rem; text-align: left; }
+ input { padding: .4rem; min-width: 18rem; } button { padding: .4rem .9rem; }
+ .muted { opacity: .65; font-size: .85rem; }
+ .err { color: #c33; }
+</style></head><body>
+<h1>Issue Triage Bot — dashboard</h1>
+<p><input id="token" type="password" placeholder="webhook secret (X-GHIC-Token)">
+<button onclick="load()">Load</button> <span id="msg" class="muted"></span></p>
+<div id="content" hidden>
+ <div class="tiles">
+  <div class="tile"><b id="scored">–</b>issues scored</div>
+  <div class="tile"><b id="posrate">–</b>flagged actionable</div>
+  <div class="tile"><b id="liveprec">–</b>live precision</div>
+  <div class="tile"><b id="liverec">–</b>live recall (lower bound)</div>
+  <div class="tile"><b id="p95">–</b>webhook p95 (ms)</div>
+ </div>
+ <h2>Model</h2><p id="model" class="muted"></p>
+ <h2>Online evaluation</h2><p id="online" class="muted"></p>
+ <h2>Recent predictions</h2>
+ <table><thead><tr><th>repo</th><th>issue</th><th>P(bug)</th><th>predicted</th><th>at</th></tr></thead>
+ <tbody id="recent"></tbody></table>
+</div>
+<script>
+async function load() {
+  const t = document.getElementById('token').value;
+  const msg = document.getElementById('msg');
+  msg.textContent = 'loading…'; msg.className = 'muted';
+  try {
+    const h = { 'X-GHIC-Token': t };
+    const [stats, health] = await Promise.all([
+      fetch('/stats', { headers: h }).then(r => { if (!r.ok) throw new Error('stats HTTP ' + r.status); return r.json(); }),
+      fetch('/healthz').then(r => r.json()),
+    ]);
+    document.getElementById('content').hidden = false;
+    msg.textContent = 'updated ' + new Date().toLocaleTimeString();
+    const fmt = v => v == null ? 'n/a' : (typeof v === 'number' && v <= 1 ? (v * 100).toFixed(1) + '%' : v);
+    document.getElementById('scored').textContent = stats.scored;
+    document.getElementById('posrate').textContent = fmt(stats.positive_rate);
+    const oe = stats.online_evaluation || {};
+    document.getElementById('liveprec').textContent = fmt(oe.live_precision);
+    document.getElementById('liverec').textContent = fmt(oe.live_recall_lower_bound);
+    const wh = (stats.latency_ms || {})['/webhook'] || {};
+    document.getElementById('p95').textContent = wh.p95 ?? 'n/a';
+    document.getElementById('model').textContent =
+      health.model + ' · threshold ' + health.threshold + ' · dry_run ' + health.dry_run +
+      ' · per-repo thresholds ' + JSON.stringify(health.repo_thresholds);
+    document.getElementById('online').textContent =
+      'resolved ' + (oe.resolved ?? 0) + ' · awaiting outcome ' + (oe.awaiting_outcome ?? 0) +
+      ' · confusion ' + JSON.stringify(oe.confusion) + ' · audited GitHub writes ' +
+      (oe.github_writes_audited ?? 0) + ' — ' + (oe.note || '');
+    document.getElementById('recent').innerHTML = (stats.recent || []).slice().reverse().map(r =>
+      '<tr><td>' + r.repo + '</td><td>#' + r.issue + '</td><td>' + r.proba.toFixed(3) +
+      '</td><td>' + r.predicted + '</td><td>' + r.at.replace('T', ' ').slice(0, 19) + '</td></tr>'
+    ).join('');
+  } catch (e) { msg.textContent = e.message; msg.className = 'err'; }
+}
+</script></body></html>"""
+
+
+def export_openapi(path: Any = None) -> Any:
+    """Write the OpenAPI spec FastAPI generates to docs/openapi.json.
+
+    Builds the app with stubs so no model artifact is needed — the spec
+    describes the API surface, not the model.
+    """
+    import json
+    from pathlib import Path
+
+    from .settings import ServiceSettings
+
+    spec_app = create_app(
+        ServiceSettings(model_path=Path("unused.joblib"), webhook_secret="spec",
+                        suggest_related=False),
+        predictor=object(),  # never called during spec generation
+    )
+    spec = spec_app.openapi()
+    path = Path(path) if path else utils.PROJECT_ROOT / "docs" / "openapi.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+    logger.info("wrote %s (%d paths)", path, len(spec.get("paths", {})))
+    return path
+
+
 def main() -> int:
     """`python -m ghic.service.app` / `ghic-serve` — run a local server."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the webhook service.")
+    parser.add_argument("--openapi", nargs="?", const="", metavar="PATH",
+                        help="export the OpenAPI spec (default docs/openapi.json) and exit")
+    args = parser.parse_args()
+    if args.openapi is not None:
+        export_openapi(args.openapi or None)
+        return 0
+
     import uvicorn
 
     host = os.environ.get("GHIC_HOST", "127.0.0.1")

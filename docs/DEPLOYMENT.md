@@ -22,6 +22,12 @@ GitHub → Settings → Developer settings → **GitHub Apps** → *New GitHub A
 | Webhook secret | generate one: `python -c "import secrets; print(secrets.token_hex(32))"` |
 | **Repository permissions** | Issues: **Read & write** · Metadata: Read-only |
 | **Subscribe to events** | Issues |
+
+**Why each permission** (Marketplace review asks): *Issues read* — receive
+`issues.opened`/`closed` events and read labels for the online-evaluation
+loop; *Issues write* — post the prediction comment and apply the triage
+label; *Metadata read* — GitHub's implicit baseline for any App. Nothing
+else is requested: no code, PR, or member access.
 | Where can it be installed? | Any account (required for Marketplace) |
 
 After creating the app:
@@ -106,6 +112,8 @@ Then: App settings → *List in Marketplace* → draft the listing (category:
 ## 6. Operations
 
 - `/healthz` — liveness for load balancers; reports model + thresholds + dry-run.
+- `/dashboard` — read-only operator view (enter the webhook secret in the
+  page; data is fetched client-side with the token).
 - `/stats` — token-gated (`X-GHIC-Token: <webhook secret>`): totals, positive
   rate, mean probability, the last 20 scored issues, **and the online
   evaluation block** — live precision/recall computed by grading each
@@ -121,7 +129,15 @@ Then: App settings → *List in Marketplace* → draft the listing (category:
   ~50ms; the two enrichment API calls dominate). If GitHub reports delivery
   timeouts, set `GHIC_ENRICH=false` — the pipeline imputes the missing fields.
 - Retrain periodically: issue-triage vocabulary drifts. Re-run the pipeline
-  (`collect` → `label` → `train`) and swap the `.joblib` artifact.
+  (`collect` → `label` → `train --champion`) and swap the `.joblib` artifact.
+- Capacity: one prediction costs ~600 ms CPU; a single worker sustains
+  ~1.7 predictions/s (measured — `reports/loadtest.json`), far above any
+  single repo's issue rate. If you ever need more, run multiple workers or
+  replicas — but move the ledger off JSONL first (see docs/PRD.md §9).
+- Optional features: `GHIC_SUGGEST_RELATED` surfaces likely-duplicate prior
+  issues (ship `models/dup_index.joblib`); `GHIC_DRAFT_MISSING_INFO=true` +
+  `ANTHROPIC_API_KEY` drafts a "missing information" request on
+  under-specified issues (template fallback without a key).
 
 ## Security posture
 

@@ -79,6 +79,16 @@ class ServiceSettings:
     # keeps the ledger in memory only (tests, backtests).
     ledger_path: Path | None = None
 
+    # Surface likely-duplicate prior issues (requires models/dup_index.joblib,
+    # built by `python -m ghic.dupdetect --build-index`).
+    suggest_related: bool = True
+    related_min_similarity: float = 0.55
+
+    # Draft a "missing information" comment for under-specified issues.
+    # Uses the Anthropic API when a key is configured; otherwise a
+    # deterministic template. Never touches the classifier's decision.
+    draft_missing_info: bool = False
+
     extras: dict = field(default_factory=dict)
 
     @property
@@ -148,6 +158,9 @@ def load_settings() -> ServiceSettings:
         api_base_url=os.environ.get("GHIC_API_BASE_URL", "https://api.github.com"),
         request_timeout=_env_float("GHIC_REQUEST_TIMEOUT", 15.0),
         ledger_path=_load_ledger_path(),
+        suggest_related=_env_bool("GHIC_SUGGEST_RELATED", True),
+        related_min_similarity=_env_float("GHIC_RELATED_MIN_SIM", 0.55),
+        draft_missing_info=_env_bool("GHIC_DRAFT_MISSING_INFO", False),
     )
 
 
