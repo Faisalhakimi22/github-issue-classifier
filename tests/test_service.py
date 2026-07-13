@@ -31,6 +31,12 @@ SECRET = "test-secret"
 class StubPredictor:
     model_name = "stub"
 
+    @property
+    def cfg(self):
+        from ghic.config import get_config
+
+        return get_config(require_token=False)
+
     def __init__(self, proba: float = 0.9, threshold: float = 0.5) -> None:
         self.proba = proba
         self.threshold = threshold
@@ -72,6 +78,7 @@ def make_settings(**overrides: Any) -> ServiceSettings:
         webhook_secret=SECRET,
         dry_run=True,
         suggest_related=False,   # tests must not depend on models/dup_index.joblib
+        suggest_category=False,  # ...nor on models/category.joblib
     )
     defaults.update(overrides)
     return ServiceSettings(**defaults)
@@ -528,6 +535,84 @@ class TestRelatedIssues:
         resp = post_webhook(TestClient(app), issue_opened_payload())
         assert resp.status_code == 200
         assert resp.json()["related_issues"] == []
+
+
+# ---------------------------------------------------------------------------
+# Category suggestion (assistive, never auto-labeled)
+# ---------------------------------------------------------------------------
+class StubCategoryPredictor:
+    classes = ["bug", "feature", "question"]
+
+    def predict_frame(self, feats):
+        return {"predicted": "bug", "confidence": 0.72,
+                "proba": {"bug": 0.72, "feature": 0.18, "question": 0.10}}
+
+
+class TestCategorySuggestion:
+    def test_category_in_response_and_comment(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh,
+                         category_predictor=StubCategoryPredictor())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.json()["category"]["predicted"] == "bug"
+        assert "Suggested category" in gh.comments[0][2]
+        assert "**bug**" in gh.comments[0][2]
+
+    def test_category_absent_when_disabled(self):
+        client = make_client(make_settings())
+        resp = post_webhook(client, issue_opened_payload())
+        assert resp.json()["category"] is None
+
+    def test_category_failure_never_blocks_prediction(self):
+        class Broken:
+            classes = []
+
+            def predict_frame(self, feats):
+                raise RuntimeError("model corrupt")
+
+        app = create_app(make_settings(), predictor=StubPredictor(),
+                         category_predictor=Broken())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.status_code == 200
+        assert resp.json()["category"] is None
+        assert resp.json()["prediction"]["proba_actionable_bug"] == 0.9
+
+    def test_no_category_label_is_ever_applied(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, apply_label=True),
+                         predictor=StubPredictor(), gh_client=gh,
+                         category_predictor=StubCategoryPredictor())
+        post_webhook(TestClient(app), issue_opened_payload())
+        assert gh.labels == [("acme/widgets", 42, ["predicted:actionable-bug"])]
+
+
+class TestCategoryDerivation:
+    def test_repo_conventions_normalize(self):
+        from ghic.category import derive_category
+
+        assert derive_category(["bug"]) == "bug"
+        assert derive_category(["type:bug"]) == "bug"
+        assert derive_category(["Type: Bug"]) == "bug"
+        assert derive_category(["type:support"]) == "question"
+        assert derive_category(["feature-request"]) == "feature"
+
+    def test_priority_resolves_conflicts(self):
+        from ghic.category import derive_category
+
+        assert derive_category(["bug", "*duplicate"]) == "duplicate"
+        assert derive_category(["feature-request", "*question"]) == "question"
+
+    def test_regression_maps_to_bug(self):
+        from ghic.category import derive_category
+
+        assert derive_category(["regression"]) == "bug"
+
+    def test_unmapped_labels_yield_none(self):
+        from ghic.category import derive_category
+
+        assert derive_category(["stale", "comp:lite", "tf 2.16"]) is None
+        assert derive_category([]) is None
 
 
 # ---------------------------------------------------------------------------

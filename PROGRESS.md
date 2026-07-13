@@ -47,7 +47,34 @@ Verified against code, not against `docs/PRD.md`'s own table.
 
 **Gate: PASSED** — this table. Committed before Phase 15 work started.
 
-## Phase 15 — Issue Category Classification — pending
+## Phase 15 — Issue Category Classification (2026-07-14)
+
+Built `ghic/category.py`: 6-class head (bug / feature / question / docs /
+duplicate / invalid) trained on real ground truth — the category label a
+maintainer eventually applied (2,747 of 6,175 issues), normalized across
+repo conventions, multi-label conflicts resolved by documented priority.
+Same protocol as the champion: per-repo chronological split, walk-forward
+CV (macro-F1), one test evaluation. `security` (0 occurrences) and
+standalone `regression` (27, folded into bug) are documented as
+untrainable in this corpus, not faked.
+
+Measured (chronological test, n=549, `models/CATEGORY_CARD.md`):
+winner `logreg_balanced`, accuracy 0.583, macro-F1 0.470. Per-class F1:
+bug 0.69, feature 0.65, question 0.48, duplicate 0.42, docs 0.40,
+invalid 0.18. Note the duplicate row independently corroborates the
+Phase 2 negative finding. Calibration: shipped uncalibrated — the
+newest-15% calibration slice was missing rare classes entirely (the
+guard in `train_category` refuses to fit a partial calibrator).
+
+Service wiring (spec item 8, label recommendation): category ships as an
+assistive suggestion in the webhook response and comment
+(`GHIC_SUGGEST_CATEGORY`, on by default when `models/category.joblib`
+exists); **no category label is ever applied automatically** — a test
+asserts that. Feature frame is shared with the actionability head via
+`inference.build_feature_frame` (one engineering pass per event).
+
+**Gate: PASSED** — `models/CATEGORY_CARD.md` with real per-class
+metrics + confusion matrix; 115 tests green (8 new). Committed.
 
 ## Phase 16 — Maintainer Assignment — pending
 

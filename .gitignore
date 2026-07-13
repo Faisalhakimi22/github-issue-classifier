@@ -16,6 +16,7 @@ data/predictions.jsonl
 models/*
 !models/MODEL_CARD.md
 !models/DUPLICATE_CARD.md
+!models/CATEGORY_CARD.md
 
 # Local-only archive of course/personal files, not part of the published project
 _archive/

@@ -61,8 +61,10 @@ def create_app(
     predictor: IssuePredictor | None = None,
     gh_client: GitHubAppClient | None = None,
     dup_index: Any = None,
+    category_predictor: Any = None,
 ) -> FastAPI:
-    """Build the app. `predictor` / `gh_client` / `dup_index` are injectable for tests."""
+    """Build the app. `predictor` / `gh_client` / `dup_index` /
+    `category_predictor` are injectable for tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -118,6 +120,14 @@ def create_app(
         if dup_index is not None:
             logger.info("duplicate index loaded (%d issues)", len(dup_index.meta))
     app.state.dup_index = dup_index
+    # Category head (optional; assistive suggestion, never auto-labeled).
+    if category_predictor is None and settings.suggest_category:
+        from ..category import load_category_predictor
+
+        category_predictor = load_category_predictor()
+        if category_predictor is not None:
+            logger.info("category model loaded (%s)", ", ".join(category_predictor.classes))
+    app.state.category_predictor = category_predictor
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -293,6 +303,30 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         " [dry-run]" if s.dry_run else "",
     )
 
+    # Assistive category suggestion (Phase 15 head). Reuses the same
+    # engineered feature frame; a category failure never blocks the prediction.
+    category: dict[str, Any] | None = None
+    if app.state.category_predictor is not None:
+        from .inference import build_feature_frame
+
+        try:
+            frame = build_feature_frame(
+                predictor.cfg,
+                repo_full_name=repo,
+                issue_number=number,
+                title=issue.get("title", ""),
+                body=issue.get("body") or "",
+                created_at=issue.get("created_at") or _utcnow_iso(),
+                author_login=author,
+                author_created_at=author_created_at,
+                author_public_repos=author_public_repos,
+                author_followers=author_followers,
+                latest_release_iso=latest_release,
+            )
+            category = app.state.category_predictor.predict_frame(frame)
+        except Exception as e:
+            logger.warning("category prediction failed: %s", e)
+
     # Assistive duplicate candidates — surfaced for a maintainer to confirm,
     # never acted on automatically (pairwise ground truth doesn't exist).
     related: list[dict[str, Any]] = []
@@ -322,7 +356,7 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     actions: list[str] = []
     if not s.dry_run and gh is not None and installation_id:
         if s.post_comment:
-            comment = format_comment(pred, related)
+            comment = format_comment(pred, related, category)
             if info_request:
                 comment += "\n\n---\n\n" + info_request["draft"]
             gh.post_comment(repo, number, comment, installation_id)
@@ -333,8 +367,9 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     for action in actions:
         app.state.tracker.record_action(repo, number, action)
 
-    return {"ok": True, "prediction": pred.as_dict(), "related_issues": related,
-            "missing_info": info_request, "actions": actions, "dry_run": s.dry_run}
+    return {"ok": True, "prediction": pred.as_dict(), "category": category,
+            "related_issues": related, "missing_info": info_request,
+            "actions": actions, "dry_run": s.dry_run}
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +498,7 @@ def export_openapi(path: Any = None) -> Any:
 
     spec_app = create_app(
         ServiceSettings(model_path=Path("unused.joblib"), webhook_secret="spec",
-                        suggest_related=False),
+                        suggest_related=False, suggest_category=False),
         predictor=object(),  # never called during spec generation
     )
     spec = spec_app.openapi()

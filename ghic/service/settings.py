@@ -89,6 +89,11 @@ class ServiceSettings:
     # deterministic template. Never touches the classifier's decision.
     draft_missing_info: bool = False
 
+    # Suggest an issue category (bug/feature/question/docs/duplicate/invalid)
+    # in the response and comment. Requires models/category.joblib (built by
+    # `python -m ghic.category --train`); assistive only, never auto-labeled.
+    suggest_category: bool = True
+
     extras: dict = field(default_factory=dict)
 
     @property
@@ -161,6 +166,7 @@ def load_settings() -> ServiceSettings:
         suggest_related=_env_bool("GHIC_SUGGEST_RELATED", True),
         related_min_similarity=_env_float("GHIC_RELATED_MIN_SIM", 0.55),
         draft_missing_info=_env_bool("GHIC_DRAFT_MISSING_INFO", False),
+        suggest_category=_env_bool("GHIC_SUGGEST_CATEGORY", True),
     )
 
 

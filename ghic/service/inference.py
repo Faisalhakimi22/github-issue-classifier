@@ -54,6 +54,49 @@ class Prediction:
         }
 
 
+def build_feature_frame(
+    cfg: Config,
+    *,
+    repo_full_name: str,
+    issue_number: int,
+    title: str,
+    body: str,
+    created_at: str,
+    author_login: str = "",
+    author_created_at: str | None = None,
+    author_public_repos: int | None = None,
+    author_followers: int | None = None,
+    latest_release_iso: str | None = None,
+) -> pd.DataFrame:
+    """One issue -> the engineered single-row frame every model head consumes.
+
+    Shared by the actionability and category predictors so an issue is
+    feature-engineered exactly once per event.
+    """
+    raw = pd.DataFrame([{
+        "repo_name": repo_full_name,
+        "number": issue_number,
+        "title": title or "",
+        "body": body or "",
+        "created_at": created_at,
+        "author_login": author_login or "unknown",
+        "author_created_at": author_created_at,
+        "author_public_repos": (
+            np.nan if author_public_repos is None else author_public_repos
+        ),
+        "author_followers": (
+            np.nan if author_followers is None else author_followers
+        ),
+    }])
+    # Always pass a release mapping so the days_since_last_release column
+    # exists (the fitted ColumnTransformer requires it); an empty list
+    # yields NaN, which the pipeline's median imputer absorbs.
+    release_dates = {
+        repo_full_name: [latest_release_iso] if latest_release_iso else []
+    }
+    return features.engineer_features(raw, cfg, repo_release_dates=release_dates)
+
+
 class IssuePredictor:
     """Loads a fitted pipeline once and scores single issues from dicts."""
 
@@ -86,28 +129,19 @@ class IssuePredictor:
         threshold: float | None = None,
     ) -> Prediction:
         threshold = self.threshold if threshold is None else threshold
-        raw = pd.DataFrame([{
-            "repo_name": repo_full_name,
-            "number": issue_number,
-            "title": title or "",
-            "body": body or "",
-            "created_at": created_at,
-            "author_login": author_login or "unknown",
-            "author_created_at": author_created_at,
-            "author_public_repos": (
-                np.nan if author_public_repos is None else author_public_repos
-            ),
-            "author_followers": (
-                np.nan if author_followers is None else author_followers
-            ),
-        }])
-        # Always pass a release mapping so the days_since_last_release column
-        # exists (the fitted ColumnTransformer requires it); an empty list
-        # yields NaN, which the pipeline's median imputer absorbs.
-        release_dates = {
-            repo_full_name: [latest_release_iso] if latest_release_iso else []
-        }
-        feats = features.engineer_features(raw, self.cfg, repo_release_dates=release_dates)
+        feats = build_feature_frame(
+            self.cfg,
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            title=title,
+            body=body,
+            created_at=created_at,
+            author_login=author_login,
+            author_created_at=author_created_at,
+            author_public_repos=author_public_repos,
+            author_followers=author_followers,
+            latest_release_iso=latest_release_iso,
+        )
 
         with self._lock:
             proba = float(self.pipeline.predict_proba(feats)[:, 1][0])
@@ -130,7 +164,11 @@ class IssuePredictor:
         )
 
 
-def format_comment(pred: Prediction, related: list[dict[str, Any]] | None = None) -> str:
+def format_comment(
+    pred: Prediction,
+    related: list[dict[str, Any]] | None = None,
+    category: dict[str, Any] | None = None,
+) -> str:
     """Markdown comment the bot posts on a scored issue."""
     verdict = (
         "likely an **actionable bug**"
@@ -148,6 +186,11 @@ def format_comment(pred: Prediction, related: list[dict[str, Any]] | None = None
         f"| Decision threshold | {pred.threshold:.2f} |",
         f"| Model | `{pred.model_name}` |",
     ]
+    if category:
+        lines.append(
+            f"| Suggested category | **{category['predicted']}** "
+            f"(confidence {category['confidence']:.2f}) |"
+        )
     if pred.top_features:
         kind = (
             "signed contribution" if pred.signed_contributions else "importance (magnitude)"
