@@ -76,7 +76,29 @@ asserts that. Feature frame is shared with the actionability head via
 **Gate: PASSED** — `models/CATEGORY_CARD.md` with real per-class
 metrics + confusion matrix; 115 tests green (8 new). Committed.
 
-## Phase 16 — Maintainer Assignment — pending
+## Phase 16 — Maintainer Assignment (2026-07-14) — ⚠ BLOCKED on credentials
+
+Built `ghic/assign.py` end-to-end:
+
+- **Collection extension** (`--collect`): assignees + participants + closing
+  actor per issue, aliased 50-issue GraphQL batches, cached/resumable, same
+  rate-limit discipline as `collect.py`. Output `data/processed/assignments.json`.
+- **Causal evaluation** (`--evaluate`): similarity recommender (assignees/
+  closers of the 20 most similar prior issues, TF-IDF, similarity-weighted)
+  vs the naive most-active-assignee baseline; hit@{1,3,5} on the
+  chronological test slice; auto card `models/ASSIGNMENT_CARD.md` whose
+  Decision section applies the plan's rule (baseline wins → baseline ships).
+- 12 tests, including a synthetic two-cluster corpus where the similarity
+  recommender must route each cluster to its owner at k=1 (passes).
+
+**Gate: NOT passed — blocked.** The live collection failed: `GH_TOKEN` in
+`.env` returns 401 on a bare `/rate_limit` probe (unauthenticated requests
+succeed → the token is revoked/expired, not a network/code issue). Real
+top-k numbers cannot be produced without it, and per the ground rules they
+will not be invented. **To unblock:** refresh `GH_TOKEN` in `.env`, then
+`python -m ghic.assign --collect && python -m ghic.assign --evaluate`
+(~5 min). Until then no assignment feature ships, and nothing in the
+service references one.
 
 ## Phase 17 — Priority / Severity / Effort — pending
 

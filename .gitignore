@@ -11,12 +11,10 @@ data/predictions.jsonl
 !data/**/.gitkeep
 
 # Model artifacts (30MB joblib pipelines — rebuild with `python -m ghic.train`,
-# or attach to a GitHub Release). The auto-generated model card IS tracked.
+# or attach to a GitHub Release). The model/decision cards ARE tracked.
 # reports/ is tracked too: the README links to the report and its figures.
 models/*
-!models/MODEL_CARD.md
-!models/DUPLICATE_CARD.md
-!models/CATEGORY_CARD.md
+!models/*.md
 
 # Local-only archive of course/personal files, not part of the published project
 _archive/
