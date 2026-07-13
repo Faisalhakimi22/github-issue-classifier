@@ -1,0 +1,137 @@
+{
+  "winner": "logreg_balanced",
+  "cv": {
+    "logreg_balanced": {
+      "fold_macro_f1": [
+        0.4450990101436812,
+        0.5239244860949193,
+        0.3878517927502318
+      ],
+      "mean_macro_f1": 0.45229176299627744,
+      "std_macro_f1": 0.05578378640619654
+    },
+    "rf_balanced": {
+      "fold_macro_f1": [
+        0.3572789690719464,
+        0.4178053830227743,
+        0.5743775995246584
+      ],
+      "mean_macro_f1": 0.44982065053979303,
+      "std_macro_f1": 0.09147563191637617
+    }
+  },
+  "calibration": "uncalibrated (calibration slice missing classes)",
+  "classes": [
+    "duplicate",
+    "invalid",
+    "question",
+    "docs",
+    "feature",
+    "bug"
+  ],
+  "class_support_total": {
+    "duplicate": 369,
+    "invalid": 38,
+    "question": 425,
+    "docs": 47,
+    "feature": 400,
+    "bug": 1468
+  },
+  "test": {
+    "n": 549,
+    "accuracy": 0.5828779599271403,
+    "macro_f1": 0.47041523324565726,
+    "per_class": {
+      "duplicate": {
+        "precision": 0.34615384615384615,
+        "recall": 0.5454545454545454,
+        "f1": 0.4235294117647059,
+        "support": 66
+      },
+      "invalid": {
+        "precision": 0.13636363636363635,
+        "recall": 0.25,
+        "f1": 0.17647058823529413,
+        "support": 12
+      },
+      "question": {
+        "precision": 0.46,
+        "recall": 0.5054945054945055,
+        "f1": 0.4816753926701571,
+        "support": 91
+      },
+      "docs": {
+        "precision": 0.3157894736842105,
+        "recall": 0.5454545454545454,
+        "f1": 0.4,
+        "support": 11
+      },
+      "feature": {
+        "precision": 0.6210526315789474,
+        "recall": 0.6781609195402298,
+        "f1": 0.6483516483516484,
+        "support": 87
+      },
+      "bug": {
+        "precision": 0.8133971291866029,
+        "recall": 0.6028368794326241,
+        "f1": 0.6924643584521385,
+        "support": 282
+      }
+    },
+    "confusion_matrix": [
+      [
+        36,
+        6,
+        8,
+        0,
+        13,
+        3
+      ],
+      [
+        1,
+        3,
+        2,
+        2,
+        1,
+        3
+      ],
+      [
+        11,
+        6,
+        46,
+        6,
+        5,
+        17
+      ],
+      [
+        0,
+        0,
+        1,
+        6,
+        3,
+        1
+      ],
+      [
+        3,
+        1,
+        6,
+        3,
+        59,
+        15
+      ],
+      [
+        53,
+        6,
+        37,
+        2,
+        14,
+        170
+      ]
+    ]
+  },
+  "coverage": {
+    "issues_with_ground_truth": 2747,
+    "corpus_total": 6175
+  }
+}
