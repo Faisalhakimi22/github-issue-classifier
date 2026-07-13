@@ -5,11 +5,13 @@ Endpoints:
   POST /webhook      GitHub webhook receiver (HMAC-verified)
   POST /api/predict  direct scoring API (same auth caveat as /webhook)
 
-Event handling: `issues`/opened is scored; `issues`/closed feeds the online
-evaluation loop (the bot grades its own earlier prediction against the final
-labels/state_reason). Everything else is acknowledged and ignored — GitHub
-retries on non-2xx, so unknown events must still return 200. Issues opened by
-bots are ignored (the model was trained with bot authors excluded).
+Event handling: `issues`/opened is scored (+ optional actions); `edited`
+re-scores with the improved text (never posts anything); `closed` feeds the
+online evaluation loop (the bot grades its own earlier prediction against
+the final labels/state_reason); `labeled`/`unlabeled` are recorded to the
+ledger as future ground truth. Everything else is acknowledged and ignored —
+GitHub retries on non-2xx, so unknown events must still return 200. Issues
+opened by bots are ignored (the model was trained with bot authors excluded).
 
 Run locally:
   uvicorn --factory ghic.service.app:create_app --reload   # uses GHIC_* env vars
@@ -108,7 +110,7 @@ def create_app(
         return response
     # Rolling in-memory observability: totals survive for the process
     # lifetime, `recent` keeps the last 500 scored issues for /stats.
-    app.state.totals = {"scored": 0, "positive": 0, "proba_sum": 0.0}
+    app.state.totals = {"scored": 0, "positive": 0, "proba_sum": 0.0, "rescored": 0}
     app.state.recent = deque(maxlen=500)
     # Online evaluation ledger: predictions at open time, graded at close time.
     app.state.tracker = PredictionTracker(ledger_path=settings.ledger_path)
@@ -156,6 +158,7 @@ def create_app(
         t = app.state.totals
         return {
             "scored": t["scored"],
+            "rescored_after_edit": t["rescored"],
             "predicted_actionable": t["positive"],
             "positive_rate": round(t["positive"] / t["scored"], 4) if t["scored"] else None,
             "mean_proba": round(t["proba_sum"] / t["scored"], 4) if t["scored"] else None,
@@ -196,8 +199,12 @@ def create_app(
             return {"ok": True, "pong": payload.get("zen", "")}
         if event == "issues" and payload.get("action") == "opened":
             return _handle_issue_opened(app, payload)
+        if event == "issues" and payload.get("action") == "edited":
+            return _handle_issue_edited(app, payload)
         if event == "issues" and payload.get("action") == "closed":
             return _handle_issue_closed(app, payload)
+        if event == "issues" and payload.get("action") in ("labeled", "unlabeled"):
+            return _handle_label_event(app, payload)
         return {"ok": True, "ignored": f"{event}/{payload.get('action')}"}
 
     @app.post("/api/predict")
@@ -240,6 +247,24 @@ def _percentiles(samples: Any) -> dict[str, float]:
     return {"n": len(values), "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99)}
 
 
+def _enrich(
+    s: ServiceSettings, gh: GitHubAppClient | None, author: str, repo: str,
+    installation_id: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Author profile + latest release. Best-effort — any failure degrades to
+    NaN features, which the pipeline imputes."""
+    author_created_at = author_public_repos = author_followers = None
+    latest_release = None
+    if s.enrich and gh is not None and installation_id:
+        user = gh.get_user(author, installation_id)
+        if user:
+            author_created_at = user.get("created_at")
+            author_public_repos = user.get("public_repos")
+            author_followers = user.get("followers")
+        latest_release = gh.get_latest_release_date(repo, installation_id)
+    return author_created_at, author_public_repos, author_followers, latest_release
+
+
 # ---------------------------------------------------------------------------
 # The issues.opened flow
 # ---------------------------------------------------------------------------
@@ -259,17 +284,9 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     if _is_bot(author):
         return {"ok": True, "ignored": f"bot author {author}"}
 
-    # Enrichment: author profile + latest release. Best-effort — any failure
-    # degrades to NaN features, which the pipeline imputes.
-    author_created_at = author_public_repos = author_followers = None
-    latest_release = None
-    if s.enrich and gh is not None and installation_id:
-        user = gh.get_user(author, installation_id)
-        if user:
-            author_created_at = user.get("created_at")
-            author_public_repos = user.get("public_repos")
-            author_followers = user.get("followers")
-        latest_release = gh.get_latest_release_date(repo, installation_id)
+    author_created_at, author_public_repos, author_followers, latest_release = _enrich(
+        s, gh, author, repo, installation_id
+    )
 
     pred = predictor.predict(
         repo_full_name=repo,
@@ -364,12 +381,78 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         if s.apply_label and pred.predicted_label == 1:
             gh.add_labels(repo, number, [s.label_name], installation_id)
             actions.append("label")
+        if s.project_id and pred.predicted_label == 1 and issue.get("node_id"):
+            gh.add_issue_to_project(s.project_id, issue["node_id"], installation_id)
+            actions.append("project")
     for action in actions:
         app.state.tracker.record_action(repo, number, action)
 
     return {"ok": True, "prediction": pred.as_dict(), "category": category,
             "related_issues": related, "missing_info": info_request,
             "actions": actions, "dry_run": s.dry_run}
+
+
+# ---------------------------------------------------------------------------
+# The issues.edited flow: re-score with the improved text, no write actions
+# ---------------------------------------------------------------------------
+def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+    """Reporters frequently add repro steps after opening (often because the
+    bot asked). Re-scoring updates the pending ledger entry so the prediction
+    graded at close reflects the text maintainers actually triaged. No
+    comment or label is ever posted on edit — one issue, at most one comment."""
+    s: ServiceSettings = app.state.settings
+    predictor: IssuePredictor = app.state.predictor
+    gh: GitHubAppClient | None = app.state.gh
+
+    issue = payload.get("issue") or {}
+    repo = (payload.get("repository") or {}).get("full_name", "")
+    installation_id = (payload.get("installation") or {}).get("id")
+    number = int(issue.get("number", 0))
+    author = ((issue.get("user") or {}).get("login")) or ""
+
+    if not repo or not number:
+        raise HTTPException(status_code=422, detail="malformed issues payload")
+    if _is_bot(author):
+        return {"ok": True, "ignored": f"bot author {author}"}
+    if issue.get("state") == "closed":
+        return {"ok": True, "ignored": "edit on closed issue"}
+
+    author_created_at, author_public_repos, author_followers, latest_release = _enrich(
+        s, gh, author, repo, installation_id
+    )
+    pred = predictor.predict(
+        repo_full_name=repo,
+        issue_number=number,
+        title=issue.get("title", ""),
+        body=issue.get("body") or "",
+        created_at=issue.get("created_at") or _utcnow_iso(),
+        author_login=author,
+        author_created_at=author_created_at,
+        author_public_repos=author_public_repos,
+        author_followers=author_followers,
+        latest_release_iso=latest_release,
+        threshold=s.threshold_for(repo),
+        explain=False,
+    )
+    app.state.totals["rescored"] += 1
+    app.state.tracker.record_prediction(repo, number, pred.proba, pred.predicted_label)
+    logger.info("rescored %s#%d after edit: P(bug)=%.3f", repo, number, pred.proba)
+    return {"ok": True, "rescored": True, "prediction": pred.as_dict()}
+
+
+# ---------------------------------------------------------------------------
+# Label events: maintainer labeling is future ground truth — record it
+# ---------------------------------------------------------------------------
+def _handle_label_event(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+    issue = payload.get("issue") or {}
+    repo = (payload.get("repository") or {}).get("full_name", "")
+    number = int(issue.get("number", 0))
+    label = ((payload.get("label") or {}).get("name")) or ""
+    if not repo or not number or not label:
+        return {"ok": True, "ignored": "label event without label/repo/number"}
+    added = payload.get("action") == "labeled"
+    app.state.tracker.record_label_event(repo, number, label, added)
+    return {"ok": True, "recorded": ("+" if added else "-") + label}
 
 
 # ---------------------------------------------------------------------------

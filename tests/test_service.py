@@ -58,6 +58,7 @@ class StubGitHub:
     def __init__(self) -> None:
         self.comments: list[tuple[str, int, str]] = []
         self.labels: list[tuple[str, int, list[str]]] = []
+        self.project_items: list[tuple[str, str]] = []
 
     def get_user(self, login: str, installation_id: int) -> dict[str, Any]:
         return {"created_at": "2020-01-01T00:00:00Z", "public_repos": 5, "followers": 2}
@@ -70,6 +71,9 @@ class StubGitHub:
 
     def add_labels(self, full_name, issue_number, labels, installation_id) -> None:
         self.labels.append((full_name, issue_number, labels))
+
+    def add_issue_to_project(self, project_node_id, issue_node_id, installation_id) -> None:
+        self.project_items.append((project_node_id, issue_node_id))
 
 
 def make_settings(**overrides: Any) -> ServiceSettings:
@@ -184,10 +188,10 @@ class TestRouting:
         assert resp.status_code == 200
         assert "ignored" in resp.json()
 
-    def test_issue_edited_action_ignored(self):
+    def test_issue_reopened_action_ignored(self):
         client = make_client(make_settings())
         payload = issue_opened_payload()
-        payload["action"] = "edited"
+        payload["action"] = "reopened"
         resp = post_webhook(client, payload)
         assert "ignored" in resp.json()
 
@@ -535,6 +539,99 @@ class TestRelatedIssues:
         resp = post_webhook(TestClient(app), issue_opened_payload())
         assert resp.status_code == 200
         assert resp.json()["related_issues"] == []
+
+
+# ---------------------------------------------------------------------------
+# issues.edited / label events / Projects v2 (Phase 18 API surface)
+# ---------------------------------------------------------------------------
+class TestIssueEdited:
+    def edited_payload(self, **issue_overrides: Any) -> dict[str, Any]:
+        p = issue_opened_payload(**issue_overrides)
+        p["action"] = "edited"
+        p["issue"]["state"] = "open"
+        return p
+
+    def test_edit_rescores_and_updates_pending_prediction(self):
+        predictor = StubPredictor(proba=0.2)
+        app = create_app(make_settings(), predictor=predictor)
+        client = TestClient(app)
+        post_webhook(client, issue_opened_payload())
+        predictor.proba = 0.9            # the reporter added repro steps
+        resp = post_webhook(client, self.edited_payload())
+        assert resp.json()["rescored"] is True
+        assert resp.json()["prediction"]["proba_actionable_bug"] == 0.9
+        # the pending entry graded at close must reflect the re-score
+        assert app.state.tracker.pending[("acme/widgets", 42)]["proba"] == 0.9
+        assert app.state.totals["rescored"] == 1
+        assert app.state.totals["scored"] == 1   # edits don't inflate 'scored'
+
+    def test_edit_never_posts_even_when_comments_enabled(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True,
+                                       apply_label=True),
+                         predictor=StubPredictor(), gh_client=gh)
+        post_webhook(TestClient(app), self.edited_payload())
+        assert gh.comments == []
+        assert gh.labels == []
+
+    def test_edit_on_closed_issue_ignored(self):
+        app = create_app(make_settings(), predictor=StubPredictor())
+        payload = self.edited_payload()
+        payload["issue"]["state"] = "closed"
+        resp = post_webhook(TestClient(app), payload)
+        assert "ignored" in resp.json()
+
+
+class TestLabelEvents:
+    def label_payload(self, action: str, label: str) -> dict[str, Any]:
+        p = issue_opened_payload()
+        p["action"] = action
+        p["label"] = {"name": label}
+        return p
+
+    def test_labeled_event_recorded(self):
+        app = create_app(make_settings(), predictor=StubPredictor())
+        client = TestClient(app)
+        resp = post_webhook(client, self.label_payload("labeled", "bug"))
+        assert resp.json()["recorded"] == "+bug"
+        resp = post_webhook(client, self.label_payload("unlabeled", "bug"))
+        assert resp.json()["recorded"] == "-bug"
+        assert app.state.tracker.label_events == 2
+
+    def test_label_events_survive_ledger_replay(self, tmp_path):
+        from ghic.service.tracking import PredictionTracker
+
+        ledger = tmp_path / "ledger.jsonl"
+        t = PredictionTracker(ledger_path=ledger)
+        t.record_label_event("acme/widgets", 1, "*duplicate", True)
+        t2 = PredictionTracker(ledger_path=ledger)
+        assert t2.label_events == 1
+        assert t2.summary()["label_events_observed"] == 1
+
+
+class TestProjectsV2:
+    def test_positive_prediction_added_to_project(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, project_id="PVT_abc"),
+                         predictor=StubPredictor(proba=0.9), gh_client=gh)
+        payload = issue_opened_payload(node_id="I_node123")
+        resp = post_webhook(TestClient(app), payload)
+        assert gh.project_items == [("PVT_abc", "I_node123")]
+        assert "project" in resp.json()["actions"]
+
+    def test_negative_prediction_not_added(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, project_id="PVT_abc"),
+                         predictor=StubPredictor(proba=0.1), gh_client=gh)
+        post_webhook(TestClient(app), issue_opened_payload(node_id="I_node123"))
+        assert gh.project_items == []
+
+    def test_dry_run_never_touches_project(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=True, project_id="PVT_abc"),
+                         predictor=StubPredictor(proba=0.9), gh_client=gh)
+        post_webhook(TestClient(app), issue_opened_payload(node_id="I_node123"))
+        assert gh.project_items == []
 
 
 # ---------------------------------------------------------------------------

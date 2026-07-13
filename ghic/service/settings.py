@@ -69,6 +69,9 @@ class ServiceSettings:
     post_comment: bool = False            # comment the prediction on the issue
     apply_label: bool = False             # add `label_name` when P >= threshold
     label_name: str = "predicted:actionable-bug"
+    # Projects v2 board node ID (PVT_…). When set, issues predicted actionable
+    # are added to the board (needs the App's Projects write permission).
+    project_id: str = ""
 
     # Enrichment (author metadata + latest release via the GitHub API)
     enrich: bool = True
@@ -159,6 +162,7 @@ def load_settings() -> ServiceSettings:
         post_comment=_env_bool("GHIC_POST_COMMENT", False),
         apply_label=_env_bool("GHIC_APPLY_LABEL", False),
         label_name=os.environ.get("GHIC_LABEL_NAME", "predicted:actionable-bug"),
+        project_id=os.environ.get("GHIC_PROJECT_ID", ""),
         enrich=_env_bool("GHIC_ENRICH", True),
         api_base_url=os.environ.get("GHIC_API_BASE_URL", "https://api.github.com"),
         request_timeout=_env_float("GHIC_REQUEST_TIMEOUT", 15.0),

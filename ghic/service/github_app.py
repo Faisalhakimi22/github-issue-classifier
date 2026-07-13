@@ -136,3 +136,30 @@ class GitHubAppClient:
         )
         resp.raise_for_status()
         logger.info("labeled %s#%d with %s", full_name, issue_number, labels)
+
+    def add_issue_to_project(self, project_node_id: str, issue_node_id: str,
+                             installation_id: int) -> None:
+        """Add an issue to a Projects v2 board (GraphQL — v2 has no REST API).
+
+        Requires the App to have the organization/repository Projects write
+        permission; `project_node_id` is the board's node ID (`PVT_…`).
+        """
+        resp = self._request(
+            "POST",
+            "/graphql",
+            installation_id,
+            json_body={
+                "query": (
+                    "mutation($project: ID!, $content: ID!) {"
+                    " addProjectV2ItemById(input:"
+                    " {projectId: $project, contentId: $content})"
+                    " { item { id } } }"
+                ),
+                "variables": {"project": project_node_id, "content": issue_node_id},
+            },
+        )
+        resp.raise_for_status()
+        errors = resp.json().get("errors")
+        if errors:
+            raise RuntimeError(f"addProjectV2ItemById failed: {errors}")
+        logger.info("added issue %s to project %s", issue_node_id, project_node_id)

@@ -35,6 +35,7 @@ class PredictionTracker:
         self.pending: dict[tuple[str, int], dict[str, Any]] = {}
         self.confusion = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
         self.actions = 0            # GitHub writes performed (audit records)
+        self.label_events = 0       # maintainer label add/remove events observed
         if ledger_path and ledger_path.exists():
             self._replay()
 
@@ -63,6 +64,8 @@ class PredictionTracker:
                     self._note_outcome(rec)
                 elif rec.get("type") == "action":
                     self.actions += 1
+                elif rec.get("type") == "label_event":
+                    self.label_events += 1
                 n += 1
         logger.info("replayed %d ledger records from %s", n, self.ledger_path)
 
@@ -105,6 +108,24 @@ class PredictionTracker:
             self.actions += 1
             self._append(rec)
 
+    def record_label_event(self, repo: str, number: int, label: str, added: bool) -> None:
+        """Maintainer labeling activity, observed live.
+
+        This is deliberately collected: category labels applied while an
+        issue is open are early ground truth for the category head, and
+        duplicate labels with timestamps are exactly the pairwise signal the
+        duplicate-detection card says is missing. Recording them costs one
+        ledger line now and buys future evaluations real data.
+        """
+        from datetime import datetime, timezone
+
+        rec = {"type": "label_event", "repo": repo, "number": number,
+               "label": label, "added": added,
+               "at": datetime.now(tz=timezone.utc).isoformat()}
+        with self._lock:
+            self.label_events += 1
+            self._append(rec)
+
     def record_outcome(self, repo: str, number: int, truth: int) -> bool:
         """Returns True when the outcome matched a tracked prediction."""
         rec = {"type": "outcome", "repo": repo, "number": number, "truth": truth}
@@ -125,6 +146,7 @@ class PredictionTracker:
         return {
             "awaiting_outcome": len(self.pending),
             "github_writes_audited": self.actions,
+            "label_events_observed": self.label_events,
             "resolved": resolved,
             "confusion": dict(c),
             "live_precision": round(precision, 4) if precision is not None else None,
