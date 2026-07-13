@@ -97,6 +97,11 @@ class ServiceSettings:
     # `python -m ghic.category --train`); assistive only, never auto-labeled.
     suggest_category: bool = True
 
+    # Coarse resolution-time bucket in the API response (never the public
+    # comment). Requires models/effort.joblib, which only exists when an
+    # `python -m ghic.effort --evaluate` run met the pre-declared ship bar.
+    estimate_effort: bool = True
+
     extras: dict = field(default_factory=dict)
 
     @property
@@ -171,6 +176,7 @@ def load_settings() -> ServiceSettings:
         related_min_similarity=_env_float("GHIC_RELATED_MIN_SIM", 0.55),
         draft_missing_info=_env_bool("GHIC_DRAFT_MISSING_INFO", False),
         suggest_category=_env_bool("GHIC_SUGGEST_CATEGORY", True),
+        estimate_effort=_env_bool("GHIC_ESTIMATE_EFFORT", True),
     )
 
 
