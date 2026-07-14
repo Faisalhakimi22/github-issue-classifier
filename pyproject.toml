@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ghic"
-version = "1.0.0"
+version = "1.1.0"
 description = "GitHub Issue Triage Bot — predicts whether a newly opened issue will resolve as an actionable bug, and triages it via a GitHub App webhook."
 readme = "README.md"
 license = { text = "MIT" }
