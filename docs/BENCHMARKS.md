@@ -109,12 +109,23 @@ candidate proxy fails for a documented reason (the severity keyword-proxy
 is circular: it would train the model to detect its own labeling rule).
 No numbers exist because none could honestly be produced.
 
-## 7. Maintainer assignment — evaluation pending (credentials)
+## 7. Maintainer assignment — similarity recommender beats the baseline
 
-Source: `ghic/assign.py` (built + synthetically tested); the live
-evaluation needs a supplemental collection pass and the repo's `GH_TOKEN`
-is currently revoked. `models/ASSIGNMENT_CARD.md` will carry hit@{1,3,5}
-vs the most-active baseline once run. No number is published until then.
+Source: `models/ASSIGNMENT_CARD.md`, `reports/assign.json`
+(`python -m ghic.assign --collect && --evaluate`, 2026-07-15). Ground
+truth: the issue's eventual human assignee(s); 968 test issues scored.
+
+| recommender | hit@1 | hit@3 | hit@5 |
+|---|---|---|---|
+| similarity (assignees/closers of 20 most similar priors) | **0.115** | **0.389** | **0.485** |
+| most-active-assignee baseline (causal) | 0.000 | 0.261 | 0.406 |
+
+Per the plan's decision rule, the similarity mechanism ships (a learned
+ranker would have to beat 0.389 hit@3 on this protocol first). Suggestions
+are response-level only — the service never assigns anyone and never
+@-mentions suggested names in comments. Known caveats on the card:
+assignee state is close-time (slightly acausal for late assignments), and
+"most-active-committer" is approximated by most-active-assignee.
 
 ## 8. Service performance — measured, single uvicorn worker, Windows dev box
 

@@ -102,6 +102,13 @@ class ServiceSettings:
     # `python -m ghic.effort --evaluate` run met the pre-declared ship bar.
     estimate_effort: bool = True
 
+    # Maintainer suggestions in the API response (never an assignment, never
+    # an @-mention). Requires the dup index plus data/processed/
+    # assignments.json (`python -m ghic.assign --collect`). The similarity
+    # mechanism won its evaluation vs the most-active baseline — see
+    # models/ASSIGNMENT_CARD.md.
+    suggest_assignees: bool = True
+
     extras: dict = field(default_factory=dict)
 
     @property
@@ -177,6 +184,7 @@ def load_settings() -> ServiceSettings:
         draft_missing_info=_env_bool("GHIC_DRAFT_MISSING_INFO", False),
         suggest_category=_env_bool("GHIC_SUGGEST_CATEGORY", True),
         estimate_effort=_env_bool("GHIC_ESTIMATE_EFFORT", True),
+        suggest_assignees=_env_bool("GHIC_SUGGEST_ASSIGNEES", True),
     )
 
 

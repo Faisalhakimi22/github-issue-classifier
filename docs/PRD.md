@@ -147,7 +147,7 @@ unjustified at one model family and one operator.
 | Effort (coarse time-to-resolution bucket) | **BUILT** — cleared a pre-declared ship bar; API response only | `models/EFFORT_CARD.md`: Spearman 0.492, MAE −11.8% vs baseline |
 | Priority | **not shipped** — zero ground truth in corpus | `models/PRIORITY_CARD.md` |
 | Severity | **not shipped** — only a circular keyword proxy exists | `models/SEVERITY_CARD.md` |
-| Maintainer assignment | built, **evaluation blocked** on a fresh collection token | `ghic/assign.py`; card lands with real hit@k when run |
+| Maintainer assignment | **BUILT** — similarity recommender beat the most-active baseline; response-only, never assigns | `models/ASSIGNMENT_CARD.md`: hit@3 0.389 vs 0.261 (n=968) |
 
 ## 5. Duplicate detection [BUILT — with a negative validation result]
 

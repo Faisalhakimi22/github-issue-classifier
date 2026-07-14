@@ -139,6 +139,35 @@ class TestEffortTarget:
         assert t.iloc[3] != t.iloc[3]    # NaN
 
 
+class TestAssignmentRecommender:
+    class StubIndex:
+        def query(self, repo, title, body, k=20, min_sim=0.0):
+            return [{"number": 1, "title": "a", "similarity": 0.9},
+                    {"number": 2, "title": "b", "similarity": 0.4},
+                    {"number": 99, "title": "unknown", "similarity": 0.3}]
+
+    def test_weights_by_similarity_and_filters_bots(self):
+        from ghic.assign import AssignmentRecommender
+
+        assignments = {"acme/widgets": {
+            "1": {"assignees": ["alice"], "participants": [], "closer": "carol"},
+            "2": {"assignees": ["bob", "triage-bot"], "participants": [], "closer": None},
+        }}
+        rec = AssignmentRecommender(assignments, self.StubIndex(),
+                                    bot_logins={"triage-bot"})
+        out = rec.recommend("acme/widgets", "t", "b", k=3)
+        assert [o["login"] for o in out] == ["alice", "carol", "bob"]
+        assert out[0]["score"] == 0.9
+        assert out[2]["score"] == 0.4
+
+    def test_loader_requires_both_artifacts(self, tmp_path):
+        from ghic.assign import load_assignment_recommender
+
+        assert load_assignment_recommender(None) is None                      # no index
+        assert load_assignment_recommender(self.StubIndex(),
+                                           path=tmp_path / "missing.json") is None
+
+
 class TestAssignmentsRoundTrip:
     def test_load_assignments_reads_written_json(self, tmp_path, monkeypatch):
         from ghic import assign

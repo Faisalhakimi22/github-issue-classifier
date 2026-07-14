@@ -84,6 +84,7 @@ def make_settings(**overrides: Any) -> ServiceSettings:
         suggest_related=False,   # tests must not depend on models/dup_index.joblib
         suggest_category=False,  # ...nor on models/category.joblib
         estimate_effort=False,   # ...nor on models/effort.joblib
+        suggest_assignees=False,  # ...nor on data/processed/assignments.json
     )
     defaults.update(overrides)
     return ServiceSettings(**defaults)
@@ -787,6 +788,42 @@ class TestCategoryDerivation:
 
         assert derive_category(["stale", "comp:lite", "tf 2.16"]) is None
         assert derive_category([]) is None
+
+
+# ---------------------------------------------------------------------------
+# Assignment suggestions (similarity mechanism; response-only, never assigned)
+# ---------------------------------------------------------------------------
+class TestAssignmentSuggestion:
+    class StubRecommender:
+        def recommend(self, repo, title, body, k=3):
+            return [{"login": "alice", "score": 2.1}, {"login": "bob", "score": 0.9}]
+
+    def test_suggestions_in_response_never_in_comment(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh,
+                         assignment_recommender=self.StubRecommender())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.json()["suggested_assignees"][0]["login"] == "alice"
+        # never in the public comment: suggesting people publicly pings them
+        assert "alice" not in gh.comments[0][2]
+        # and no assignment/label action of any kind resulted from it
+        assert gh.labels == []
+
+    def test_absent_when_disabled(self):
+        resp = post_webhook(make_client(make_settings()), issue_opened_payload())
+        assert resp.json()["suggested_assignees"] == []
+
+    def test_recommender_failure_never_blocks_prediction(self):
+        class Broken:
+            def recommend(self, *a, **k):
+                raise RuntimeError("map corrupt")
+
+        app = create_app(make_settings(), predictor=StubPredictor(),
+                         assignment_recommender=Broken())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.status_code == 200
+        assert resp.json()["suggested_assignees"] == []
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,64 @@
+{
+  "task": "recommend maintainers for a new issue; ground truth = the issue's eventual human assignee(s)",
+  "recommenders": {
+    "similarity": "assignees+closers of the 20 most similar prior same-repo issues (TF-IDF cosine), similarity-weighted",
+    "most_active": "maintainers ranked by prior assignment count (causal)"
+  },
+  "overall": {
+    "n_test_with_assignee": 968,
+    "similarity_hit_at_k": {
+      "1": 0.1147,
+      "3": 0.3885,
+      "5": 0.4855
+    },
+    "most_active_hit_at_k": {
+      "1": 0.0,
+      "3": 0.2613,
+      "5": 0.406
+    }
+  },
+  "per_repo": {
+    "facebook/react": {
+      "n_test_with_assignee": 1,
+      "distinct_prior_assignees": 140,
+      "similarity_hit_at_k": {
+        "1": 0.0,
+        "3": 1.0,
+        "5": 1.0
+      },
+      "most_active_hit_at_k": {
+        "1": 0.0,
+        "3": 0.0,
+        "5": 0.0
+      }
+    },
+    "microsoft/vscode": {
+      "n_test_with_assignee": 688,
+      "distinct_prior_assignees": 428,
+      "similarity_hit_at_k": {
+        "1": 0.1352,
+        "3": 0.2733,
+        "5": 0.3503
+      },
+      "most_active_hit_at_k": {
+        "1": 0.0,
+        "3": 0.093,
+        "5": 0.2718
+      }
+    },
+    "tensorflow/tensorflow": {
+      "n_test_with_assignee": 279,
+      "distinct_prior_assignees": 387,
+      "similarity_hit_at_k": {
+        "1": 0.0645,
+        "3": 0.6703,
+        "5": 0.8172
+      },
+      "most_active_hit_at_k": {
+        "1": 0.0,
+        "3": 0.6774,
+        "5": 0.7384
+      }
+    }
+  }
+}

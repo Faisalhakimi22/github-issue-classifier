@@ -347,6 +347,52 @@ def _decision_text(sim3: float | None, freq3: float | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Serving — the mechanism the evaluation selected (similarity recommender)
+# ---------------------------------------------------------------------------
+class AssignmentRecommender:
+    """Assignees/closers of the most similar prior issues, similarity-weighted.
+
+    Reuses the duplicate index for the similarity search and the collected
+    assignments map for the maintainer pool. Response-level suggestion only —
+    nothing here ever calls the assignment API or @-mentions anyone.
+    """
+
+    def __init__(self, assignments: dict[str, dict[str, Any]], dup_index: Any,
+                 bot_logins: set[str] | None = None) -> None:
+        self.assignments = assignments
+        self.dup_index = dup_index
+        self.bot_logins = bot_logins or set()
+
+    def recommend(self, repo: str, title: str, body: str, k: int = 3) -> list[dict[str, Any]]:
+        similar = self.dup_index.query(repo, title, body, k=N_SIMILAR, min_sim=0.0)
+        scores: Counter = Counter()
+        for cand in similar:
+            rec = self.assignments.get(repo, {}).get(str(cand["number"]))
+            if not rec:
+                continue
+            pool = list(rec["assignees"]) + ([rec["closer"]] if rec["closer"] else [])
+            for login in pool:
+                if _is_human(login, self.bot_logins):
+                    scores[login] += cand["similarity"]
+        return [
+            {"login": login, "score": round(score, 3)}
+            for login, score in scores.most_common(k)
+        ]
+
+
+def load_assignment_recommender(dup_index: Any, cfg: Config | None = None,
+                                path: Path = ASSIGNMENTS_PATH) -> AssignmentRecommender | None:
+    """Recommender if both the assignments map and a dup index exist, else None."""
+    if dup_index is None:
+        return None
+    assignments = load_assignments(path)
+    if assignments is None:
+        return None
+    cfg = cfg or get_config(require_token=False)
+    return AssignmentRecommender(assignments, dup_index, set(cfg.labeling.bot_logins))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:

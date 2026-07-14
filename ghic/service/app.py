@@ -65,9 +65,11 @@ def create_app(
     dup_index: Any = None,
     category_predictor: Any = None,
     effort_predictor: Any = None,
+    assignment_recommender: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
-    `category_predictor` / `effort_predictor` are injectable for tests."""
+    `category_predictor` / `effort_predictor` / `assignment_recommender`
+    are injectable for tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -139,6 +141,15 @@ def create_app(
         if effort_predictor is not None:
             logger.info("effort model loaded")
     app.state.effort_predictor = effort_predictor
+    # Assignment suggestions (similarity mechanism — won its evaluation;
+    # response-level only, never an assignment action).
+    if assignment_recommender is None and settings.suggest_assignees and dup_index is not None:
+        from ..assign import load_assignment_recommender
+
+        assignment_recommender = load_assignment_recommender(dup_index)
+        if assignment_recommender is not None:
+            logger.info("assignment recommender loaded")
+    app.state.assignment_recommender = assignment_recommender
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -380,6 +391,17 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
             except Exception as e:
                 logger.warning("effort estimate failed: %s", e)
 
+    # Assistive maintainer suggestions — response only, never an assignment
+    # (a wrong automatic assignment costs a real person's time).
+    suggested_assignees: list[dict[str, Any]] = []
+    if app.state.assignment_recommender is not None:
+        try:
+            suggested_assignees = app.state.assignment_recommender.recommend(
+                repo, issue.get("title", ""), issue.get("body") or ""
+            )
+        except Exception as e:  # recommender problems never block a prediction
+            logger.warning("assignment suggestion failed: %s", e)
+
     # Optional LLM-drafted "missing information" request. Triggered only by
     # the deterministic under-specified check; the classifier's decision is
     # never delegated to the generator.
@@ -413,7 +435,9 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
 
     return {"ok": True, "prediction": pred.as_dict(), "category": category,
             "estimated_resolution": effort,   # API-only by design; see EFFORT_CARD.md
-            "related_issues": related, "missing_info": info_request,
+            "related_issues": related,
+            "suggested_assignees": suggested_assignees,  # API-only; never assigned
+            "missing_info": info_request,
             "actions": actions, "dry_run": s.dry_run}
 
 

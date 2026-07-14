@@ -91,14 +91,23 @@ Built `ghic/assign.py` end-to-end:
 - 12 tests, including a synthetic two-cluster corpus where the similarity
   recommender must route each cluster to its owner at k=1 (passes).
 
-**Gate: NOT passed — blocked.** The live collection failed: `GH_TOKEN` in
-`.env` returns 401 on a bare `/rate_limit` probe (unauthenticated requests
-succeed → the token is revoked/expired, not a network/code issue). Real
-top-k numbers cannot be produced without it, and per the ground rules they
-will not be invented. **To unblock:** refresh `GH_TOKEN` in `.env`, then
-`python -m ghic.assign --collect && python -m ghic.assign --evaluate`
-(~5 min). Until then no assignment feature ships, and nothing in the
-service references one.
+~~Gate initially blocked: the original `GH_TOKEN` was revoked (401 on
+`/rate_limit`).~~ **Unblocked 2026-07-15** with a fresh user-provided
+token; collection ran (~7 min, 124 cached batches), evaluation produced
+real numbers (n=968 test issues with a human assignee):
+
+| recommender | hit@1 | hit@3 | hit@5 |
+|---|---|---|---|
+| **similarity** (shipped) | 0.115 | **0.389** | 0.485 |
+| most-active baseline | 0.000 | 0.261 | 0.406 |
+
+Per the plan's decision rule the similarity mechanism ships — assistive,
+response-level only (`suggested_assignees`), never an assignment action,
+never an @-mention in a comment. A learned ranker is not built: it would
+have to beat hit@3 0.389 on this protocol first.
+
+**Gate: PASSED** — `models/ASSIGNMENT_CARD.md` with real top-k vs the
+naive baseline; serving wired + tested (160 tests).
 
 ## Phase 17 — Priority / Severity / Effort (2026-07-14)
 
@@ -216,12 +225,11 @@ checked or explicitly blocked-on-deployment. 155 tests, ruff clean.
 
 ---
 
-## Post-plan status (2026-07-14)
+## Post-plan status (2026-07-15)
 
-Phases 14–22 complete except the **Phase 16 live evaluation**, which is
-blocked on a fresh `GH_TOKEN` (the one in `.env` is revoked — verified
-401 on `/rate_limit`). To finish it:
-`python -m ghic.assign --collect && python -m ghic.assign --evaluate`.
+**Phases 14–22 complete, all gates green.** The Phase 16 live evaluation
+ran after the user supplied a fresh `GH_TOKEN`; the similarity recommender
+won and is wired into the service. 160 tests, ruff clean.
 
 ## Phase 21 — Dashboard (2026-07-14)
 
