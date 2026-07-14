@@ -172,8 +172,6 @@ No new logic — routing only. The `ghic-*` per-stage scripts remain.
 **Gate: PASSED** — subcommand tests incl. real end-to-end predict/explain
 against the trained champion (auto-skip when no artifact). Committed.
 
-## Phase 19 — CLI — pending
-
 ## Phase 20 — MLOps (2026-07-14)
 
 - **Retraining pipeline**: `python -m ghic.retrain` = label → champion
@@ -196,6 +194,28 @@ against the trained champion (auto-skip when no artifact). Committed.
 
 **Gate: PASSED** — documented retraining run + new model card + registry
 entry + snapshot; registry/snapshot mechanics covered by tests.
+
+## Phase 21 — Dashboard (2026-07-14)
+
+All six facets render from real ledger data (`tracker.analytics()`,
+surfaced in `/stats` and drawn by `/dashboard`):
+
+1. **Issue trends** — predictions/day (ledger records now carry
+   timestamps; old lines replay without a trend point, never invented).
+2. **Duplicate rate** — share of predictions with similar-prior
+   candidates (`related_count` now recorded) + duplicate labels observed
+   live via label events.
+3. **Resolution analytics** — resolved actionable / non-actionable /
+   awaiting, from graded outcomes.
+4. **Confidence metrics** — P(actionable) decile histogram + mean.
+5. **Label stats** — top maintainer-applied labels, observed live.
+6. **Component analytics** — per-repo scored / positive rate / mean P
+   (the component boundary this service actually has; finer component
+   labels appear in label stats as maintainers apply them).
+
+Facets a fresh deploy hasn't earned data for show zeros/empty — no
+placeholders. **Gate: PASSED** — tests assert each facet reports real
+counted numbers from webhook activity, incl. rebuild-from-ledger.
 
 ## Phase 22 — Docs, Benchmarks, Marketplace (2026-07-14)
 
@@ -230,27 +250,3 @@ checked or explicitly blocked-on-deployment. 155 tests, ruff clean.
 **Phases 14–22 complete, all gates green.** The Phase 16 live evaluation
 ran after the user supplied a fresh `GH_TOKEN`; the similarity recommender
 won and is wired into the service. 160 tests, ruff clean.
-
-## Phase 21 — Dashboard (2026-07-14)
-
-All six facets render from real ledger data (`tracker.analytics()`,
-surfaced in `/stats` and drawn by `/dashboard`):
-
-1. **Issue trends** — predictions/day (ledger records now carry
-   timestamps; old lines replay without a trend point, never invented).
-2. **Duplicate rate** — share of predictions with similar-prior
-   candidates (`related_count` now recorded) + duplicate labels observed
-   live via label events.
-3. **Resolution analytics** — resolved actionable / non-actionable /
-   awaiting, from graded outcomes.
-4. **Confidence metrics** — P(actionable) decile histogram + mean.
-5. **Label stats** — top maintainer-applied labels, observed live.
-6. **Component analytics** — per-repo scored / positive rate / mean P
-   (the component boundary this service actually has; finer component
-   labels appear in label stats as maintainers apply them).
-
-Facets a fresh deploy hasn't earned data for show zeros/empty — no
-placeholders. **Gate: PASSED** — tests assert each facet reports real
-counted numbers from webhook activity, incl. rebuild-from-ledger.
-
-## Phase 22 — Docs / Benchmarks / Marketplace — pending
