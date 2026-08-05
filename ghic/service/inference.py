@@ -170,6 +170,8 @@ def format_comment(
     category: dict[str, Any] | None = None,
 ) -> str:
     """Markdown comment the bot posts on a scored issue."""
+    from .explain import confidence_bar, explain_prediction
+
     verdict = (
         "likely an **actionable bug**"
         if pred.predicted_label == 1
@@ -182,20 +184,23 @@ def format_comment(
         "",
         "| | |",
         "|---|---|",
-        f"| P(actionable bug) | **{pred.proba:.2f}** |",
-        f"| Decision threshold | {pred.threshold:.2f} |",
+        f"| Confidence | `{confidence_bar(pred.proba)}` **{pred.proba:.0%}** |",
+        f"| Decision threshold | {pred.threshold:.0%} |",
         f"| Model | `{pred.model_name}` |",
     ]
     if category:
         lines.append(
             f"| Suggested category | **{category['predicted']}** "
-            f"(confidence {category['confidence']:.2f}) |"
+            f"(confidence {category['confidence']:.0%}) |"
         )
+    explanation = explain_prediction(pred.top_features, pred.signed_contributions)
+    if explanation:
+        lines += ["", explanation]
     if pred.top_features:
         kind = (
             "signed contribution" if pred.signed_contributions else "importance (magnitude)"
         )
-        lines += ["", f"<details><summary>Top model features ({kind})</summary>", ""]
+        lines += ["", f"<details><summary>Technical details ({kind})</summary>", ""]
         lines += [
             f"- `{item['feature']}`: {item['value']:+.3f}"
             if pred.signed_contributions

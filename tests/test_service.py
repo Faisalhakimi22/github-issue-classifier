@@ -464,6 +464,77 @@ class TestOnlineEvaluation:
 
 
 # ---------------------------------------------------------------------------
+# Pluggable ledger backend (JSONL vs Postgres, for deploys with no
+# persistent disk — see ghic/service/pg_ledger.py). The in-memory rebuild
+# logic (record_*/summary/analytics) is backend-agnostic, so an injected
+# fake backend should behave identically to the JSONL default.
+# ---------------------------------------------------------------------------
+class _FakeLedgerBackend:
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+
+    def append(self, record: dict) -> None:
+        self.records.append(record)
+
+    def replay(self):
+        return iter(list(self.records))
+
+
+class TestLedgerBackend:
+    def test_injected_backend_persists_across_simulated_restart(self):
+        from ghic.service.tracking import PredictionTracker
+
+        backend = _FakeLedgerBackend()
+        t1 = PredictionTracker(backend=backend)
+        t1.record_prediction("a/b", 1, 0.9, 1)
+        t1.record_outcome("a/b", 1, 1)
+        t1.record_prediction("a/b", 2, 0.7, 1)
+        assert len(backend.records) == 3
+
+        t2 = PredictionTracker(backend=backend)  # same backend, fresh instance
+        assert t2.summary()["confusion"]["tp"] == 1
+        assert t2.summary()["awaiting_outcome"] == 1
+
+    def test_database_url_takes_precedence_over_ledger_path(self, tmp_path, monkeypatch):
+        from ghic.service import pg_ledger, tracking
+
+        class _FakePostgresBackend(_FakeLedgerBackend):
+            def __init__(self, database_url: str) -> None:
+                super().__init__()
+                self.database_url = database_url
+
+        monkeypatch.setattr(pg_ledger, "PostgresLedgerBackend", _FakePostgresBackend)
+        ledger = tmp_path / "ledger.jsonl"
+        t = tracking.PredictionTracker(ledger_path=ledger, database_url="postgres://fake/db")
+        t.record_prediction("a/b", 1, 0.9, 1)
+        assert isinstance(t._backend, _FakePostgresBackend)
+        assert not ledger.exists()  # nothing written to the file backend
+
+    def test_no_path_or_url_is_in_memory_only(self):
+        from ghic.service.tracking import PredictionTracker, _NullBackend
+
+        t = PredictionTracker()
+        assert isinstance(t._backend, _NullBackend)
+        t.record_prediction("a/b", 1, 0.9, 1)  # must not raise
+        assert t.summary()["awaiting_outcome"] == 1
+
+    def test_settings_database_url_env_precedence(self, monkeypatch):
+        from ghic.service.settings import load_settings
+
+        for var in ("GHIC_DATABASE_URL", "DATABASE_URL", "POSTGRES_URL"):
+            monkeypatch.delenv(var, raising=False)
+
+        monkeypatch.setenv("POSTGRES_URL", "postgres://from-postgres-url")
+        assert load_settings().database_url == "postgres://from-postgres-url"
+
+        monkeypatch.setenv("DATABASE_URL", "postgres://from-database-url")
+        assert load_settings().database_url == "postgres://from-database-url"
+
+        monkeypatch.setenv("GHIC_DATABASE_URL", "postgres://from-ghic-database-url")
+        assert load_settings().database_url == "postgres://from-ghic-database-url"
+
+
+# ---------------------------------------------------------------------------
 # Walk-forward CV + explanation unwrapping (champion protocol pieces)
 # ---------------------------------------------------------------------------
 class TestChampionProtocol:
@@ -957,9 +1028,37 @@ class TestComment:
         pred = Prediction(repo="a/b", issue_number=1, proba=0.87, threshold=0.5,
                           predicted_label=1, model_name="rf_balanced")
         text = format_comment(pred)
-        assert "0.87" in text
+        assert "87%" in text
         assert "actionable bug" in text
         assert "can be wrong" in text
+
+    def test_comment_shows_confidence_bar_not_raw_features(self):
+        pred = Prediction(
+            repo="a/b", issue_number=1, proba=0.9, threshold=0.5, predicted_label=1,
+            model_name="rf_balanced", signed_contributions=False,
+            top_features=[
+                {"feature": "numeric__has_code_block", "value": 0.31},
+                {"feature": "numeric__has_repro_steps", "value": 0.22},
+                {"feature": "text__crash", "value": 0.10},
+            ],
+        )
+        text = format_comment(pred)
+        assert "█" in text and "░" in text  # confidence bar rendered
+        # The raw sklearn column names must not appear outside the
+        # collapsed technical-details block -- the main comment body is
+        # everything before that block.
+        main_body = text.split("<details>")[0]
+        assert "numeric__" not in main_body
+        assert "text__" not in main_body
+        assert "including a code block" in text
+        assert "including reproduction steps" in text
+
+    def test_comment_omits_explanation_when_no_features(self):
+        pred = Prediction(repo="a/b", issue_number=1, proba=0.6, threshold=0.5,
+                          predicted_label=1, model_name="ensemble", top_features=[])
+        text = format_comment(pred)
+        assert "Technical details" not in text
+        assert "influential" not in text
 
 
 # ---------------------------------------------------------------------------

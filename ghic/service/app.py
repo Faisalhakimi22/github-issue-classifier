@@ -116,7 +116,9 @@ def create_app(
     app.state.totals = {"scored": 0, "positive": 0, "proba_sum": 0.0, "rescored": 0}
     app.state.recent = deque(maxlen=500)
     # Online evaluation ledger: predictions at open time, graded at close time.
-    app.state.tracker = PredictionTracker(ledger_path=settings.ledger_path)
+    app.state.tracker = PredictionTracker(
+        ledger_path=settings.ledger_path, database_url=settings.database_url
+    )
     # Duplicate-candidate index (optional; assistive only).
     if dup_index is None and settings.suggest_related:
         from ..dupdetect import load_index

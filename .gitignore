@@ -27,3 +27,15 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+.vercel
+.env*
+
+# A separate project (its own git repo) that happens to live nested here on
+# disk — not part of this repo.
+/Elegant-Interface-Design/
+
+# Installed via `npx skills add` at this directory by mistake (meant for the
+# frontend project) — not relevant to this Python backend.
+/.agents/
+/skills-lock.json

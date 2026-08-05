@@ -12,17 +12,22 @@ merged PR closed the issue (rules R1/R1b need timeline data), so bugs fixed
 via PR without a bug label are under-counted as Class 1 — live recall is a
 LOWER BOUND. state_reason and labels drive rules R2/R3/R3b/R4 faithfully.
 
-Predictions and outcomes are appended to a JSONL file so restarts don't lose
-the ledger; the file is replayed on startup.
+Predictions and outcomes are appended to a ledger so restarts don't lose
+history; the ledger is replayed on startup. The default backend is a local
+JSONL file. Deploys with no persistent disk (Vercel's serverless functions)
+inject a Postgres-backed backend instead (see pg_ledger.py) — same
+append/replay contract, so the in-memory rebuild logic below doesn't care
+which one it's talking to.
 """
 from __future__ import annotations
 
 import json
 import threading
 from collections import Counter
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .. import utils
 
@@ -33,9 +38,62 @@ def _utcnow() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+class LedgerBackend(Protocol):
+    def append(self, record: dict[str, Any]) -> None: ...
+    def replay(self) -> Iterator[dict[str, Any]]: ...
+
+
+class _NullBackend:
+    """No persistence — in-memory only (tests, backtests, ledger disabled)."""
+
+    def append(self, record: dict[str, Any]) -> None:
+        return None
+
+    def replay(self) -> Iterator[dict[str, Any]]:
+        return iter(())
+
+
+class _JsonlBackend:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def replay(self) -> Iterator[dict[str, Any]]:
+        if not self.path.exists():
+            return
+        with self.path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+
 class PredictionTracker:
-    def __init__(self, ledger_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        ledger_path: Path | None = None,
+        database_url: str | None = None,
+        backend: LedgerBackend | None = None,
+    ) -> None:
         self.ledger_path = ledger_path
+        if backend is not None:
+            self._backend: LedgerBackend = backend
+        elif database_url:
+            from .pg_ledger import PostgresLedgerBackend
+
+            self._backend = PostgresLedgerBackend(database_url)
+        elif ledger_path:
+            self._backend = _JsonlBackend(ledger_path)
+        else:
+            self._backend = _NullBackend()
         self._lock = threading.Lock()
         # (repo, number) -> predicted label at open time
         self.pending: dict[tuple[str, int], dict[str, Any]] = {}
@@ -51,38 +109,26 @@ class PredictionTracker:
         self.with_related = 0                    # predictions w/ >=1 dup candidate
         self.resolutions = Counter()             # truth class at close
         self.label_counts: Counter = Counter()   # labels added by maintainers
-        if ledger_path and ledger_path.exists():
-            self._replay()
+        self._replay()
 
     # -- persistence ----------------------------------------------------------
     def _append(self, record: dict[str, Any]) -> None:
-        if not self.ledger_path:
-            return
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.ledger_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._backend.append(record)
 
     def _replay(self) -> None:
         n = 0
-        with self.ledger_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("type") == "prediction":
-                    self._note_prediction(rec)
-                elif rec.get("type") == "outcome":
-                    self._note_outcome(rec)
-                elif rec.get("type") == "action":
-                    self.actions += 1
-                elif rec.get("type") == "label_event":
-                    self._note_label_event(rec)
-                n += 1
-        logger.info("replayed %d ledger records from %s", n, self.ledger_path)
+        for rec in self._backend.replay():
+            if rec.get("type") == "prediction":
+                self._note_prediction(rec)
+            elif rec.get("type") == "outcome":
+                self._note_outcome(rec)
+            elif rec.get("type") == "action":
+                self.actions += 1
+            elif rec.get("type") == "label_event":
+                self._note_label_event(rec)
+            n += 1
+        if n:
+            logger.info("replayed %d ledger records (%s)", n, type(self._backend).__name__)
 
     # -- recording ------------------------------------------------------------
     def _note_prediction(self, rec: dict[str, Any]) -> None:

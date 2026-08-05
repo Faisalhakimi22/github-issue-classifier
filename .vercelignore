@@ -1,0 +1,71 @@
+# A custom installCommand (tried first) disables Vercel's automatic function
+# bundle optimization entirely — that dropped the effective cap from the
+# documented 500MB down to ~225MB and a plain build blew past it (315.92MB).
+# So: no installCommand (see vercel.json — Vercel auto-detects and installs
+# requirements.txt with its own optimizer), pyproject.toml hidden below so
+# requirements.txt wins detection instead of pyproject's incomplete base
+# deps. dup_index.joblib now ships (14MB, needed for the "possibly related"
+# comment section) — the last measured pre-optimization bundle was 281MB
+# with real headroom to the 500MB cap, so this fits comfortably.
+# effort.joblib (21MB) stays cut; load_effort_predictor() already returns
+# None on a missing file so that feature just degrades gracefully (Docker/
+# Fly deploys are unaffected, still ship all heads).
+
+.git
+.github
+.claude
+.venv
+venv
+__pycache__
+.pytest_cache
+.ruff_cache
+_archive
+
+# A separate, unrelated project (its own git repo, a pnpm monorepo with a
+# huge node_modules) that happens to live nested inside this directory on
+# disk. Sweeping it into this Python backend's upload blew past Vercel's
+# 15000-file limit.
+Elegant-Interface-Design/
+
+# Secrets — never in a deployment bundle, even gitignored ones.
+.env
+*.pem
+
+# Research data / notebooks / historical run reports — not needed to serve
+# predictions; the ledger goes to Postgres on this deploy (DATABASE_URL).
+data/
+reports/
+notebook/
+scripts/
+
+# Docs, tests, project meta.
+docs/
+tests/
+conftest.py
+BUILD_PLAN_2.md
+PROGRESS.md
+README.md
+PRIVACY.md
+SUPPORT.md
+LICENSE
+
+# Model artifacts: champion.joblib (required), category.joblib (676KB),
+# and dup_index.joblib (14MB, powers "possibly related" + assignment
+# suggestions) ship on Vercel. rf_balanced.joblib is settings.py's fallback
+# for when champion.joblib is missing, moot here since champion always
+# ships. effort.joblib (21MB) stays cut for bundle size — see note above.
+models/*.md
+models/rf.joblib
+models/rf_balanced.joblib
+models/logreg.joblib
+models/logreg_balanced.joblib
+models/effort.joblib
+
+# Local-dev / Docker-only files. pyproject.toml IS excluded here — Vercel
+# prefers pyproject.toml over requirements.txt for auto-detection when both
+# are present, and pyproject's base deps deliberately exclude the service
+# extras. requirements.txt alone is enough for Vercel's Python-project
+# detection to succeed.
+Dockerfile
+.dockerignore
+pyproject.toml

@@ -81,6 +81,11 @@ class ServiceSettings:
     # Online-evaluation ledger (predictions graded at issue close). None
     # keeps the ledger in memory only (tests, backtests).
     ledger_path: Path | None = None
+    # Postgres connection string for the ledger on deploys with no persistent
+    # disk (Vercel). Takes precedence over ledger_path when set — see
+    # ghic/service/pg_ledger.py. Vercel's Postgres/Neon integration injects
+    # this as DATABASE_URL or POSTGRES_URL automatically.
+    database_url: str = ""
 
     # Surface likely-duplicate prior issues (requires models/dup_index.joblib,
     # built by `python -m ghic.dupdetect --build-index`).
@@ -179,6 +184,12 @@ def load_settings() -> ServiceSettings:
         api_base_url=os.environ.get("GHIC_API_BASE_URL", "https://api.github.com"),
         request_timeout=_env_float("GHIC_REQUEST_TIMEOUT", 15.0),
         ledger_path=_load_ledger_path(),
+        database_url=(
+            os.environ.get("GHIC_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+            or os.environ.get("POSTGRES_URL")
+            or ""
+        ),
         suggest_related=_env_bool("GHIC_SUGGEST_RELATED", True),
         related_min_similarity=_env_float("GHIC_RELATED_MIN_SIM", 0.55),
         draft_missing_info=_env_bool("GHIC_DRAFT_MISSING_INFO", False),

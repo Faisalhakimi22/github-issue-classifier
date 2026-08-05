@@ -40,6 +40,12 @@ service = [
     "PyJWT>=2.8",
     "cryptography>=42",
 ]
+# Only needed when GHIC_DATABASE_URL/DATABASE_URL is set (serverless deploys
+# with no persistent disk, e.g. Vercel — see docs/DEPLOYMENT.md). Pure-Python
+# driver, no compiled extension, so it doesn't fight function bundle limits.
+postgres = [
+    "pg8000>=1.30",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",

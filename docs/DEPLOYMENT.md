@@ -91,6 +91,77 @@ your own repos, start from the global `GHIC_THRESHOLD` and lower it to catch
 more bugs (more false positives) or raise it for higher precision. `/stats`
 shows the live probability distribution to tune against.
 
+### Alternative: deploy on Vercel
+
+The Docker path above assumes a host with a persistent disk for the
+online-evaluation ledger. Vercel's Python functions have none — every
+invocation may be a fresh container — so this path swaps the ledger to
+Postgres and trims the model bundle to fit Vercel's size limit. Everything
+else (webhook logic, models, dashboard) is unchanged.
+
+**What's different from Docker:**
+
+- **Ledger → Postgres.** `data/predictions.jsonl` doesn't survive between
+  invocations on Vercel. Add a Postgres database (Vercel's own Postgres
+  integration, or any external one — Neon, Supabase, RDS) and set
+  `DATABASE_URL`; `ghic/service/pg_ledger.py` takes over automatically (see
+  `settings.py` — `GHIC_DATABASE_URL` / `DATABASE_URL` / `POSTGRES_URL`, in
+  that precedence order). Without one, the service still runs, but online
+  precision/recall reset on every cold start.
+- **Smaller model bundle, and no custom install command.** Vercel's
+  documented Python limit is 500MB uncompressed, but that's only reachable
+  through Vercel's own automatic bundle optimizer — a custom
+  `installCommand` disables it and drops the effective cap to ~225MB (found
+  the hard way: a first attempt with a custom `installCommand` hit 315.92MB
+  and failed). So `vercel.json` has no `installCommand`; Vercel auto-detects
+  and installs the root `requirements.txt` itself. `.vercelignore` also
+  drops `rf.joblib`/`rf_balanced.joblib`/`logreg*.joblib` (unused —
+  `champion.joblib` is what's actually loaded) and, for bundle size,
+  `effort.joblib` (21MB — `GHIC_ESTIMATE_EFFORT` degrades to off
+  automatically when its artifact is missing, no env var changes needed).
+  What ships: `champion.joblib` (required), `category.joblib` (676KB), and
+  `dup_index.joblib` (14MB — powers the "possibly related" comment section
+  and assignment suggestions; measured pre-optimization bundle with it
+  included is ~295MB, well clear of the 500MB cap).
+- **`pyproject.toml` is hidden from Vercel** (`.vercelignore`) so
+  `requirements.txt` wins dependency detection instead — Vercel prefers
+  `pyproject.toml` when both exist, and its base `[project.dependencies]`
+  deliberately excludes the service extras (fastapi etc.) to keep a plain
+  CLI install light. `requirements.txt` itself was repointed at this
+  deployment (Docker still installs from `pyproject.toml`'s `[service]`
+  extra, unaffected); the previous fully-pinned research-reproduction
+  manifest — including matplotlib/pytest/httpx, which have no business in a
+  serverless bundle — moved to `requirements-freeze.txt`.
+- **Cold starts re-load everything.** Each cold invocation re-imports
+  scikit-learn/pandas and re-`joblib.load`s ~20MB of models. `maxDuration`
+  is set to 10s in `vercel.json` to match GitHub's own webhook timeout and
+  the Hobby plan's default cap — raise it (Pro/Fluid compute) if cold
+  starts run long in practice; measure with `/healthz` timing before
+  assuming it's needed.
+
+**Deploy:**
+
+```bash
+npm i -g vercel        # or: npx vercel <command>
+vercel login           # opens a browser; needs your Vercel account
+vercel link             # from the repo root — creates/links the Vercel project
+vercel env add GHIC_WEBHOOK_SECRET production
+vercel env add GHIC_APP_ID production
+vercel env add GHIC_PRIVATE_KEY production   # paste the .pem contents
+vercel env add DATABASE_URL production        # from your Postgres provider
+vercel --prod
+```
+
+The webhook URL to register on the GitHub App is `https://<project>.vercel.app/webhook`.
+Everything from the "Validate, then roll out" checklist below still applies —
+backtest first, dry-run, then flip on comments/labels via the same
+`GHIC_DRY_RUN`/`GHIC_POST_COMMENT`/`GHIC_APPLY_LABEL` env vars, just set
+through `vercel env add` instead of `docker run -e`.
+
+`api/index.py` is the entrypoint Vercel's Python runtime loads (it puts the
+repo root on `sys.path` and calls `create_app()` — the `ghic` package isn't
+pip-installed here, it's imported straight from source).
+
 ## 4. Install the app on repositories
 
 App settings → *Install App* → choose the account → select repositories.

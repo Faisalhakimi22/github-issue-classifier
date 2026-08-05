@@ -1,0 +1,29 @@
+# Fully pinned environment for reproducing the research results.
+# For development/production installs prefer: pip install -e ".[service,dev]"
+# (see pyproject.toml — this file mirrors it with exact versions).
+
+# Python 3.11+ required (PEP 604 unions, frozenset[str] generics, etc.)
+
+# Foundational — ghic/utils.py, ghic/config.py
+pyyaml==6.0.2
+python-dotenv==1.0.1
+
+# Data collection — ghic/collect.py
+requests==2.32.3
+
+# Modeling — ghic/features.py, ghic/train.py, ghic/evaluate.py
+pandas==3.0.3
+scikit-learn==1.8.0
+numpy==2.4.5
+matplotlib==3.10.9
+joblib==1.5.3
+
+# Webhook service — ghic/service/
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+PyJWT==2.13.0
+cryptography==49.0.0
+
+# Testing — tests/
+pytest==8.3.3
+httpx==0.28.1
