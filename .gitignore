@@ -10,11 +10,22 @@ data/*.log
 data/predictions.jsonl
 !data/**/.gitkeep
 
-# Model artifacts (30MB joblib pipelines — rebuild with `python -m ghic.train`,
-# or attach to a GitHub Release). The model/decision cards ARE tracked.
-# reports/ is tracked too: the README links to the report and its figures.
+# Model artifacts. The three heads the deployed service actually loads
+# (champion.joblib, category.joblib, dup_index.joblib -- ~34MB total, all
+# well under GitHub's 100MB hard limit) ARE tracked: a plain `git push`
+# drives Vercel's auto-deploy, which builds from the git tree, not the
+# local filesystem, so anything the service needs at runtime has to be
+# committed. The larger/unused heads (rf*.joblib, logreg*.joblib,
+# effort.joblib -- retraining artifacts and an optional head Vercel drops
+# for bundle size, see docs/DEPLOYMENT.md) stay out of git; rebuild them
+# with `python -m ghic.train` or `python -m ghic.retrain`. The model/
+# decision cards ARE tracked. reports/ is tracked too: the README links to
+# the report and its figures.
 models/*
 !models/*.md
+!models/champion.joblib
+!models/category.joblib
+!models/dup_index.joblib
 
 # Local-only archive of course/personal files, not part of the published project
 _archive/

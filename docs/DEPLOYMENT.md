@@ -6,10 +6,12 @@ App that anyone can install — and, optionally, a GitHub Marketplace listing.
 ## 1. Prerequisites
 
 - Trained model artifacts in `models/` — one `python -m ghic.retrain` run
-  produces all of them (`champion.joblib` + `rf_balanced.joblib` required;
-  `category.joblib`, `effort.joblib`, `dup_index.joblib` optional heads), or
-  copy them from a GitHub Release. They are gitignored, so publish them as
-  Release assets when you push the repo.
+  produces all of them. `champion.joblib`, `category.joblib`, and
+  `dup_index.joblib` (the three the deployed service actually loads) are
+  tracked directly in git, so a fresh clone already has them. The rest
+  (`rf_balanced.joblib`, `effort.joblib`, and the other retraining
+  artifacts) are gitignored — rebuild them locally, or copy from a GitHub
+  Release if you publish one.
 - A host with a public HTTPS URL (any of: Fly.io, Render, Railway, a VPS
   behind a reverse proxy, or a tunnel like `smee.io` / `ngrok` for testing).
 
@@ -122,7 +124,16 @@ else (webhook logic, models, dashboard) is unchanged.
   What ships: `champion.joblib` (required), `category.joblib` (676KB), and
   `dup_index.joblib` (14MB — powers the "possibly related" comment section
   and assignment suggestions; measured pre-optimization bundle with it
-  included is ~295MB, well clear of the 500MB cap).
+  included is ~295MB, well clear of the 500MB cap). These three are the
+  only model files tracked in git (see `.gitignore`) — deliberately, because
+  Vercel's GitHub integration auto-deploys from a plain `git push`, building
+  from the git tree rather than the local filesystem. A model that only
+  exists on disk locally deploys fine via `vercel --prod` (which uploads the
+  working directory) but 500s on the next `git push`-triggered build with
+  `FileNotFoundError: Model not found` — this bit the project once in
+  production; don't regitignore these three. The unused/oversized heads
+  (`rf*.joblib`, `logreg*.joblib`, `effort.joblib`) stay untracked and
+  rebuildable via `python -m ghic.train` / `python -m ghic.retrain`.
 - **`pyproject.toml` is hidden from Vercel** (`.vercelignore`) so
   `requirements.txt` wins dependency detection instead — Vercel prefers
   `pyproject.toml` when both exist, and its base `[project.dependencies]`
