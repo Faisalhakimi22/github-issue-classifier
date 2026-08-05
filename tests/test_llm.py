@@ -10,7 +10,9 @@ import json
 import httpx
 import pytest
 
-from ghic.llm.exceptions import LLMProviderError, LLMResponseError, LLMTimeoutError
+from ghic.llm.exceptions import LLMError, LLMProviderError, LLMResponseError, LLMTimeoutError
+from ghic.llm.fallback import FallbackLLMProvider
+from ghic.llm.groq import GroqProvider
 from ghic.llm.models import IssueContext, parse_issue_analysis
 from ghic.llm.openrouter import OpenRouterProvider
 from ghic.llm.prompts import build_user_prompt
@@ -338,3 +340,89 @@ class TestLLMService:
 
         result = service.analyze_issue(make_context())
         assert result is not None  # the analysis itself still succeeds
+
+
+# ---------------------------------------------------------------------------
+# groq.py -- thin subclass of the shared base; light coverage is enough,
+# the retry/timeout/parsing matrix is already exercised against OpenRouter
+# above (both go through the same ChatCompletionsProvider).
+# ---------------------------------------------------------------------------
+class TestGroqProvider:
+    def test_uses_groq_base_url_and_default_model(self):
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["body"] = json.loads(request.content)
+            return _chat_response(json.dumps(VALID_RAW))
+
+        provider = GroqProvider(api_key="test-key", http_client=_client_returning(handler))
+        analysis = provider.analyze(make_context())
+
+        assert analysis.category == "bug"
+        assert captured["url"] == "https://api.groq.com/openai/v1/chat/completions"
+        assert captured["body"]["model"] == "openai/gpt-oss-120b"
+
+    def test_malformed_response_raises_response_error(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _chat_response("not json")
+
+        provider = GroqProvider(api_key="test-key", http_client=_client_returning(handler))
+        with pytest.raises(LLMResponseError):
+            provider.analyze(make_context())
+
+
+# ---------------------------------------------------------------------------
+# fallback.py -- priority chain
+# ---------------------------------------------------------------------------
+class TestFallbackLLMProvider:
+    def test_primary_success_never_calls_secondary(self):
+        primary = _FakeProvider(result=parse_issue_analysis(VALID_RAW))
+        secondary = _FakeProvider(result=parse_issue_analysis(VALID_RAW))
+        chain = FallbackLLMProvider([primary, secondary])
+
+        chain.analyze(make_context())
+        assert primary.calls == 1
+        assert secondary.calls == 0
+
+    def test_primary_failure_falls_through_to_secondary(self):
+        primary = _FakeProvider(error=LLMTimeoutError("too slow"))
+        secondary = _FakeProvider(result=parse_issue_analysis(VALID_RAW))
+        chain = FallbackLLMProvider([primary, secondary])
+
+        result = chain.analyze(make_context())
+        assert result.category == "bug"
+        assert primary.calls == 1
+        assert secondary.calls == 1
+
+    def test_all_providers_failing_raises_the_last_error(self):
+        primary = _FakeProvider(error=LLMTimeoutError("primary timed out"))
+        secondary = _FakeProvider(error=LLMProviderError("secondary rejected"))
+        chain = FallbackLLMProvider([primary, secondary])
+
+        with pytest.raises(LLMProviderError, match="secondary rejected"):
+            chain.analyze(make_context())
+
+    def test_empty_provider_list_rejected_at_construction(self):
+        with pytest.raises(ValueError):
+            FallbackLLMProvider([])
+
+    def test_works_transparently_inside_llm_service(self, tmp_path, monkeypatch):
+        """The whole point of the abstraction: LLMService doesn't need to
+        know a fallback chain is involved at all."""
+        from ghic import utils
+
+        monkeypatch.setattr(utils, "DATA_RAW", tmp_path)
+        primary = _FakeProvider(error=LLMProviderError("down"))
+        secondary = _FakeProvider(result=parse_issue_analysis(VALID_RAW))
+        service = LLMService(FallbackLLMProvider([primary, secondary]))
+
+        result = service.analyze_issue(make_context())
+        assert result is not None
+        assert result.category == "bug"
+
+    def test_isinstance_of_llm_error_hierarchy(self):
+        # Sanity check the test fixtures themselves use real LLMError types,
+        # since FallbackLLMProvider only catches LLMError.
+        assert issubclass(LLMTimeoutError, LLMError)
+        assert issubclass(LLMProviderError, LLMError)

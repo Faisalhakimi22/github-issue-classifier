@@ -157,14 +157,7 @@ def create_app(
     # LLM-assisted analysis (optional; off unless GHIC_USE_LLM_ANALYSIS=true
     # AND an OPENROUTER_API_KEY is set — see settings.can_use_llm).
     if llm_service is None and settings.can_use_llm:
-        from ..llm.openrouter import OpenRouterProvider
-
-        provider = OpenRouterProvider(
-            api_key=settings.openrouter_api_key, model=settings.llm_model,
-        )
-        llm_service = LLMService(provider)
-        logger.info("llm analysis enabled (provider=%s model=%s)",
-                   settings.llm_provider, settings.llm_model)
+        llm_service = LLMService(_build_llm_provider(settings))
     app.state.llm_service = llm_service
 
     def _require_token(request: Request) -> None:
@@ -282,6 +275,34 @@ def _percentiles(samples: Any) -> dict[str, float]:
         return round(values[min(len(values) - 1, int(len(values) * p))], 1)
 
     return {"n": len(values), "p50": pct(0.50), "p95": pct(0.95), "p99": pct(0.99)}
+
+
+def _build_llm_provider(settings: ServiceSettings) -> Any:
+    """Groq (fast, ~1.9s measured) is the primary; OpenRouter (nemotron,
+    free tier, ~17s measured) is the fallback -- see
+    models/LLM_ANALYSIS_CARD.md for the comparison. Which of the two keys
+    are actually set decides what gets built: both -> a priority chain,
+    either alone -> that one provider. Only called when settings.can_use_llm
+    is already True, so at least one key is guaranteed present.
+    """
+    from ..llm.fallback import FallbackLLMProvider
+    from ..llm.groq import GroqProvider
+    from ..llm.openrouter import OpenRouterProvider
+
+    providers: list[Any] = []
+    if settings.groq_api_key:
+        providers.append(GroqProvider(api_key=settings.groq_api_key, model=settings.llm_model))
+    if settings.openrouter_api_key:
+        providers.append(OpenRouterProvider(
+            api_key=settings.openrouter_api_key, model=settings.openrouter_model,
+        ))
+
+    provider = providers[0] if len(providers) == 1 else FallbackLLMProvider(providers)
+    logger.info(
+        "llm analysis enabled (%s)",
+        " -> ".join(type(p).__name__ for p in providers),
+    )
+    return provider
 
 
 def _enrich(

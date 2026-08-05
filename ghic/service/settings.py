@@ -115,17 +115,26 @@ class ServiceSettings:
     suggest_assignees: bool = True
 
     # LLM-assisted issue analysis (category/priority/severity/summary/missing
-    # info/label suggestions) via OpenRouter — see ghic/llm/ and
-    # models/LLM_ANALYSIS_CARD.md. Off by default like draft_missing_info:
-    # it's a new external API dependency, not something a fresh deploy should
-    # start calling until the operator opts in. Never touches the ML
-    # actionability decision itself. Env var names intentionally match the
-    # provider's own convention (no GHIC_ prefix), same as ANTHROPIC_API_KEY
-    # in drafting.py — a key set for one tool works for this one too.
+    # info/label suggestions) — see ghic/llm/ and models/LLM_ANALYSIS_CARD.md.
+    # Off by default like draft_missing_info: it's a new external API
+    # dependency, not something a fresh deploy should start calling until the
+    # operator opts in. Never touches the ML actionability decision itself.
+    # Env var names intentionally match each provider's own convention (no
+    # GHIC_ prefix), same as ANTHROPIC_API_KEY in drafting.py — a key set for
+    # one tool works for this one too.
+    #
+    # Two providers, priority chain: Groq (openai/gpt-oss-120b) is the fast
+    # primary (~1.9s measured), OpenRouter (nemotron, free tier) is the
+    # fallback (~17s measured — too slow as a primary but fine as a rarely-
+    # hit backup). Whichever key(s) are actually set determines what gets
+    # built in app.py: both -> fallback chain, either alone -> that one
+    # provider, neither -> feature stays off regardless of the toggle.
     use_llm_analysis: bool = False
-    llm_provider: str = "openrouter"
-    llm_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    llm_provider: str = "groq"  # informational/logging only; see app.py
+    llm_model: str = "openai/gpt-oss-120b"
+    groq_api_key: str = ""
     openrouter_api_key: str = ""
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
     extras: dict = field(default_factory=dict)
 
@@ -135,7 +144,7 @@ class ServiceSettings:
 
     @property
     def can_use_llm(self) -> bool:
-        return self.use_llm_analysis and bool(self.openrouter_api_key)
+        return self.use_llm_analysis and bool(self.groq_api_key or self.openrouter_api_key)
 
     def threshold_for(self, repo_full_name: str) -> float:
         return self.repo_thresholds.get(repo_full_name, self.threshold)
@@ -161,10 +170,11 @@ class ServiceSettings:
                 "Running with GHIC_ALLOW_UNSIGNED=true and no webhook secret. "
                 "Do NOT expose this instance to the internet."
             )
-        if self.use_llm_analysis and not self.openrouter_api_key:
+        if self.use_llm_analysis and not (self.groq_api_key or self.openrouter_api_key):
             logger.warning(
-                "GHIC_USE_LLM_ANALYSIS=true but OPENROUTER_API_KEY is not set — "
-                "LLM analysis will stay off; comments fall back to the ML-only format."
+                "GHIC_USE_LLM_ANALYSIS=true but neither GROQ_API_KEY nor "
+                "OPENROUTER_API_KEY is set — LLM analysis will stay off; "
+                "comments fall back to the ML-only format."
             )
 
 
@@ -219,9 +229,12 @@ def load_settings() -> ServiceSettings:
         estimate_effort=_env_bool("GHIC_ESTIMATE_EFFORT", True),
         suggest_assignees=_env_bool("GHIC_SUGGEST_ASSIGNEES", True),
         use_llm_analysis=_env_bool("GHIC_USE_LLM_ANALYSIS", False),
-        llm_provider=os.environ.get("LLM_PROVIDER") or "openrouter",
-        llm_model=os.environ.get("LLM_MODEL") or "nvidia/nemotron-3-ultra-550b-a55b:free",
+        llm_provider=os.environ.get("LLM_PROVIDER") or "groq",
+        llm_model=os.environ.get("LLM_MODEL") or "openai/gpt-oss-120b",
+        groq_api_key=os.environ.get("GROQ_API_KEY", ""),
         openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+        openrouter_model=os.environ.get("OPENROUTER_MODEL")
+        or "nvidia/nemotron-3-ultra-550b-a55b:free",
     )
 
 
