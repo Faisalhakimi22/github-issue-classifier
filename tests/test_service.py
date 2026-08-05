@@ -1052,6 +1052,9 @@ def make_llm_analysis(**overrides):
         summary="The app crashes on save.",
         reasoning=["Clear reproduction steps and a stack trace are present."],
         recommended_action="Investigate immediately -- this affects a core workflow.",
+        risk_level="high",
+        risk_reasons=["Blocks a core workflow", "Reproducible"],
+        business_impact=["Users may lose unsaved work"],
         missing_information=["Application version", "Operating system"],
         recommended_labels=["bug", "backend"],
     )
@@ -1078,6 +1081,12 @@ class TestLLMAnalysisComment:
         assert "numeric__" not in comment
         assert "tfidf__" not in comment
         assert "feature importance" not in comment.lower()
+        # v2: no implementation-flavored naming anywhere in the comment.
+        assert "ML Actionability Score" not in comment
+        assert "prompt" not in comment.lower()
+        assert "token" not in comment.lower()
+        assert "temperature" not in comment.lower()
+        assert "provider" not in comment.lower()
 
     def test_falls_back_to_ml_comment_when_llm_unavailable(self):
         gh = StubGitHub()
@@ -1123,10 +1132,12 @@ class TestLLMAnalysisComment:
             predicted_label=0, model_name="stub",
         )
         comment = format_llm_comment(pred, make_llm_analysis(), disagreement=True)
-        assert "⚠️ Model Disagreement" in comment
+        assert "Needs Maintainer Review" in comment
         assert "Likely Not Actionable" not in comment
         assert "Likely Actionable" not in comment
-        assert "AI's own reasoning" in comment
+        # Never expose the underlying mechanism as "the models disagree".
+        assert "disagree" not in comment.lower()
+        assert "reached different conclusions" in comment
 
     def test_no_disagreement_renders_the_plain_verdict(self):
         pred = Prediction(
@@ -1135,8 +1146,87 @@ class TestLLMAnalysisComment:
         )
         comment = format_llm_comment(pred, make_llm_analysis(), disagreement=False)
         assert "Likely Not Actionable" in comment
-        assert "Model Disagreement" not in comment
-        assert "AI's own reasoning" not in comment
+        assert "Needs Maintainer Review" not in comment
+        assert "reached different conclusions" not in comment
+
+    def test_executive_summary_leads_the_comment(self):
+        """The old '### Summary' heading is gone -- analysis.summary is now
+        an unheaded lead paragraph right under the title, doubling as the
+        executive summary a maintainer reads first."""
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
+                           threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(pred, make_llm_analysis())
+        assert "### Summary" not in comment
+        title_idx = comment.index("GHIC Analysis")
+        summary_idx = comment.index("The app crashes on save.")
+        table_idx = comment.index("| **Classification**")
+        assert title_idx < summary_idx < table_idx
+
+    def test_statistical_risk_score_replaces_ml_actionability_score(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.42,
+                           threshold=0.5, predicted_label=0, model_name="stub")
+        comment = format_llm_comment(pred, make_llm_analysis())
+        assert "**Statistical Risk Score** | 42%" in comment
+        assert "ML Actionability Score" not in comment
+        assert "based on historical issue patterns" in comment
+
+    def test_risk_assessment_section_renders_level_and_reasons(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
+                           threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(
+            pred, make_llm_analysis(risk_level="critical",
+                                     risk_reasons=["Blocks a production workflow", "Reproducible"]),
+        )
+        assert "### Risk Assessment" in comment
+        assert "**Critical**" in comment
+        assert "- Blocks a production workflow" in comment
+        assert "- Reproducible" in comment
+
+    def test_business_impact_section_shown_only_when_present(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
+                           threshold=0.5, predicted_label=1, model_name="stub")
+        with_impact = format_llm_comment(
+            pred, make_llm_analysis(business_impact=["Data import unavailable"]),
+        )
+        assert "### Business Impact" in with_impact
+        assert "Data import unavailable" in with_impact
+
+        without_impact = format_llm_comment(pred, make_llm_analysis(business_impact=[]))
+        assert "### Business Impact" not in without_impact
+
+    def test_low_confidence_adds_explicit_disclaimer(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
+                           threshold=0.5, predicted_label=1, model_name="stub")
+        low = format_llm_comment(pred, make_llm_analysis(confidence=0.2))
+        assert "insufficient to reach a high-confidence assessment" in low
+
+        high = format_llm_comment(pred, make_llm_analysis(confidence=0.9))
+        assert "insufficient to reach a high-confidence assessment" not in high
+
+    def test_missing_information_uses_framed_intro_and_is_capped(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
+                           threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(
+            pred, make_llm_analysis(missing_information=["Server stack trace", "Browser version"]),
+        )
+        assert "To speed up investigation, consider adding:" in comment
+        assert "- Server stack trace" in comment
+
+    def test_analysis_details_footer_hides_internals_and_shows_metadata(self):
+        from datetime import datetime, timezone
+
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
+                           threshold=0.5, predicted_label=1, model_name="stub")
+        fixed = datetime(2026, 8, 6, 18, 42, tzinfo=timezone.utc)
+        comment = format_llm_comment(pred, make_llm_analysis(), generated_at=fixed)
+
+        assert "### Analysis Details" in comment
+        assert "AI Analysis Completed" in comment
+        assert "Machine Learning + AI Review" in comment
+        assert "2026-08-06 18:42 UTC" in comment
+        assert "feature importance" not in comment.lower()
+        assert "prompt" not in comment.lower()
+        assert "temperature" not in comment.lower()
 
     def test_webhook_end_to_end_surfaces_disagreement_in_response_and_comment(self):
         """ML calls it non-actionable, but the LLM's own priority/severity/
@@ -1158,7 +1248,7 @@ class TestLLMAnalysisComment:
         assert resp.status_code == 200
         assert resp.json()["llm_ml_disagreement"] is True
         comment = gh.comments[0][2]
-        assert "⚠️ Model Disagreement" in comment
+        assert "Needs Maintainer Review" in comment
 
 
 class TestCategoryDerivation:

@@ -26,6 +26,9 @@ VALID_RAW = {
     "summary": "The app crashes on save.",
     "reasoning": ["Clear reproduction steps and a stack trace are present."],
     "recommended_action": "Investigate immediately -- this affects a core workflow.",
+    "risk_level": "high",
+    "risk_reasons": ["Blocks a core workflow", "Reproducible"],
+    "business_impact": ["Users may lose unsaved work"],
     "missing_information": ["Application version"],
     "recommended_labels": ["bug", "backend"],
 }
@@ -143,6 +146,51 @@ class TestParseIssueAnalysis:
         raw = {**VALID_RAW, "recommended_labels": [f"label-{i}" for i in range(8)]}
         analysis = parse_issue_analysis(raw)
         assert len(analysis.recommended_labels) == 5
+
+    def test_missing_risk_level_rejected(self):
+        raw = {k: v for k, v in VALID_RAW.items() if k != "risk_level"}
+        with pytest.raises(LLMResponseError, match="risk_level"):
+            parse_issue_analysis(raw)
+
+    def test_invalid_risk_level_value_rejected(self):
+        raw = {**VALID_RAW, "risk_level": "extreme"}
+        with pytest.raises(LLMResponseError, match="risk_level"):
+            parse_issue_analysis(raw)
+
+    def test_missing_risk_reasons_rejected(self):
+        raw = {k: v for k, v in VALID_RAW.items() if k != "risk_reasons"}
+        with pytest.raises(LLMResponseError, match="risk_reasons"):
+            parse_issue_analysis(raw)
+
+    def test_empty_risk_reasons_list_rejected(self):
+        raw = {**VALID_RAW, "risk_reasons": []}
+        with pytest.raises(LLMResponseError, match="risk_reasons"):
+            parse_issue_analysis(raw)
+
+    def test_risk_reasons_truncated_to_max(self):
+        raw = {**VALID_RAW, "risk_reasons": [f"reason {i}" for i in range(10)]}
+        analysis = parse_issue_analysis(raw)
+        assert len(analysis.risk_reasons) == 5
+
+    def test_business_impact_optional_and_defaults_empty(self):
+        raw = {k: v for k, v in VALID_RAW.items() if k != "business_impact"}
+        analysis = parse_issue_analysis(raw)
+        assert analysis.business_impact == []
+
+    def test_business_impact_must_be_string_list(self):
+        raw = {**VALID_RAW, "business_impact": "not a list"}
+        with pytest.raises(LLMResponseError, match="business_impact"):
+            parse_issue_analysis(raw)
+
+    def test_business_impact_truncated_to_max(self):
+        raw = {**VALID_RAW, "business_impact": [f"impact {i}" for i in range(10)]}
+        analysis = parse_issue_analysis(raw)
+        assert len(analysis.business_impact) == 5
+
+    def test_missing_information_truncated_to_five(self):
+        raw = {**VALID_RAW, "missing_information": [f"item {i}" for i in range(10)]}
+        analysis = parse_issue_analysis(raw)
+        assert len(analysis.missing_information) == 5
 
 
 # ---------------------------------------------------------------------------

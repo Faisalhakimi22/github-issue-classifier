@@ -1,9 +1,11 @@
-# Card — LLM-assisted issue analysis (category / priority / severity / summary)
+# Card — LLM-assisted issue analysis (category / priority / severity / risk / summary)
 
 **Task:** turn the ML classifier's actionability probability into a
-polished, human-readable analysis — category, priority, severity, a plain-
-language summary and reasoning, missing-information suggestions, and label
-suggestions — via an LLM, as a priority chain of two providers (below).
+polished, human-readable analysis — category, priority, severity, an
+executive-summary-style overview, a risk assessment, business-impact
+notes, plain-language reasoning, missing-information suggestions, and
+label suggestions — via an LLM, as a priority chain of two providers
+(below).
 
 ## Two providers, measured, not assumed
 
@@ -64,36 +66,83 @@ logic that kept the ML version out.
   `logger.info` calls) and in `format_comment()`'s collapsed technical-
   details section, which this comment format doesn't use at all.
 
-## Comment format and schema (v2)
+## Comment format and schema
 
-The posted comment (`format_llm_comment()` in `ghic/service/inference.py`) was
-rebuilt around one rule: a maintainer reading it should not be able to tell
-there's a model behind it. Concretely:
+The posted comment (`format_llm_comment()` in `ghic/service/inference.py`) is
+built around one rule: a maintainer reading it should not be able to tell
+there's a model behind it, and should be able to answer four questions —
+what is this, how important is it, why does GHIC think that, what should
+happen next — in under 10 seconds. Concretely:
 
-- **`IssueAnalysis.reasoning` is `list[str]`, not a paragraph.** The prompt
-  (`ghic/llm/prompts.py`) asks for 2–5 short factual bullets directly, and
-  `parse_issue_analysis()` rejects a string in that field rather than
-  splitting it after the fact — a model that's actually reasoning in bullets
-  produces better bullets than a paragraph does when chopped up. Truncated to
-  6 items defensively even though the prompt asks for at most 5.
-- **`IssueAnalysis.recommended_action` is a new required field** — exactly
-  one sentence naming the single next step a maintainer should take. It has
-  its own section in the comment (`### Recommended Next Step`) rather than
-  being folded into the summary or reasoning.
-- **No confidence bar.** An earlier iteration rendered `pred.proba` behind a
-  Unicode block-character progress bar (`confidence_bar()` in
-  `ghic/service/explain.py`); that's still what `format_comment()` — the
-  ML-only fallback — uses. `format_llm_comment()` deliberately does not: it
-  prints the ML score as plain text (`| **ML Actionability Score** | 12% |`)
-  and nothing else. A bar next to a number invites reading precision into a
-  probability that doesn't have that precision.
+- **`analysis.summary` doubles as the lead executive summary.** It's the
+  first thing under the `## 🤖 GHIC Analysis` heading, unheaded, 1–2 plain-
+  language sentences (the prompt enforces this) — not a separate field, so
+  there's exactly one place answering "what is this and how important is
+  it" instead of two that can quietly drift apart. There's no `### Summary`
+  heading in the output; the paragraph itself is the answer.
+- **`IssueAnalysis.reasoning` is `list[str]`, not a paragraph** — same
+  reasoning applies to the new `risk_reasons` and `business_impact` fields.
+  The prompt (`ghic/llm/prompts.py`) asks for short bullets directly, and
+  `parse_issue_analysis()` rejects a string in any of these fields rather
+  than splitting one after the fact — a model that's actually reasoning in
+  bullets produces better bullets than a paragraph does when chopped up.
+- **`IssueAnalysis.recommended_action` is a required field** — exactly one
+  sentence naming the single next step a maintainer should take, in its own
+  `### Recommended Next Step` section.
+- **`risk_level` + `risk_reasons` (both required) drive a `### Risk
+  Assessment` section** — a level (low/medium/high/critical, same scale as
+  priority/severity) plus the concrete reasons behind it. This is
+  deliberately a separate judgment from priority/severity, not a
+  restatement: the prompt lets it diverge when the evidence pulls in
+  different directions (e.g. low severity but high business risk).
+- **`business_impact` (optional, defaults to `[]`) drives a `### Business
+  Impact` section that's hidden entirely when empty.** The prompt is
+  explicit that an empty array is the *correct* answer far more often than
+  not — a feature request or docs issue has no operational impact to
+  report, and inventing one to fill the section would violate the "never
+  invent evidence" rule below.
+- **No confidence bar, and the score is renamed.** An earlier iteration
+  rendered `pred.proba` behind a Unicode block-character progress bar
+  (`confidence_bar()` in `ghic/service/explain.py`); that's still what
+  `format_comment()` — the ML-only fallback — uses.
+  `format_llm_comment()` deliberately does not: it labels the row
+  **"Statistical Risk Score"** (not "ML Actionability Score" — avoids the
+  implementation-flavored "ML" term) and prints it as plain text with one
+  supporting sentence ("This score is based on historical issue
+  patterns.") underneath, nothing else. A bar next to a number invites
+  reading precision into a probability that doesn't have that precision.
 - **`confidence` (the LLM's own confidence in its analysis) is captured in
-  the schema and exposed in the API response, but never rendered in the
-  comment.** Showing it next to the ML actionability score would read as two
-  competing confidence numbers on the same message — exactly the ambiguity
-  this redesign removes.
-- **`recommended_labels` is capped at 5** and always rendered as individual
-  backtick-wrapped tokens, never a comma-joined sentence.
+  the schema and exposed in the API response, but is not itself rendered.**
+  Showing it next to the Statistical Risk Score would read as two competing
+  confidence numbers on the same message. Below
+  `models.LOW_CONFIDENCE_THRESHOLD` (0.4) it still surfaces — not as a
+  number, but as a plain-language disclaimer under the reasoning section:
+  "The available information is insufficient to reach a high-confidence
+  assessment." This is a deterministic threshold check in
+  `format_llm_comment()`, not left to the model to remember to say —
+  same reasoning as the consistency layer below.
+- **`missing_information` is capped at 5** and rendered under an explicit
+  frame ("To speed up investigation, consider adding:") rather than a bare
+  heading. **`recommended_labels` is capped at 5**, ordered most-important-
+  first (the prompt asks for this explicitly), and always rendered as
+  individual backtick-wrapped tokens, never a comma-joined sentence.
+- **Category-specific tone (bug vs. feature vs. question vs. duplicate vs.
+  security vs. performance vs. docs, plus an explicit regression callout)
+  is steered entirely through `SYSTEM_PROMPT`'s guidance, not branched on in
+  Python.** The free-text fields — `summary`, `reasoning`,
+  `business_impact` — are where that shows up. This was a deliberate
+  choice over a per-category template switch in `format_llm_comment()`:
+  hardcoded per-category copy would fight the model's own read of a
+  specific issue rather than express it, and would need updating by hand
+  every time a new category shape came up. The structure (which sections
+  render, in what order) stays uniform across categories; only the prose
+  inside it adapts.
+- **`### Analysis Details` is a small metadata footer at the very bottom**
+  (`Status: AI Analysis Completed`, `Pipeline: Machine Learning + AI
+  Review`, `Generated: <UTC timestamp>`) — deliberately not the feature
+  importance values, token counts, prompt text, provider name, or model
+  temperature a debugging-flavored footer might otherwise include; those
+  stay in logs only (see "What's actually held to the existing bar" above).
 
 ## Consistency layer — `ghic/llm/consistency.py`
 
@@ -120,9 +169,15 @@ answer, and this project has no ground truth to check that answer against.
 When `detect_disagreement()` fires, the webhook logs a warning
 (`llm/ml disagreement on {repo}#{number}`), the API response sets
 `llm_ml_disagreement: true`, and the comment's Actionability line reads
-`⚠️ Model Disagreement` instead of picking a side — every other section
-(summary, reasoning, recommended action) still renders, since those stay
-useful regardless of which verdict a maintainer ends up trusting.
+**"Needs Maintainer Review"** instead of picking a side. It deliberately
+does not say "Model Disagreement" or name "the models" at all — that's an
+implementation detail, not something a maintainer needs framed that way —
+and the explanatory line underneath it ("The statistical prediction and
+the AI review reached different conclusions on this one...") describes the
+situation in plain language without inventing specifics beyond what
+`detect_disagreement()` actually detected. Every other section (summary,
+risk assessment, reasoning, recommended action) still renders, since those
+stay useful regardless of which verdict a maintainer ends up trusting.
 
 Directional by design: only "ML says not-actionable, LLM signal says
 otherwise" is flagged. The reverse (ML says actionable, LLM's own severity

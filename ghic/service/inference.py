@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -227,29 +228,49 @@ def format_llm_comment(
     analysis: Any,
     related: list[dict[str, Any]] | None = None,
     disagreement: bool = False,
+    generated_at: datetime | None = None,
 ) -> str:
-    """Polished markdown comment built from an LLM IssueAnalysis on top of
-    the ML prediction. `analysis` is a ghic.llm.IssueAnalysis -- typed as
-    Any here to avoid a service/inference -> llm import at module load time
-    for callers that never use this path.
+    """Polished, first-party-feeling markdown comment built from an LLM
+    IssueAnalysis on top of the ML prediction. `analysis` is a
+    ghic.llm.IssueAnalysis -- typed as Any here to avoid a
+    service/inference -> llm import at module load time for callers that
+    never use this path.
 
+    Answers four questions in order, so a maintainer can stop reading as
+    soon as they have what they need: what is this (executive summary),
+    how important is it (the fact table + Risk Assessment), why does GHIC
+    think that (reasoning), what should happen next (recommended action).
     Never includes raw feature names, TF-IDF terms, feature-importance
-    values, or any other ML-internal language -- those stay in logs only
-    (see app.py). The existing format_comment() above is the fallback when
-    the LLM analysis isn't available at all; it keeps its own collapsed
-    technical-details section for maintainers who want it. This format
-    never shows that section, by design -- a maintainer reading this
-    should not be able to tell there's a model behind it.
+    values, prompts, providers, token counts, or any other ML/engineering
+    internals -- those stay in logs only (see app.py). format_comment()
+    above is the fallback when no LLM analysis is available at all; it
+    keeps its own collapsed technical-details section for maintainers who
+    want it, which this format never shows.
 
     `disagreement=True` means ghic.llm.detect_disagreement() found the
     LLM's own priority/severity/reasoning strongly implying an actionable
-    bug while the ML classifier called it not actionable. Rather than pick
-    a side, the Actionability line says so plainly -- every other section
-    (summary, reasoning, next step) still renders, since those stay useful
-    regardless of which verdict a maintainer ends up trusting.
+    bug while the ML classifier called it not actionable. The Actionability
+    line reads "Needs Maintainer Review" rather than naming the underlying
+    mechanism -- "the models disagree" is an implementation detail, not
+    something a maintainer needs framed that way. Every other section
+    (summary, risk, reasoning, next step) still renders, since those stay
+    useful regardless of which verdict a maintainer ends up trusting.
+
+    Below models.LOW_CONFIDENCE_THRESHOLD, a plain-language disclaimer is
+    added rather than trusting the model to remember to say so itself --
+    deterministic where it needs to be, same reasoning as consistency.py.
+
+    Tone/emphasis differences per issue category (bug vs. feature vs.
+    question vs. ...) are steered entirely through the prompt (see
+    prompts.py's SYSTEM_PROMPT), not branched on here -- the free-text
+    fields (summary, reasoning, business_impact) are where that shows up,
+    and hardcoding per-category templates here would fight the model's own
+    read of the issue rather than express it.
     """
+    from ..llm.models import LOW_CONFIDENCE_THRESHOLD
+
     if disagreement:
-        actionability = "⚠️ Model Disagreement"
+        actionability = "Needs Maintainer Review"
     elif pred.predicted_label == 1:
         actionability = "Likely Actionable"
     else:
@@ -258,39 +279,58 @@ def format_llm_comment(
     lines = [
         "## 🤖 GHIC Analysis",
         "",
+        analysis.summary,
+        "",
+        "---",
+        "",
         "| | |",
         "|---|---|",
         f"| **Classification** | {analysis.category} |",
         f"| **Actionability** | {actionability} |",
-        f"| **ML Actionability Score** | {pred.proba:.0%} |",
+        f"| **Statistical Risk Score** | {pred.proba:.0%} |",
         f"| **Priority** | {analysis.priority.title()} |",
         f"| **Severity** | {analysis.severity.title()} |",
+        "",
+        "_This score is based on historical issue patterns._",
     ]
     if disagreement:
         lines += [
             "",
-            "_The AI's own reasoning below points more strongly toward an actionable "
-            "bug than the ML score suggests. Shown as a disagreement rather than a "
-            "single verdict — worth a maintainer's own look._",
+            "_The statistical prediction and the AI review reached different "
+            "conclusions on this one. Given the evidence below, GHIC recommends "
+            "a maintainer take a direct look before this gets triaged on the "
+            "score alone._",
         ]
 
     lines += [
         "",
         "---",
         "",
-        "### Summary",
+        "### Risk Assessment",
         "",
-        analysis.summary,
-        "",
-        "---",
-        "",
-        "### Why GHIC Reached This Conclusion",
+        f"**{analysis.risk_level.title()}**",
         "",
     ]
+    lines += [f"- {reason}" for reason in analysis.risk_reasons]
+
+    if analysis.business_impact:
+        lines += ["", "---", "", "### Business Impact", "", "**Potential Impact**", ""]
+        lines += [f"- {item}" for item in analysis.business_impact]
+
+    lines += ["", "---", "", "### Why GHIC Reached This Conclusion", ""]
     lines += [f"- {point}" for point in analysis.reasoning]
+    if analysis.confidence < LOW_CONFIDENCE_THRESHOLD:
+        lines += [
+            "",
+            "_The available information is insufficient to reach a "
+            "high-confidence assessment._",
+        ]
 
     if analysis.missing_information:
-        lines += ["", "---", "", "### Missing Information", ""]
+        lines += [
+            "", "---", "", "### Missing Information", "",
+            "To speed up investigation, consider adding:", "",
+        ]
         lines += [f"- {item}" for item in analysis.missing_information]
 
     if analysis.recommended_labels:
@@ -313,9 +353,18 @@ def format_llm_comment(
             for r in related
         ]
 
+    timestamp = (generated_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M UTC")
     lines += [
         "",
         "---",
+        "",
+        "### Analysis Details",
+        "",
+        "| | |",
+        "|---|---|",
+        "| **Status** | AI Analysis Completed |",
+        "| **Pipeline** | Machine Learning + AI Review |",
+        f"| **Generated** | {timestamp} |",
         "",
         "> GHIC combines statistical machine learning with AI reasoning to assist "
         "maintainers. Final triage decisions always remain with project maintainers.",
