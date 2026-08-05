@@ -220,3 +220,64 @@ def format_comment(
         "it can be wrong. A maintainer's judgement always wins._",
     ]
     return "\n".join(lines)
+
+
+def format_llm_comment(
+    pred: Prediction,
+    analysis: Any,
+    related: list[dict[str, Any]] | None = None,
+) -> str:
+    """Polished markdown comment built from an LLM IssueAnalysis on top of
+    the ML prediction. `analysis` is a ghic.llm.IssueAnalysis -- typed as
+    Any here to avoid a service/inference -> llm import at module load time
+    for callers that never use this path.
+
+    Never includes raw feature names, TF-IDF terms, or feature-importance
+    values -- those stay in logs only (see app.py), matching the spec this
+    format was built against. The existing format_comment() above is the
+    fallback when the LLM analysis isn't available; it keeps its own
+    collapsed technical-details section for maintainers who want it.
+    """
+    from .explain import confidence_bar
+
+    actionability = "Likely Actionable" if pred.predicted_label == 1 else "Likely Not Actionable"
+    lines = [
+        "## 🤖 GHIC Analysis",
+        "",
+        f"**Classification:** {analysis.category}",
+        "",
+        f"**Actionability:** {actionability}  ",
+        f"**Confidence:** `{confidence_bar(pred.proba)}` {pred.proba:.0%}",
+        "",
+        f"**Priority:** {analysis.priority.title()}  ",
+        f"**Severity:** {analysis.severity.title()}",
+        "",
+        "### Summary",
+        "",
+        analysis.summary,
+        "",
+        "### Reasoning",
+        "",
+        analysis.reasoning,
+    ]
+    if analysis.missing_information:
+        lines += ["", "### Missing Information", ""]
+        lines += [f"- {item}" for item in analysis.missing_information]
+    if analysis.recommended_labels:
+        lines += ["", "### Suggested Labels", ""]
+        lines += [" ".join(f"`{label}`" for label in analysis.recommended_labels)]
+    if related:
+        lines += ["", "**Possibly related prior issues** (by text similarity — please verify):"]
+        lines += [
+            f"- #{r['number']} — {r['title']} (similarity {r['similarity']:.2f})"
+            for r in related
+        ]
+    lines += [
+        "",
+        "---",
+        "",
+        "_Generated automatically by GHIC. Actionability is a statistically calibrated "
+        "prediction; category, priority, and severity are the AI's judgment, not a "
+        "validated model — this assists maintainers and does not replace human review._",
+    ]
+    return "\n".join(lines)

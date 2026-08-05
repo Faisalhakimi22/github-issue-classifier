@@ -2,8 +2,8 @@
 # this). For local dev with the full CLI/training toolchain, prefer:
 #   pip install -e ".[service,dev]"
 # (see pyproject.toml). For an exact pinned snapshot of the environment that
-# produced the shipped model artifacts (adds matplotlib/pytest/httpx, used
-# only for reproducing the research), see requirements-freeze.txt.
+# produced the shipped model artifacts (adds matplotlib/pytest, used only
+# for reproducing the research), see requirements-freeze.txt.
 #
 # On Vercel this file is auto-detected and installed by Vercel's own
 # optimizing installer (no custom installCommand — a custom install command
@@ -26,4 +26,5 @@ joblib==1.5.3
 fastapi==0.139.0
 PyJWT==2.13.0
 cryptography==49.0.0
+httpx==0.28.1
 pg8000>=1.30

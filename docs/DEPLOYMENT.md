@@ -229,11 +229,49 @@ Then: App settings → *List in Marketplace* → draft the listing (category:
   auto-labeled); `GHIC_DRAFT_MISSING_INFO=true` + `ANTHROPIC_API_KEY`
   drafts a "missing information" request on under-specified issues
   (template fallback without a key); `GHIC_PROJECT_ID` files predicted-
-  actionable issues onto a Projects v2 board.
+  actionable issues onto a Projects v2 board; `GHIC_USE_LLM_ANALYSIS=true`
+  + `OPENROUTER_API_KEY` replaces the comment with a full LLM-assisted
+  report — see §7 below.
 - Edited issues are re-scored automatically (never re-commented), so a
   report improved after the bot's nudge is graded on its improved text.
   Maintainer label events are recorded to the ledger as future ground
   truth (`label_events_observed` in `/stats`).
+
+## 7. LLM-assisted analysis (optional)
+
+Adds category / priority / severity / plain-language summary / missing-info
+/ suggested-labels to the comment, on top of the (unchanged) ML
+actionability probability. See [models/LLM_ANALYSIS_CARD.md](../models/LLM_ANALYSIS_CARD.md)
+for what this is and isn't (short version: priority/severity here are the
+LLM's judgment, not a validated prediction — that's a real distinction in
+this project, see the card).
+
+**Setup:**
+
+1. Get a free API key at [openrouter.ai/keys](https://openrouter.ai/keys) —
+   no payment method required for the default free-tier model.
+2. Set three env vars (Vercel: `vercel env add <NAME> production --value "..."`;
+   Docker: pass with `-e`):
+   ```bash
+   GHIC_USE_LLM_ANALYSIS=true
+   OPENROUTER_API_KEY=sk-or-v1-...
+   LLM_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free   # optional, this is the default
+   ```
+3. Redeploy. `GET /healthz` doesn't report LLM status directly, but startup
+   logs a line: `llm analysis enabled (provider=openrouter model=...)`.
+4. Dry-run first, same as any other rollout — the analysis is computed and
+   returned in `/api/predict`'s and the webhook's JSON response
+   (`llm_analysis` key) regardless of dry-run, so you can inspect it before
+   any comment goes out for real.
+
+**Troubleshooting:**
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Comment still uses the old format (no "GHIC Analysis" header) | `GHIC_USE_LLM_ANALYSIS` unset/false, or `OPENROUTER_API_KEY` missing | Both must be set — `settings.can_use_llm` requires both. Check startup logs for the "llm analysis enabled" line; its absence means at least one is missing. |
+| `llm_analysis` is `null` in the API/webhook response even with both set | The call failed and was caught — check logs for `llm analysis failed (...)` | Usually a bad/expired key (`LLMProviderError`, HTTP 401) or a rate limit on the free tier (`LLMProviderError`, HTTP 429 after retries exhausted). Verify the key at openrouter.ai; consider a paid model if 429s are frequent. |
+| Comments arrive slower than before | Expected — this adds one synchronous LLM call per issue, budgeted at an 8s timeout by default | If webhook deliveries are timing out on GitHub's side, lower `reasoning_effort` isn't exposed as an env var yet; open an issue, or construct `OpenRouterProvider` with a shorter `timeout` in a custom deploy. |
+| Free-tier model unavailable / retired | OpenRouter's free-tier catalog changes over time | Check `https://openrouter.ai/api/v1/models` for current `nvidia/*:free` (or any other provider's `:free`) slugs and set `LLM_MODEL` accordingly — no code change needed. |
 
 ## Security posture
 

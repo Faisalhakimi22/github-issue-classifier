@@ -30,8 +30,9 @@ from fastapi import FastAPI, HTTPException, Request
 from .. import utils
 from ..config import get_config
 from ..label import label_issue
+from ..llm import IssueContext, LLMService
 from .github_app import GitHubAppClient
-from .inference import IssuePredictor, format_comment
+from .inference import IssuePredictor, format_comment, format_llm_comment
 from .settings import ServiceSettings, load_settings
 from .tracking import PredictionTracker
 
@@ -66,10 +67,11 @@ def create_app(
     category_predictor: Any = None,
     effort_predictor: Any = None,
     assignment_recommender: Any = None,
+    llm_service: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
-    `category_predictor` / `effort_predictor` / `assignment_recommender`
-    are injectable for tests."""
+    `category_predictor` / `effort_predictor` / `assignment_recommender` /
+    `llm_service` are injectable for tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -152,6 +154,18 @@ def create_app(
         if assignment_recommender is not None:
             logger.info("assignment recommender loaded")
     app.state.assignment_recommender = assignment_recommender
+    # LLM-assisted analysis (optional; off unless GHIC_USE_LLM_ANALYSIS=true
+    # AND an OPENROUTER_API_KEY is set — see settings.can_use_llm).
+    if llm_service is None and settings.can_use_llm:
+        from ..llm.openrouter import OpenRouterProvider
+
+        provider = OpenRouterProvider(
+            api_key=settings.openrouter_api_key, model=settings.llm_model,
+        )
+        llm_service = LLMService(provider)
+        logger.info("llm analysis enabled (provider=%s model=%s)",
+                   settings.llm_provider, settings.llm_model)
+    app.state.llm_service = llm_service
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -404,11 +418,32 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         except Exception as e:  # recommender problems never block a prediction
             logger.warning("assignment suggestion failed: %s", e)
 
-    # Optional LLM-drafted "missing information" request. Triggered only by
-    # the deterministic under-specified check; the classifier's decision is
-    # never delegated to the generator.
+    # LLM-assisted analysis (category/priority/severity/summary/missing
+    # info/labels) layered on top of the ML prediction -- never recomputes
+    # or overrides pred.proba. None when disabled or on any failure;
+    # LLMService itself never raises. See ghic/llm/ and
+    # models/LLM_ANALYSIS_CARD.md.
+    llm_analysis = None
+    if app.state.llm_service is not None:
+        context = IssueContext(
+            repo=repo,
+            title=issue.get("title", ""),
+            body=issue.get("body") or "",
+            labels=[lab.get("name", "") for lab in (issue.get("labels") or [])],
+            author=author,
+            metadata={"created_at": issue.get("created_at")},
+            ml_probability=pred.proba,
+            ml_predicted_label=pred.predicted_label,
+        )
+        llm_analysis = app.state.llm_service.analyze_issue(context)
+
+    # Optional LLM-drafted "missing information" request. Skipped when the
+    # analysis above already produced one (avoids a redundant second LLM
+    # call and a duplicate section in the comment). Triggered only by the
+    # deterministic under-specified check either way; the classifier's
+    # decision is never delegated to the generator.
     info_request: dict[str, Any] | None = None
-    if s.draft_missing_info:
+    if s.draft_missing_info and llm_analysis is None:
         from .drafting import draft_missing_info
 
         try:
@@ -421,9 +456,12 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     actions: list[str] = []
     if not s.dry_run and gh is not None and installation_id:
         if s.post_comment:
-            comment = format_comment(pred, related, category)
-            if info_request:
-                comment += "\n\n---\n\n" + info_request["draft"]
+            if llm_analysis is not None:
+                comment = format_llm_comment(pred, llm_analysis, related)
+            else:
+                comment = format_comment(pred, related, category)
+                if info_request:
+                    comment += "\n\n---\n\n" + info_request["draft"]
             gh.post_comment(repo, number, comment, installation_id)
             actions.append("comment")
         if s.apply_label and pred.predicted_label == 1:
@@ -440,6 +478,7 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
             "related_issues": related,
             "suggested_assignees": suggested_assignees,  # API-only; never assigned
             "missing_info": info_request,
+            "llm_analysis": llm_analysis.as_dict() if llm_analysis else None,
             "actions": actions, "dry_run": s.dry_run}
 
 

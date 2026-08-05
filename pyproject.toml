@@ -39,6 +39,7 @@ service = [
     "uvicorn[standard]>=0.29",
     "PyJWT>=2.8",
     "cryptography>=42",
+    "httpx>=0.27",
 ]
 # Only needed when GHIC_DATABASE_URL/DATABASE_URL is set (serverless deploys
 # with no persistent disk, e.g. Vercel — see docs/DEPLOYMENT.md). Pure-Python

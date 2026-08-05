@@ -210,6 +210,23 @@ index. The LLM never makes the actionability decision — that stays with the
 calibrated classifier — and everything degrades to a deterministic template
 without an API key. Off by default.
 
+**LLM-assisted analysis** (`ghic/llm/`): on top of the ML actionability
+probability, an LLM (OpenRouter, default
+`nvidia/nemotron-3-ultra-550b-a55b:free`, free tier) produces a category,
+priority, severity, plain-language summary/reasoning, missing-information
+list, and suggested labels — the polished report format in
+`format_llm_comment()`. The ML probability is passed in as fixed evidence
+the model reasons from, never something it recomputes; category/priority/
+severity here are the LLM's judgment, explicitly not a statistically
+validated prediction the way the classifier's probability is (that
+distinction is why priority/severity weren't shipped as a *classifier* head —
+see the card). Every failure mode (timeout, rate limit, malformed JSON, no
+API key) degrades to the original ML-only comment, never breaks the
+webhook. `ghic/llm/provider.py` is a one-method abstract interface so
+another backend (OpenAI, Anthropic, Gemini, Ollama) is a new class, not a
+rewrite. Off by default (`GHIC_USE_LLM_ANALYSIS=false`); full design/testing
+notes in [models/LLM_ANALYSIS_CARD.md](models/LLM_ANALYSIS_CARD.md).
+
 **Operations**: structured request logs, per-endpoint latency percentiles
 and 5xx counts in `/stats`, a read-only `/dashboard` with six analytics
 facets computed from real ledger data (issue trends, duplicate rate,
@@ -271,12 +288,21 @@ ghic/
     app.py         FastAPI: /webhook, /healthz, /stats, /dashboard, /api/predict
     github_app.py  App auth (JWT → installation token) + REST/GraphQL helpers
     inference.py   single-issue prediction + top-feature explanations
+    explain.py     raw-feature-name humanizer + natural-language explanation
     tracking.py    the self-grading ledger + audit trail + dashboard analytics
+    pg_ledger.py   Postgres ledger backend (serverless deploys, no local disk)
     drafting.py    scoped LLM comment drafting (never the decision)
     settings.py    GHIC_* env config, safe-by-default
+  llm/             LLM-assisted issue analysis (see "LLM-assisted analysis" above)
+    provider.py    abstract LLMProvider interface (one method, swappable backends)
+    openrouter.py  the OpenRouter implementation: httpx, retry/backoff, timeout
+    prompts.py     system/user prompt construction
+    models.py      IssueContext / IssueAnalysis + strict JSON-schema validation
+    service.py     cache lookup → provider call → cache write, never raises
+    exceptions.py  LLMError hierarchy
 scripts/         loadtest.py — real latency percentiles against a live instance
 notebook/        the pipeline as three narrative notebooks
-tests/           155 tests: labeling, features, collection, service, heads, CLI, analytics
+tests/           214 tests: labeling, features, collection, service, heads, CLI, analytics, llm
 reports/         metrics, figures, backtest/champion/loadtest artifacts, runs/
 docs/            DEPLOYMENT.md · PRD.md · BENCHMARKS.md · openapi.json · assets/
 ```

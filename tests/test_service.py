@@ -833,6 +833,95 @@ class TestCategorySuggestion:
         assert gh.labels == [("acme/widgets", 42, ["predicted:actionable-bug"])]
 
 
+# ---------------------------------------------------------------------------
+# LLM-assisted analysis, wired into the issues.opened flow
+# ---------------------------------------------------------------------------
+class StubLLMService:
+    """Mirrors ghic.llm.LLMService's contract: analyze_issue never raises,
+    returns None to signal "fall back to the ML-only comment"."""
+
+    def __init__(self, analysis=None, calls_log=None):
+        self.analysis = analysis
+        self.calls = calls_log if calls_log is not None else []
+
+    def analyze_issue(self, context):
+        self.calls.append(context)
+        return self.analysis
+
+
+def make_llm_analysis(**overrides):
+    from ghic.llm.models import IssueAnalysis
+
+    defaults = dict(
+        category="bug", priority="high", severity="medium", confidence=0.92,
+        summary="The app crashes on save.",
+        reasoning="Clear reproduction steps and a stack trace are present.",
+        missing_information=["Application version", "Operating system"],
+        recommended_labels=["bug", "backend"],
+    )
+    defaults.update(overrides)
+    return IssueAnalysis(**defaults)
+
+
+class TestLLMAnalysisComment:
+    def test_llm_comment_used_when_analysis_available(self):
+        gh = StubGitHub()
+        llm = StubLLMService(analysis=make_llm_analysis())
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh, llm_service=llm)
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+
+        assert resp.status_code == 200
+        assert resp.json()["llm_analysis"]["category"] == "bug"
+        comment = gh.comments[0][2]
+        assert "GHIC Analysis" in comment
+        assert "High" in comment  # priority
+        assert "Application version" in comment
+        assert "`bug`" in comment and "`backend`" in comment
+        # The whole point: no raw sklearn/ML internals in the public comment.
+        assert "numeric__" not in comment
+        assert "tfidf__" not in comment
+        assert "feature importance" not in comment.lower()
+
+    def test_falls_back_to_ml_comment_when_llm_unavailable(self):
+        gh = StubGitHub()
+        llm = StubLLMService(analysis=None)  # disabled, missing key, or failed
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh, llm_service=llm)
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+
+        assert resp.status_code == 200
+        assert resp.json()["llm_analysis"] is None
+        comment = gh.comments[0][2]
+        assert "Issue triage prediction" in comment  # the original format_comment header
+
+    def test_no_llm_service_configured_behaves_like_before(self):
+        client = make_client(make_settings())
+        resp = post_webhook(client, issue_opened_payload())
+        assert resp.status_code == 200
+        assert resp.json()["llm_analysis"] is None
+
+    def test_llm_context_carries_the_ml_probability_unmodified(self):
+        llm = StubLLMService(analysis=make_llm_analysis())
+        app = create_app(make_settings(dry_run=True), predictor=StubPredictor(proba=0.73),
+                         llm_service=llm)
+        post_webhook(TestClient(app), issue_opened_payload())
+        assert llm.calls[0].ml_probability == 0.73
+        assert llm.calls[0].ml_predicted_label == 1
+
+    def test_missing_info_draft_skipped_when_llm_analysis_present(self):
+        """Avoids a redundant second LLM call and a duplicate section when
+        both GHIC_DRAFT_MISSING_INFO and GHIC_USE_LLM_ANALYSIS are on."""
+        gh = StubGitHub()
+        llm = StubLLMService(analysis=make_llm_analysis())
+        app = create_app(
+            make_settings(dry_run=False, post_comment=True, draft_missing_info=True),
+            predictor=StubPredictor(), gh_client=gh, llm_service=llm,
+        )
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.json()["missing_info"] is None
+
+
 class TestCategoryDerivation:
     def test_repo_conventions_normalize(self):
         from ghic.category import derive_category
