@@ -233,6 +233,23 @@ compatible API (which both shipped providers are), so another backend
 Off by default (`GHIC_USE_LLM_ANALYSIS=false`); full design/testing
 notes in [models/LLM_ANALYSIS_CARD.md](models/LLM_ANALYSIS_CARD.md).
 
+**Async webhook processing** (`ghic/service/qstash.py`,
+`ghic/service/idempotency.py`): `/webhook` can validate, idempotency-check,
+and return 200 in well under a second, deferring the actual scoring/LLM/
+comment work to a callback via Upstash QStash — a real durable queue,
+not a home-grown workaround, because the obvious alternatives don't
+actually work on this project's serverless target: FastAPI's
+`BackgroundTasks` is confirmed unreliable on Vercel's Python runtime (no
+guarantee the function keeps running after it responds), Vercel's own
+`waitUntil()` continuation is documented for Node.js/Edge only, and
+Vercel's Cron Jobs are capped at once/day on the Hobby plan — useless as a
+poller for a triage bot. Idempotency (dedup on GitHub's own
+`X-GitHub-Delivery` header, so a retried delivery never produces a second
+comment) is independent of the queue and always active. Off by default —
+`/webhook` processes every issue inline exactly as before otherwise. Full
+platform research and design notes in
+[models/ASYNC_PROCESSING_CARD.md](models/ASYNC_PROCESSING_CARD.md).
+
 **Operations**: structured request logs, per-endpoint latency percentiles
 and 5xx counts in `/stats`, a read-only `/dashboard` with six analytics
 facets computed from real ledger data (issue trends, duplicate rate,
@@ -297,6 +314,8 @@ ghic/
     explain.py     raw-feature-name humanizer + natural-language explanation
     tracking.py    the self-grading ledger + audit trail + dashboard analytics
     pg_ledger.py   Postgres ledger backend (serverless deploys, no local disk)
+    idempotency.py dedup GitHub deliveries by X-GitHub-Delivery (Postgres/file/memory)
+    qstash.py      async queue publish + Upstash-Signature JWT verification
     drafting.py    scoped LLM comment drafting (never the decision)
     settings.py    GHIC_* env config, safe-by-default
   llm/             LLM-assisted issue analysis (see "LLM-assisted analysis" above)
@@ -311,7 +330,7 @@ ghic/
     exceptions.py        LLMError hierarchy
 scripts/         loadtest.py — real latency percentiles against a live instance
 notebook/        the pipeline as three narrative notebooks
-tests/           222 tests: labeling, features, collection, service, heads, CLI, analytics, llm
+tests/           253 tests: labeling, features, collection, service, heads, CLI, analytics, llm, async
 reports/         metrics, figures, backtest/champion/loadtest artifacts, runs/
 docs/            DEPLOYMENT.md · PRD.md · BENCHMARKS.md · openapi.json · assets/
 ```

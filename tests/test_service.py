@@ -168,6 +168,201 @@ class TestSignature:
 
 
 # ---------------------------------------------------------------------------
+# Idempotency: same X-GitHub-Delivery must never process twice
+# ---------------------------------------------------------------------------
+def post_webhook_with_delivery(client: TestClient, payload: dict[str, Any], delivery_id: str,
+                               event: str = "issues", secret: str = SECRET):
+    body = json.dumps(payload).encode()
+    return client.post(
+        "/webhook",
+        content=body,
+        headers={
+            "X-GitHub-Event": event,
+            "X-GitHub-Delivery": delivery_id,
+            "X-Hub-Signature-256": sign(body, secret),
+            "Content-Type": "application/json",
+        },
+    )
+
+
+class TestIdempotency:
+    def test_duplicate_delivery_id_is_ignored(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh)
+        client = TestClient(app)
+
+        first = post_webhook_with_delivery(client, issue_opened_payload(), "delivery-abc")
+        second = post_webhook_with_delivery(client, issue_opened_payload(), "delivery-abc")
+
+        assert first.status_code == 200
+        assert first.json().get("duplicate") is not True
+        assert second.status_code == 200
+        assert second.json() == {"ok": True, "duplicate": True}
+        assert len(gh.comments) == 1  # not 2 -- the whole point
+
+    def test_different_delivery_ids_both_process(self):
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh)
+        client = TestClient(app)
+
+        post_webhook_with_delivery(client, issue_opened_payload(number=1), "delivery-1")
+        post_webhook_with_delivery(client, issue_opened_payload(number=2), "delivery-2")
+        assert len(gh.comments) == 2
+
+    def test_requests_without_delivery_header_are_never_deduped(self):
+        """Backward compatibility: a caller (or test) that doesn't send
+        X-GitHub-Delivery gets the pre-idempotency behavior unchanged --
+        no header means no dedup key to check."""
+        client = make_client(make_settings())
+        first = post_webhook(client, issue_opened_payload())
+        second = post_webhook(client, issue_opened_payload())
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json().get("duplicate") is not True
+
+
+# ---------------------------------------------------------------------------
+# Async processing via QStash
+# ---------------------------------------------------------------------------
+class StubQueuePublisher:
+    """Records what would have been published; lets tests assert the
+    webhook returned fast without doing any ML/LLM/GitHub work inline."""
+
+    def __init__(self, message_id="msg-test", error=None):
+        self.message_id = message_id
+        self.error = error
+        self.published: list[tuple[str, dict]] = []
+
+    def __call__(self, destination_url, payload, token, region="us-east-1"):
+        if self.error:
+            raise self.error
+        self.published.append((destination_url, payload))
+        return self.message_id
+
+
+class TestAsyncProcessing:
+    def _async_settings(self, **overrides):
+        return make_settings(
+            dry_run=False, post_comment=True,
+            use_async_processing=True, qstash_token="test-token",
+            qstash_current_signing_key="test-signing-key-long-enough-for-hs256",
+            public_base_url="https://example.com",
+            **overrides,
+        )
+
+    def test_queued_when_async_configured(self, monkeypatch):
+        # The handler does `from .qstash import publish` at call time, so
+        # patching the attribute on the source module is what actually
+        # takes effect.
+        import ghic.service.qstash as qstash_module
+
+        stub_publish = StubQueuePublisher()
+        monkeypatch.setattr(qstash_module, "publish", stub_publish)
+
+        gh = StubGitHub()
+        app = create_app(self._async_settings(), predictor=StubPredictor(), gh_client=gh)
+        client = TestClient(app)
+
+        resp = post_webhook_with_delivery(client, issue_opened_payload(), "delivery-async-1")
+
+        assert resp.status_code == 200
+        assert resp.json()["queued"] is True
+        assert resp.json()["message_id"] == "msg-test"
+        assert len(stub_publish.published) == 1
+        assert gh.comments == []  # nothing posted synchronously -- it's queued
+
+    def test_publish_failure_falls_back_to_synchronous(self, monkeypatch):
+        from ghic.service.qstash import QStashError
+        import ghic.service.qstash as qstash_module
+
+        stub_publish = StubQueuePublisher(error=QStashError("upstash is down"))
+        monkeypatch.setattr(qstash_module, "publish", stub_publish)
+
+        gh = StubGitHub()
+        app = create_app(self._async_settings(), predictor=StubPredictor(), gh_client=gh)
+        client = TestClient(app)
+
+        resp = post_webhook_with_delivery(client, issue_opened_payload(), "delivery-async-2")
+
+        assert resp.status_code == 200
+        assert "queued" not in resp.json()
+        assert len(gh.comments) == 1  # processed inline instead
+
+    def test_async_not_configured_processes_synchronously(self):
+        """Default behavior, unchanged: no QStash config means every issue
+        is still scored and commented on inline, same as before this
+        feature existed."""
+        gh = StubGitHub()
+        app = create_app(make_settings(dry_run=False, post_comment=True),
+                         predictor=StubPredictor(), gh_client=gh)
+        client = TestClient(app)
+        resp = post_webhook_with_delivery(client, issue_opened_payload(), "delivery-sync-1")
+        assert "queued" not in resp.json()
+        assert len(gh.comments) == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /internal/process-issue -- the QStash callback target
+# ---------------------------------------------------------------------------
+class TestProcessIssueCallback:
+    def _signed_request(self, secret_key: str, url: str, payload: dict):
+        import base64
+        import hashlib
+        import time
+
+        import jwt
+
+        body = json.dumps(payload).encode()
+        body_hash = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).decode().rstrip("=")
+        now = int(time.time())
+        claims = {"iss": "Upstash", "sub": url, "exp": now + 300, "iat": now,
+                  "nbf": now - 1, "jti": "test", "body": body_hash}
+        return body, jwt.encode(claims, secret_key, algorithm="HS256")
+
+    def test_valid_signature_processes_and_returns_200(self):
+        signing_key = "test-signing-key-long-enough-for-hs256"
+        settings = make_settings(
+            dry_run=False, post_comment=True,
+            use_async_processing=True, qstash_token="t",
+            qstash_current_signing_key=signing_key,
+            public_base_url="https://example.com",
+        )
+        gh = StubGitHub()
+        app = create_app(settings, predictor=StubPredictor(), gh_client=gh)
+        client = TestClient(app)
+
+        payload = issue_opened_payload()
+        body, sig = self._signed_request(
+            signing_key, "https://example.com/internal/process-issue", payload,
+        )
+        resp = client.post("/internal/process-issue", content=body,
+                           headers={"Upstash-Signature": sig, "Content-Type": "application/json"})
+        assert resp.status_code == 200
+        assert len(gh.comments) == 1
+
+    def test_invalid_signature_rejected(self):
+        settings = make_settings(
+            use_async_processing=True, qstash_token="t",
+            qstash_current_signing_key="test-signing-key-long-enough-for-hs256",
+            public_base_url="https://example.com",
+        )
+        app = create_app(settings, predictor=StubPredictor())
+        client = TestClient(app)
+
+        resp = client.post("/internal/process-issue", content=b'{"a": 1}',
+                           headers={"Upstash-Signature": "not-a-real-jwt"})
+        assert resp.status_code == 401
+
+    def test_not_configured_returns_503(self):
+        app = create_app(make_settings(), predictor=StubPredictor())
+        client = TestClient(app)
+        resp = client.post("/internal/process-issue", content=b"{}")
+        assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
 # Event routing
 # ---------------------------------------------------------------------------
 class TestRouting:

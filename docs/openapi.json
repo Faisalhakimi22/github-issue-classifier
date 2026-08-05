@@ -105,6 +105,27 @@
           }
         }
       }
+    },
+    "/internal/process-issue": {
+      "post": {
+        "summary": "Process Issue Callback",
+        "description": "QStash's callback target -- see settings.can_use_async_queue and\nghic/service/qstash.py. Verifies the Upstash-Signature JWT (not the\nGitHub HMAC -- this request comes from QStash, not GitHub) before\ndoing any work, since this endpoint can trigger a real GitHub\ncomment. A non-2xx response makes QStash retry per its own policy.",
+        "operationId": "process_issue_callback_internal_process_issue_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Process Issue Callback Internal Process Issue Post"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

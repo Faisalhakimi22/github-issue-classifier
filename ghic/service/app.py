@@ -68,10 +68,11 @@ def create_app(
     effort_predictor: Any = None,
     assignment_recommender: Any = None,
     llm_service: Any = None,
+    idempotency: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
     `category_predictor` / `effort_predictor` / `assignment_recommender` /
-    `llm_service` are injectable for tests."""
+    `llm_service` / `idempotency` are injectable for tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -159,6 +160,17 @@ def create_app(
     if llm_service is None and settings.can_use_llm:
         llm_service = LLMService(_build_llm_provider(settings))
     app.state.llm_service = llm_service
+    # Idempotency: dedup GitHub webhook deliveries by X-GitHub-Delivery.
+    # Shares database_url (same Postgres) with the ledger when set; a
+    # file-backed fallback otherwise; in-memory (this process's lifetime
+    # only) if neither is configured -- see idempotency.py.
+    if idempotency is None:
+        from .idempotency import build_idempotency_store
+
+        idempotency = build_idempotency_store(
+            database_url=settings.database_url, file_path=settings.idempotency_path,
+        )
+    app.state.idempotency = idempotency
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -222,6 +234,15 @@ def create_app(
         elif not s.allow_unsigned:
             raise HTTPException(status_code=503, detail="webhook secret not configured")
 
+        # GitHub reuses the same X-GitHub-Delivery ID when it retries a
+        # delivery that didn't get a timely 2xx -- the natural idempotency
+        # key, checked before any processing so a retried delivery (or one
+        # replayed by mistake) never produces a second comment.
+        delivery_id = request.headers.get("X-GitHub-Delivery")
+        if delivery_id and not app.state.idempotency.mark_if_new(delivery_id):
+            logger.info("duplicate delivery %s ignored", delivery_id)
+            return {"ok": True, "duplicate": True}
+
         event = request.headers.get("X-GitHub-Event", "")
         payload = await request.json()
 
@@ -256,6 +277,31 @@ def create_app(
             created_at=data.get("created_at") or _utcnow_iso(),
         )
         return pred.as_dict()
+
+    @app.post("/internal/process-issue")
+    async def process_issue_callback(request: Request) -> dict[str, Any]:
+        """QStash's callback target -- see settings.can_use_async_queue and
+        ghic/service/qstash.py. Verifies the Upstash-Signature JWT (not the
+        GitHub HMAC -- this request comes from QStash, not GitHub) before
+        doing any work, since this endpoint can trigger a real GitHub
+        comment. A non-2xx response makes QStash retry per its own policy.
+        """
+        s: ServiceSettings = app.state.settings
+        if not s.can_use_async_queue:
+            raise HTTPException(status_code=503, detail="async processing not configured")
+
+        body = await request.body()
+        from .qstash import verify_signature
+
+        signing_keys = [s.qstash_current_signing_key, s.qstash_next_signing_key]
+        if not verify_signature(
+            request.headers.get("Upstash-Signature"), body, signing_keys,
+            f"{s.public_base_url}/internal/process-issue",
+        ):
+            raise HTTPException(status_code=401, detail="invalid qstash signature")
+
+        payload = await request.json()
+        return _process_issue_job(app, payload)
 
     return app
 
@@ -327,6 +373,48 @@ def _enrich(
 # The issues.opened flow
 # ---------------------------------------------------------------------------
 def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+    """Thin ingest: cheap validation, then either hand off to QStash (async
+    configured) or process inline (default, current behavior unchanged).
+
+    The bot/malformed-payload checks stay here rather than moving into the
+    deferred job -- no reason to enqueue (or spend a synchronous call on) an
+    issue that's getting ignored either way.
+    """
+    issue = payload.get("issue") or {}
+    repo = (payload.get("repository") or {}).get("full_name", "")
+    number = int(issue.get("number", 0))
+    author = ((issue.get("user") or {}).get("login")) or ""
+
+    if not repo or not number:
+        raise HTTPException(status_code=422, detail="malformed issues payload")
+    if _is_bot(author):
+        return {"ok": True, "ignored": f"bot author {author}"}
+
+    if app.state.settings.can_use_async_queue:
+        from .qstash import QStashError, publish
+
+        s: ServiceSettings = app.state.settings
+        try:
+            message_id = publish(
+                f"{s.public_base_url}/internal/process-issue", payload, s.qstash_token,
+                region=s.qstash_region,
+            )
+            return {"ok": True, "queued": True, "message_id": message_id}
+        except QStashError as e:
+            # Queueing failed -- fall through to synchronous processing
+            # rather than silently dropping the issue.
+            logger.warning("qstash publish failed (%s); processing synchronously instead", e)
+
+    return _process_issue_job(app, payload)
+
+
+def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+    """The actual work: ML scoring, assistive heads, LLM analysis, and any
+    GitHub writes. Runs inline when async processing is off (default) or
+    QStash publish failed; runs from POST /internal/process-issue when
+    QStash calls back. Same function either way -- the caller decides
+    when it runs, this doesn't know or care.
+    """
     s: ServiceSettings = app.state.settings
     predictor: IssuePredictor = app.state.predictor
     gh: GitHubAppClient | None = app.state.gh
@@ -336,11 +424,6 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     installation_id = (payload.get("installation") or {}).get("id")
     number = int(issue.get("number", 0))
     author = ((issue.get("user") or {}).get("login")) or ""
-
-    if not repo or not number:
-        raise HTTPException(status_code=422, detail="malformed issues payload")
-    if _is_bot(author):
-        return {"ok": True, "ignored": f"bot author {author}"}
 
     author_created_at, author_public_repos, author_followers, latest_release = _enrich(
         s, gh, author, repo, installation_id

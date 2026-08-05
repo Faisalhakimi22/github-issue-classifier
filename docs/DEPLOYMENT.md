@@ -285,11 +285,54 @@ Groq itself fails.
 | Comments arrive slower than before | Expected — this adds one synchronous LLM call per issue | With Groq alone this should stay under ~2-3s. If it's consistently much slower, Groq may be degraded/rate-limited and falling through to OpenRouter's ~17s path on every request — check logs for `llm provider 1/2 (GroqProvider) failed`. |
 | Free-tier model unavailable / retired | Provider catalogs change over time | Groq: check [console.groq.com/docs/models](https://console.groq.com/docs/models). OpenRouter: check `https://openrouter.ai/api/v1/models` for current `:free` slugs. Set `LLM_MODEL` / `OPENROUTER_MODEL` accordingly — no code change needed. |
 
+## 8. Asynchronous webhook processing (optional)
+
+`/webhook` validates and returns 200 in well under a second instead of
+waiting on the LLM call, deferring the actual work to a queued callback.
+See [models/ASYNC_PROCESSING_CARD.md](../models/ASYNC_PROCESSING_CARD.md)
+for why this needs a real queue (Upstash QStash) rather than FastAPI
+`BackgroundTasks` or Vercel Cron — both were checked directly and neither
+works for this on Vercel's Python runtime / Hobby plan.
+
+**Setup:**
+
+1. Create a free account at [console.upstash.com](https://console.upstash.com) →
+   QStash tab. Copy the **QStash Token** and both **Signing Keys** (current
+   and next).
+2. Set env vars:
+   ```bash
+   GHIC_USE_ASYNC_PROCESSING=true
+   QSTASH_TOKEN=...
+   QSTASH_CURRENT_SIGNING_KEY=...
+   QSTASH_NEXT_SIGNING_KEY=...
+   GHIC_PUBLIC_BASE_URL=https://<your-deployed-domain>   # no trailing slash
+   ```
+3. Redeploy. Open a test issue on an installed repo and check `/webhook`'s
+   response — with async active it returns `{"ok": true, "queued": true,
+   "message_id": "..."}` immediately; the comment appears a few seconds
+   later once QStash's callback to `/internal/process-issue` completes.
+4. If any of the four vars above is missing, `/webhook` silently processes
+   inline instead (same as async being off) — check startup logs for a
+   warning naming which one.
+
+**Idempotency** (dedup by `X-GitHub-Delivery`) is independent of this and
+always on — no setup needed, works whether or not the queue is configured.
+On Vercel it shares `DATABASE_URL`/`GHIC_DATABASE_URL` with the ledger (no
+separate connection string); on Docker/Fly it's a file at
+`GHIC_IDEMPOTENCY_FILE` (default `data/idempotency.json`, same volume as
+the ledger).
+
 ## Security posture
 
 - HMAC (`X-Hub-Signature-256`) verified on every webhook with a constant-time
   compare; unsigned requests are rejected unless `GHIC_ALLOW_UNSIGNED=true`
   (dev only).
+- `/internal/process-issue` (the QStash callback target, when async
+  processing is enabled) verifies the `Upstash-Signature` JWT — HS256 via
+  the configured signing key(s), checking issuer, destination URL, and a
+  hash of the request body — before doing anything. Returns 503 if async
+  processing isn't configured, so the route can't be probed into doing
+  anything on a deploy that never enabled it.
 - `/api/predict` is gated by the same secret (`X-GHIC-Token` header) so the
   model is not a public scoring oracle.
 - The container runs as a non-root user; no state is persisted.

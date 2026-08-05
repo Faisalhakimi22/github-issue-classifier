@@ -136,6 +136,28 @@ class ServiceSettings:
     openrouter_api_key: str = ""
     openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
+    # Async webhook processing via Upstash QStash — see ghic/service/qstash.py
+    # and models/ASYNC_PROCESSING_CARD.md for why this exists (neither
+    # FastAPI's BackgroundTasks nor Vercel's waitUntil() reliably keeps a
+    # Python function running after it responds on Vercel, and Vercel's own
+    # Cron Jobs are capped at once/day on the Hobby plan — too infrequent to
+    # stand in as a poller). Off by default: with it off, /webhook processes
+    # issues synchronously exactly as before (current, backward-compatible
+    # behavior) — this is purely additive.
+    use_async_processing: bool = False
+    qstash_token: str = ""
+    qstash_current_signing_key: str = ""
+    qstash_next_signing_key: str = ""
+    qstash_region: str = "us-east-1"
+    # This deploy's own public URL, so QStash knows where to call back
+    # (POST {public_base_url}/internal/process-issue). No default — a wrong
+    # guess here would silently misroute every queued job.
+    public_base_url: str = ""
+    # File-backed idempotency store path for deploys without database_url
+    # (Docker/Fly). Shares database_url (same Postgres) when that's set --
+    # no separate connection string needed.
+    idempotency_path: Path | None = None
+
     extras: dict = field(default_factory=dict)
 
     @property
@@ -145,6 +167,13 @@ class ServiceSettings:
     @property
     def can_use_llm(self) -> bool:
         return self.use_llm_analysis and bool(self.groq_api_key or self.openrouter_api_key)
+
+    @property
+    def can_use_async_queue(self) -> bool:
+        return bool(
+            self.use_async_processing and self.qstash_token and self.public_base_url
+            and self.qstash_current_signing_key
+        )
 
     def threshold_for(self, repo_full_name: str) -> float:
         return self.repo_thresholds.get(repo_full_name, self.threshold)
@@ -175,6 +204,19 @@ class ServiceSettings:
                 "GHIC_USE_LLM_ANALYSIS=true but neither GROQ_API_KEY nor "
                 "OPENROUTER_API_KEY is set — LLM analysis will stay off; "
                 "comments fall back to the ML-only format."
+            )
+        if self.use_async_processing and not self.can_use_async_queue:
+            missing = [
+                name for name, val in [
+                    ("QSTASH_TOKEN", self.qstash_token),
+                    ("GHIC_PUBLIC_BASE_URL", self.public_base_url),
+                    ("QSTASH_CURRENT_SIGNING_KEY", self.qstash_current_signing_key),
+                ] if not val
+            ]
+            logger.warning(
+                "GHIC_USE_ASYNC_PROCESSING=true but missing %s — issues will "
+                "be processed synchronously instead (same as async being off).",
+                ", ".join(missing),
             )
 
 
@@ -235,7 +277,26 @@ def load_settings() -> ServiceSettings:
         openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
         openrouter_model=os.environ.get("OPENROUTER_MODEL")
         or "nvidia/nemotron-3-ultra-550b-a55b:free",
+        use_async_processing=_env_bool("GHIC_USE_ASYNC_PROCESSING", False),
+        qstash_token=os.environ.get("QSTASH_TOKEN", ""),
+        qstash_current_signing_key=os.environ.get("QSTASH_CURRENT_SIGNING_KEY", ""),
+        qstash_next_signing_key=os.environ.get("QSTASH_NEXT_SIGNING_KEY", ""),
+        qstash_region=os.environ.get("QSTASH_REGION") or "us-east-1",
+        public_base_url=(os.environ.get("GHIC_PUBLIC_BASE_URL", "")).rstrip("/"),
+        idempotency_path=_load_idempotency_path(),
     )
+
+
+def _load_idempotency_path() -> Path | None:
+    """GHIC_IDEMPOTENCY_FILE: unset -> data/idempotency.json; empty -> disabled
+    (falls back to in-memory, correct only within one process's lifetime).
+    Irrelevant when database_url is set -- Postgres wins, see idempotency.py's
+    build_idempotency_store().
+    """
+    raw = os.environ.get("GHIC_IDEMPOTENCY_FILE")
+    if raw is None:
+        return utils.PROJECT_ROOT / "data" / "idempotency.json"
+    return Path(raw) if raw.strip() else None
 
 
 def _load_ledger_path() -> Path | None:
