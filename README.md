@@ -224,9 +224,13 @@ evidence the model reasons from, never something it recomputes; category/
 priority/severity here are the LLM's judgment, explicitly not a
 statistically validated prediction the way the classifier's probability is
 (that distinction is why priority/severity weren't shipped as a *classifier*
-head — see the card). Every failure mode (timeout, rate limit, malformed
-JSON, no API key) degrades to the original ML-only comment, never breaks
-the webhook. `ghic/llm/provider.py` is a one-method abstract interface, and
+head — see the card). A deterministic consistency check
+(`ghic/llm/consistency.py`) flags the rare case where the LLM's own
+priority/severity/reasoning strongly implies an actionable bug the ML
+classifier called non-actionable, rendering `⚠️ Model Disagreement` instead
+of silently showing two contradictory conclusions. Every failure mode
+(timeout, rate limit, malformed JSON, no API key) degrades to the original
+ML-only comment, never breaks the webhook. `ghic/llm/provider.py` is a one-method abstract interface, and
 `ghic/llm/_chat_completions.py` a narrower shared base for any OpenAI-
 compatible API (which both shipped providers are), so another backend
 (OpenAI, Anthropic, Gemini, Ollama) is a small new class, not a rewrite.

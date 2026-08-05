@@ -19,7 +19,7 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from ghic.service.app import create_app, verify_signature  # noqa: E402
-from ghic.service.inference import Prediction, format_comment  # noqa: E402
+from ghic.service.inference import Prediction, format_comment, format_llm_comment  # noqa: E402
 from ghic.service.settings import ServiceSettings  # noqa: E402
 
 SECRET = "test-secret"
@@ -1050,7 +1050,8 @@ def make_llm_analysis(**overrides):
     defaults = dict(
         category="bug", priority="high", severity="medium", confidence=0.92,
         summary="The app crashes on save.",
-        reasoning="Clear reproduction steps and a stack trace are present.",
+        reasoning=["Clear reproduction steps and a stack trace are present."],
+        recommended_action="Investigate immediately -- this affects a core workflow.",
         missing_information=["Application version", "Operating system"],
         recommended_labels=["bug", "backend"],
     )
@@ -1115,6 +1116,49 @@ class TestLLMAnalysisComment:
         )
         resp = post_webhook(TestClient(app), issue_opened_payload())
         assert resp.json()["missing_info"] is None
+
+    def test_disagreement_renders_warning_instead_of_a_verdict(self):
+        pred = Prediction(
+            repo="acme/widgets", issue_number=1, proba=0.12, threshold=0.5,
+            predicted_label=0, model_name="stub",
+        )
+        comment = format_llm_comment(pred, make_llm_analysis(), disagreement=True)
+        assert "⚠️ Model Disagreement" in comment
+        assert "Likely Not Actionable" not in comment
+        assert "Likely Actionable" not in comment
+        assert "AI's own reasoning" in comment
+
+    def test_no_disagreement_renders_the_plain_verdict(self):
+        pred = Prediction(
+            repo="acme/widgets", issue_number=1, proba=0.12, threshold=0.5,
+            predicted_label=0, model_name="stub",
+        )
+        comment = format_llm_comment(pred, make_llm_analysis(), disagreement=False)
+        assert "Likely Not Actionable" in comment
+        assert "Model Disagreement" not in comment
+        assert "AI's own reasoning" not in comment
+
+    def test_webhook_end_to_end_surfaces_disagreement_in_response_and_comment(self):
+        """ML calls it non-actionable, but the LLM's own priority/severity/
+        reasoning strongly implies an actionable bug -- detect_disagreement()
+        should catch it and the webhook should both flag it in the JSON
+        response and render it in the posted comment."""
+        gh = StubGitHub()
+        llm = StubLLMService(analysis=make_llm_analysis(
+            priority="critical", severity="critical",
+            reasoning=["The report includes a reproducible crash with a stack trace."],
+        ))
+        app = create_app(
+            make_settings(dry_run=False, post_comment=True),
+            predictor=StubPredictor(proba=0.1, threshold=0.5),  # -> predicted_label=0
+            gh_client=gh, llm_service=llm,
+        )
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+
+        assert resp.status_code == 200
+        assert resp.json()["llm_ml_disagreement"] is True
+        comment = gh.comments[0][2]
+        assert "⚠️ Model Disagreement" in comment
 
 
 class TestCategoryDerivation:

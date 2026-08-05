@@ -64,6 +64,75 @@ logic that kept the ML version out.
   `logger.info` calls) and in `format_comment()`'s collapsed technical-
   details section, which this comment format doesn't use at all.
 
+## Comment format and schema (v2)
+
+The posted comment (`format_llm_comment()` in `ghic/service/inference.py`) was
+rebuilt around one rule: a maintainer reading it should not be able to tell
+there's a model behind it. Concretely:
+
+- **`IssueAnalysis.reasoning` is `list[str]`, not a paragraph.** The prompt
+  (`ghic/llm/prompts.py`) asks for 2–5 short factual bullets directly, and
+  `parse_issue_analysis()` rejects a string in that field rather than
+  splitting it after the fact — a model that's actually reasoning in bullets
+  produces better bullets than a paragraph does when chopped up. Truncated to
+  6 items defensively even though the prompt asks for at most 5.
+- **`IssueAnalysis.recommended_action` is a new required field** — exactly
+  one sentence naming the single next step a maintainer should take. It has
+  its own section in the comment (`### Recommended Next Step`) rather than
+  being folded into the summary or reasoning.
+- **No confidence bar.** An earlier iteration rendered `pred.proba` behind a
+  Unicode block-character progress bar (`confidence_bar()` in
+  `ghic/service/explain.py`); that's still what `format_comment()` — the
+  ML-only fallback — uses. `format_llm_comment()` deliberately does not: it
+  prints the ML score as plain text (`| **ML Actionability Score** | 12% |`)
+  and nothing else. A bar next to a number invites reading precision into a
+  probability that doesn't have that precision.
+- **`confidence` (the LLM's own confidence in its analysis) is captured in
+  the schema and exposed in the API response, but never rendered in the
+  comment.** Showing it next to the ML actionability score would read as two
+  competing confidence numbers on the same message — exactly the ambiguity
+  this redesign removes.
+- **`recommended_labels` is capped at 5** and always rendered as individual
+  backtick-wrapped tokens, never a comma-joined sentence.
+
+## Consistency layer — `ghic/llm/consistency.py`
+
+The LLM is given the ML verdict as fixed evidence and told not to
+contradict it (see prompts.py above), but nothing stops its own
+priority/severity/reasoning from *implying* a different conclusion than the
+ML probability reached — e.g. ML says "not actionable" while the LLM's own
+reasoning describes a reproducible crash with a stack trace. Shipping both
+halves of that unreconciled onto the same comment is worse than either
+alone: it reads as the tool contradicting itself.
+
+`detect_disagreement()` is a deterministic, non-LLM check (same pattern as
+`drafting.py`'s `needs_more_info()`): ML predicted "not actionable" **and**
+the LLM's own priority and severity are both high/critical **and** its
+reasoning text contains a strong actionable-signal term (crash, reproducible,
+data loss, security, regression, etc.). All three must hold — it is a
+precision-first check, tuned to only fire when genuinely confident something
+is off, not to catch every soft disagreement.
+
+**Deliberately not resolved with a second LLM call.** Asking the model (same
+call or a follow-up) to "reconcile" a detected disagreement doesn't validate
+which side was right — it just produces a differently-confident-sounding
+answer, and this project has no ground truth to check that answer against.
+When `detect_disagreement()` fires, the webhook logs a warning
+(`llm/ml disagreement on {repo}#{number}`), the API response sets
+`llm_ml_disagreement: true`, and the comment's Actionability line reads
+`⚠️ Model Disagreement` instead of picking a side — every other section
+(summary, reasoning, recommended action) still renders, since those stay
+useful regardless of which verdict a maintainer ends up trusting.
+
+Directional by design: only "ML says not-actionable, LLM signal says
+otherwise" is flagged. The reverse (ML says actionable, LLM's own severity
+read is mild) is not — a calibrated probability landing just over the
+decision threshold on a real but minor issue is expected behavior, not a
+contradiction. See `tests/test_llm.py::TestDetectDisagreement` and
+`tests/test_service.py::TestLLMAnalysisComment` (the
+`test_disagreement_*` / `test_webhook_end_to_end_surfaces_disagreement_*`
+cases) for the covered scenarios.
+
 ## Cost / reliability notes
 
 - Both default models are free tiers: no per-token cost, but free tiers

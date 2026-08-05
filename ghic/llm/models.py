@@ -12,7 +12,9 @@ from typing import Any
 from .exceptions import LLMResponseError
 
 _VALID_LEVELS = frozenset({"low", "medium", "high", "critical"})
-_REQUIRED_STRING_FIELDS = ("category", "priority", "severity", "summary", "reasoning")
+_REQUIRED_STRING_FIELDS = ("category", "priority", "severity", "summary", "recommended_action")
+_MAX_LABELS = 5
+_MAX_REASONING_POINTS = 6
 
 
 @dataclass(frozen=True)
@@ -34,13 +36,24 @@ class IssueContext:
 class IssueAnalysis:
     """The LLM's structured judgment. Priority/severity are the model's
     opinion, not a statistically validated prediction -- see
-    models/LLM_ANALYSIS_CARD.md."""
+    models/LLM_ANALYSIS_CARD.md.
+
+    `reasoning` is short factual bullet points ("Clear reproduction steps
+    were provided."), not a paragraph -- it's rendered directly as a list
+    in the comment, so it has to already be list-shaped and free of model-
+    internal language when it arrives. `confidence` is kept for API
+    consumers (the dashboard, /api/predict-style callers) but is
+    deliberately not rendered in the comment itself -- showing it next to
+    the ML actionability score reads as two competing confidence numbers,
+    which is exactly the ambiguity the redesigned comment removes.
+    """
     category: str
     priority: str
     severity: str
     confidence: float
     summary: str
-    reasoning: str
+    reasoning: list[str]
+    recommended_action: str
     missing_information: list[str] = field(default_factory=list)
     recommended_labels: list[str] = field(default_factory=list)
 
@@ -52,6 +65,7 @@ class IssueAnalysis:
             "confidence": round(self.confidence, 4),
             "summary": self.summary,
             "reasoning": self.reasoning,
+            "recommended_action": self.recommended_action,
             "missing_information": self.missing_information,
             "recommended_labels": self.recommended_labels,
         }
@@ -90,8 +104,14 @@ def parse_issue_analysis(raw: Any) -> IssueAnalysis:
     if not (0.0 <= confidence <= 1.0):
         raise LLMResponseError(f"field 'confidence' must be in [0, 1], got {confidence}")
 
+    reasoning = _string_list(raw.get("reasoning"), "reasoning")
+    if not reasoning:
+        raise LLMResponseError("field 'reasoning' must have at least one item")
+    reasoning = reasoning[:_MAX_REASONING_POINTS]
+
     missing_information = _string_list(raw.get("missing_information", []), "missing_information")
     recommended_labels = _string_list(raw.get("recommended_labels", []), "recommended_labels")
+    recommended_labels = recommended_labels[:_MAX_LABELS]
 
     return IssueAnalysis(
         category=raw["category"].strip(),
@@ -99,7 +119,8 @@ def parse_issue_analysis(raw: Any) -> IssueAnalysis:
         severity=severity,
         confidence=confidence,
         summary=raw["summary"].strip(),
-        reasoning=raw["reasoning"].strip(),
+        reasoning=reasoning,
+        recommended_action=raw["recommended_action"].strip(),
         missing_information=missing_information,
         recommended_labels=recommended_labels,
     )

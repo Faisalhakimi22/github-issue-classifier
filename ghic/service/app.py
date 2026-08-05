@@ -541,6 +541,24 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
         )
         llm_analysis = app.state.llm_service.analyze_issue(context)
 
+    # Consistency check: does the LLM's own priority/severity/reasoning
+    # strongly contradict the ML verdict it was given as fixed evidence?
+    # Deterministic, not a second LLM call -- see ghic/llm/consistency.py
+    # for why. Never silently picks a side; the comment shows the tension.
+    disagreement = False
+    if llm_analysis is not None:
+        from ..llm import detect_disagreement
+
+        disagreement = detect_disagreement(
+            pred.predicted_label, llm_analysis.priority, llm_analysis.severity,
+            llm_analysis.reasoning,
+        )
+        if disagreement:
+            logger.warning(
+                "llm/ml disagreement on %s#%d: ML=non-actionable but LLM priority=%s severity=%s",
+                repo, number, llm_analysis.priority, llm_analysis.severity,
+            )
+
     # Optional LLM-drafted "missing information" request. Skipped when the
     # analysis above already produced one (avoids a redundant second LLM
     # call and a duplicate section in the comment). Triggered only by the
@@ -561,7 +579,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
     if not s.dry_run and gh is not None and installation_id:
         if s.post_comment:
             if llm_analysis is not None:
-                comment = format_llm_comment(pred, llm_analysis, related)
+                comment = format_llm_comment(pred, llm_analysis, related, disagreement=disagreement)
             else:
                 comment = format_comment(pred, related, category)
                 if info_request:
@@ -583,6 +601,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             "suggested_assignees": suggested_assignees,  # API-only; never assigned
             "missing_info": info_request,
             "llm_analysis": llm_analysis.as_dict() if llm_analysis else None,
+            "llm_ml_disagreement": disagreement,
             "actions": actions, "dry_run": s.dry_run}
 
 

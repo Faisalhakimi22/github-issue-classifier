@@ -24,7 +24,8 @@ VALID_RAW = {
     "severity": "medium",
     "confidence": 0.92,
     "summary": "The app crashes on save.",
-    "reasoning": "Clear reproduction steps and a stack trace are present.",
+    "reasoning": ["Clear reproduction steps and a stack trace are present."],
+    "recommended_action": "Investigate immediately -- this affects a core workflow.",
     "missing_information": ["Application version"],
     "recommended_labels": ["bug", "backend"],
 }
@@ -112,6 +113,36 @@ class TestParseIssueAnalysis:
         d = analysis.as_dict()
         assert d["category"] == "bug"
         assert d["confidence"] == 0.92
+
+    def test_missing_recommended_action_rejected(self):
+        raw = {k: v for k, v in VALID_RAW.items() if k != "recommended_action"}
+        with pytest.raises(LLMResponseError, match="recommended_action"):
+            parse_issue_analysis(raw)
+
+    def test_reasoning_must_be_a_list_not_a_string(self):
+        raw = {**VALID_RAW, "reasoning": "a single prose paragraph, not a list"}
+        with pytest.raises(LLMResponseError, match="reasoning"):
+            parse_issue_analysis(raw)
+
+    def test_reasoning_missing_rejected(self):
+        raw = {k: v for k, v in VALID_RAW.items() if k != "reasoning"}
+        with pytest.raises(LLMResponseError, match="reasoning"):
+            parse_issue_analysis(raw)
+
+    def test_empty_reasoning_list_rejected(self):
+        raw = {**VALID_RAW, "reasoning": []}
+        with pytest.raises(LLMResponseError, match="reasoning"):
+            parse_issue_analysis(raw)
+
+    def test_reasoning_truncated_to_max_points(self):
+        raw = {**VALID_RAW, "reasoning": [f"point {i}" for i in range(10)]}
+        analysis = parse_issue_analysis(raw)
+        assert len(analysis.reasoning) == 6
+
+    def test_recommended_labels_truncated_to_five(self):
+        raw = {**VALID_RAW, "recommended_labels": [f"label-{i}" for i in range(8)]}
+        analysis = parse_issue_analysis(raw)
+        assert len(analysis.recommended_labels) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -426,3 +457,59 @@ class TestFallbackLLMProvider:
         # since FallbackLLMProvider only catches LLMError.
         assert issubclass(LLMTimeoutError, LLMError)
         assert issubclass(LLMProviderError, LLMError)
+
+
+# ---------------------------------------------------------------------------
+# consistency.py -- deterministic ML/LLM disagreement detection
+# ---------------------------------------------------------------------------
+class TestDetectDisagreement:
+    def test_flags_non_actionable_ml_with_high_signal_llm_language(self):
+        from ghic.llm.consistency import detect_disagreement
+
+        assert detect_disagreement(
+            ml_predicted_label=0, priority="high", severity="high",
+            reasoning=["The report includes a reproducible crash with a stack trace."],
+        ) is True
+
+    def test_critical_level_also_counts_as_high_signal(self):
+        from ghic.llm.consistency import detect_disagreement
+
+        assert detect_disagreement(
+            ml_predicted_label=0, priority="critical", severity="critical",
+            reasoning=["This causes data loss for every user on save."],
+        ) is True
+
+    def test_not_flagged_when_ml_says_actionable(self):
+        from ghic.llm.consistency import detect_disagreement
+
+        assert detect_disagreement(
+            ml_predicted_label=1, priority="high", severity="high",
+            reasoning=["Clear reproducible crash."],
+        ) is False
+
+    def test_not_flagged_when_priority_or_severity_is_low(self):
+        from ghic.llm.consistency import detect_disagreement
+
+        assert detect_disagreement(
+            ml_predicted_label=0, priority="medium", severity="high",
+            reasoning=["Clear reproducible crash."],
+        ) is False
+
+    def test_not_flagged_without_strong_signal_terms(self):
+        from ghic.llm.consistency import detect_disagreement
+
+        assert detect_disagreement(
+            ml_predicted_label=0, priority="high", severity="high",
+            reasoning=["The reporter asked a general question about configuration."],
+        ) is False
+
+    def test_reverse_pairing_is_not_flagged_by_design(self):
+        """ML says actionable but the LLM's own read is mild -- a calibrated
+        probability just over threshold on a real but minor issue, not a
+        contradiction worth surfacing (see consistency.py docstring)."""
+        from ghic.llm.consistency import detect_disagreement
+
+        assert detect_disagreement(
+            ml_predicted_label=1, priority="low", severity="low",
+            reasoning=["A minor cosmetic issue."],
+        ) is False

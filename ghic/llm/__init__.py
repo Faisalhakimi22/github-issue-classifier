@@ -8,6 +8,7 @@ suggested labels, all clearly framed as an AI opinion rather than a
 statistically validated model (see models/LLM_ANALYSIS_CARD.md for why that
 distinction matters in this project specifically).
 """
+from .consistency import detect_disagreement
 from .exceptions import LLMError, LLMProviderError, LLMResponseError, LLMTimeoutError
 from .models import IssueAnalysis, IssueContext
 from .provider import LLMProvider
@@ -22,4 +23,5 @@ __all__ = [
     "IssueContext",
     "LLMProvider",
     "LLMService",
+    "detect_disagreement",
 ]

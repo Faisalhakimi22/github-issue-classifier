@@ -226,58 +226,98 @@ def format_llm_comment(
     pred: Prediction,
     analysis: Any,
     related: list[dict[str, Any]] | None = None,
+    disagreement: bool = False,
 ) -> str:
     """Polished markdown comment built from an LLM IssueAnalysis on top of
     the ML prediction. `analysis` is a ghic.llm.IssueAnalysis -- typed as
     Any here to avoid a service/inference -> llm import at module load time
     for callers that never use this path.
 
-    Never includes raw feature names, TF-IDF terms, or feature-importance
-    values -- those stay in logs only (see app.py), matching the spec this
-    format was built against. The existing format_comment() above is the
-    fallback when the LLM analysis isn't available; it keeps its own
-    collapsed technical-details section for maintainers who want it.
-    """
-    from .explain import confidence_bar
+    Never includes raw feature names, TF-IDF terms, feature-importance
+    values, or any other ML-internal language -- those stay in logs only
+    (see app.py). The existing format_comment() above is the fallback when
+    the LLM analysis isn't available at all; it keeps its own collapsed
+    technical-details section for maintainers who want it. This format
+    never shows that section, by design -- a maintainer reading this
+    should not be able to tell there's a model behind it.
 
-    actionability = "Likely Actionable" if pred.predicted_label == 1 else "Likely Not Actionable"
+    `disagreement=True` means ghic.llm.detect_disagreement() found the
+    LLM's own priority/severity/reasoning strongly implying an actionable
+    bug while the ML classifier called it not actionable. Rather than pick
+    a side, the Actionability line says so plainly -- every other section
+    (summary, reasoning, next step) still renders, since those stay useful
+    regardless of which verdict a maintainer ends up trusting.
+    """
+    if disagreement:
+        actionability = "⚠️ Model Disagreement"
+    elif pred.predicted_label == 1:
+        actionability = "Likely Actionable"
+    else:
+        actionability = "Likely Not Actionable"
+
     lines = [
         "## 🤖 GHIC Analysis",
         "",
-        f"**Classification:** {analysis.category}",
+        "| | |",
+        "|---|---|",
+        f"| **Classification** | {analysis.category} |",
+        f"| **Actionability** | {actionability} |",
+        f"| **ML Actionability Score** | {pred.proba:.0%} |",
+        f"| **Priority** | {analysis.priority.title()} |",
+        f"| **Severity** | {analysis.severity.title()} |",
+    ]
+    if disagreement:
+        lines += [
+            "",
+            "_The AI's own reasoning below points more strongly toward an actionable "
+            "bug than the ML score suggests. Shown as a disagreement rather than a "
+            "single verdict — worth a maintainer's own look._",
+        ]
+
+    lines += [
         "",
-        f"**Actionability:** {actionability}  ",
-        f"**Confidence:** `{confidence_bar(pred.proba)}` {pred.proba:.0%}",
-        "",
-        f"**Priority:** {analysis.priority.title()}  ",
-        f"**Severity:** {analysis.severity.title()}",
+        "---",
         "",
         "### Summary",
         "",
         analysis.summary,
         "",
-        "### Reasoning",
+        "---",
         "",
-        analysis.reasoning,
+        "### Why GHIC Reached This Conclusion",
+        "",
     ]
+    lines += [f"- {point}" for point in analysis.reasoning]
+
     if analysis.missing_information:
-        lines += ["", "### Missing Information", ""]
+        lines += ["", "---", "", "### Missing Information", ""]
         lines += [f"- {item}" for item in analysis.missing_information]
+
     if analysis.recommended_labels:
-        lines += ["", "### Suggested Labels", ""]
+        lines += ["", "---", "", "### Suggested Labels", ""]
         lines += [" ".join(f"`{label}`" for label in analysis.recommended_labels)]
-    if related:
-        lines += ["", "**Possibly related prior issues** (by text similarity — please verify):"]
-        lines += [
-            f"- #{r['number']} — {r['title']} (similarity {r['similarity']:.2f})"
-            for r in related
-        ]
+
     lines += [
         "",
         "---",
         "",
-        "_Generated automatically by GHIC. Actionability is a statistically calibrated "
-        "prediction; category, priority, and severity are the AI's judgment, not a "
-        "validated model — this assists maintainers and does not replace human review._",
+        "### Recommended Next Step",
+        "",
+        analysis.recommended_action,
+    ]
+
+    if related:
+        lines += ["", "---", "", "**Possibly related prior issues** (by text similarity — please verify):"]
+        lines += [
+            f"- #{r['number']} — {r['title']} (similarity {r['similarity']:.2f})"
+            for r in related
+        ]
+
+    lines += [
+        "",
+        "---",
+        "",
+        "> GHIC combines statistical machine learning with AI reasoning to assist "
+        "maintainers. Final triage decisions always remain with project maintainers.",
     ]
     return "\n".join(lines)
