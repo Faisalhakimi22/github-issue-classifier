@@ -311,6 +311,7 @@ def format_llm_comment(
     disagreement: bool = False,
     generated_at: datetime | None = None,
     repository_context: Any = None,
+    engineering_analysis: Any = None,
 ) -> str:
     """Polished, first-party-feeling markdown comment built from an LLM
     IssueAnalysis on top of the ML prediction. `analysis` is a
@@ -429,6 +430,22 @@ def format_llm_comment(
     ]
 
     lines += _repository_evidence_lines(repository_context)
+
+    # Phase 3 engineering sections: root cause, regression, recurrence,
+    # impact, timeline, investigation plan. Every factual reference in
+    # them is rendered from an Evidence object built out of a retrieved
+    # chunk -- the model never writes one. Renders nothing when the
+    # analysis found nothing it could support.
+    if engineering_analysis is not None:
+        from ..engineering_intelligence import (
+            render_attribution_note,
+            render_engineering_sections,
+        )
+
+        engineering_lines = render_engineering_sections(engineering_analysis)
+        if engineering_lines:
+            lines += engineering_lines
+            lines += render_attribution_note()
 
     if related:
         lines += ["", "---", "", "**Possibly related prior issues** (by text similarity — please verify):"]

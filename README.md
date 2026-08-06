@@ -270,7 +270,23 @@ same QStash queue and returns empty, and every failure mode (git missing,
 clone denied, index corrupt, embeddings down) degrades to text-only
 analysis. The default embedder is lexical (offline, no API key, no cost);
 `GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai` swaps in real semantic
-embeddings without touching anything else. The same engine indexes a repository's **history** as well as its code
+embeddings without touching anything else. **Engineering Intelligence** (`ghic/engineering_intelligence/`) reasons over
+that retrieved evidence rather than adding to it: a possible root cause
+(commits that touched the relevant code shortly before the issue appeared),
+regression and release-window correlation, a recurrence check, engineering
+impact, a dated timeline, and an ordered investigation plan where every step
+names a real artifact. It runs deterministically — no extra LLM call, so it
+costs milliseconds — and every claim is labelled **Observed** (measured from
+the index) or **Inferred** (a correlation GHIC drew), so a maintainer always
+knows which they're reading. A claim without evidence is structurally
+impossible to construct: the type raises. Component health and repository
+risk are published as heuristic indices over measured counts, withheld
+entirely below a minimum sample size, and never described as probabilities —
+the same discipline that kept an ML priority head out of this project. Off
+by default (`GHIC_ENGINEERING_INTELLIGENCE`); design notes in
+[models/ENGINEERING_INTELLIGENCE_CARD.md](models/ENGINEERING_INTELLIGENCE_CARD.md).
+
+The same engine indexes a repository's **history** as well as its code
 (Phase 2): commits ("when did this break?"), pull requests ("is someone
 already fixing this?"), and resolved issues ("how did we handle this last
 time?"). These reuse the entire code-retrieval pipeline unchanged — one

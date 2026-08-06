@@ -154,6 +154,14 @@ class ServiceSettings:
     # are the intended home.
     use_repo_intelligence: bool = False
 
+    # Phase 3 Engineering Intelligence: root-cause hypotheses, regression
+    # and release correlation, timeline, impact, and an investigation plan,
+    # derived deterministically from retrieved evidence (no extra LLM
+    # call). Requires repository intelligence -- it reasons over what that
+    # retrieves, and has nothing to work from without it. Off by default;
+    # see models/ENGINEERING_INTELLIGENCE_CARD.md.
+    use_engineering_intelligence: bool = False
+
     # Async webhook processing via Upstash QStash — see ghic/service/qstash.py
     # and models/ASYNC_PROCESSING_CARD.md for why this exists (neither
     # FastAPI's BackgroundTasks nor Vercel's waitUntil() reliably keeps a
@@ -296,6 +304,7 @@ def load_settings() -> ServiceSettings:
         openrouter_model=os.environ.get("OPENROUTER_MODEL")
         or "nvidia/nemotron-3-ultra-550b-a55b:free",
         use_repo_intelligence=_env_bool("GHIC_USE_REPO_INTELLIGENCE", False),
+        use_engineering_intelligence=_env_bool("GHIC_ENGINEERING_INTELLIGENCE", False),
         use_async_processing=_env_bool("GHIC_USE_ASYNC_PROCESSING", False),
         qstash_token=os.environ.get("QSTASH_TOKEN", ""),
         qstash_current_signing_key=os.environ.get("QSTASH_CURRENT_SIGNING_KEY", ""),

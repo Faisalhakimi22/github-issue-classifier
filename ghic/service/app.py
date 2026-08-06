@@ -429,6 +429,20 @@ def create_app(
     return app
 
 
+def _epoch(iso: Any) -> float | None:
+    """GitHub's ISO-8601 timestamp -> epoch seconds. None if unparseable,
+    which makes the analyzer fall back to "now" rather than mis-dating an
+    issue and inventing a bogus regression window."""
+    if not iso:
+        return None
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 def _utcnow_iso() -> str:
     from datetime import datetime, timezone
 
@@ -681,6 +695,25 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             logger.warning("repository intelligence failed for %s#%d: %s", repo, number, e)
             repo_context = None
 
+    # Phase 3: engineering analysis over the evidence just retrieved.
+    # Deterministic and local -- no network, no LLM call -- so it adds
+    # milliseconds, not seconds, to the webhook. Never raises (the
+    # analyzer catches internally; this wraps it anyway, same as every
+    # other assistive head).
+    engineering_analysis = None
+    if s.use_engineering_intelligence and repo_context is not None:
+        try:
+            from ..engineering_intelligence import EngineeringAnalyzer
+
+            engineering_analysis = EngineeringAnalyzer().analyze(
+                repo, issue.get("title", ""), issue.get("body") or "", repo_context,
+                issue_number=number,
+                issue_created_at=_epoch(issue.get("created_at")),
+            )
+        except Exception as e:
+            logger.warning("engineering analysis failed for %s#%d: %s", repo, number, e)
+            engineering_analysis = None
+
     llm_analysis = None
     if app.state.llm_service is not None:
         context = IssueContext(
@@ -737,6 +770,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
                 comment = format_llm_comment(
                     pred, llm_analysis, related, disagreement=disagreement,
                     repository_context=repo_context,
+                    engineering_analysis=engineering_analysis,
                 )
             else:
                 comment = format_comment(pred, related, category)
@@ -761,6 +795,9 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             "llm_analysis": llm_analysis.as_dict() if llm_analysis else None,
             "llm_ml_disagreement": disagreement,
             "repository_context": repo_context.as_dict() if repo_context else None,
+            "engineering_analysis": (
+                engineering_analysis.as_dict() if engineering_analysis else None
+            ),
             "actions": actions, "dry_run": s.dry_run}
 
 
