@@ -18,14 +18,36 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# What produced a chunk. `code` is Phase 1; the rest are Phase 2 corpora
+# (see sources.py). This is the field that let commit/PR/issue intelligence
+# reuse the entire Phase 1 pipeline -- embedder, vector store, retriever,
+# prompt builder -- rather than growing a parallel one: they differ in
+# where the text comes from, not in what happens to it afterwards.
+SOURCE_CODE = "code"
+SOURCE_COMMIT = "commit"
+SOURCE_ISSUE = "issue"
+SOURCE_PULL_REQUEST = "pull_request"
+
+ALL_SOURCES = (SOURCE_CODE, SOURCE_COMMIT, SOURCE_ISSUE, SOURCE_PULL_REQUEST)
+
+
 @dataclass(frozen=True)
 class CodeChunk:
-    """One semantically-bounded slice of one file.
+    """One semantically-bounded, retrievable unit.
 
-    Boundaries come from the language's own structure (a function, method,
-    class, or markdown section) -- never a fixed character window, which
-    would cut mid-statement and produce chunks that retrieve well but read
-    as nonsense when handed to an LLM. See parser.py.
+    For source files (`source="code"`) the boundaries come from the
+    language's own structure -- a function, method, class, or markdown
+    section -- never a fixed character window, which would cut mid-statement
+    and produce chunks that retrieve well but read as nonsense when handed
+    to an LLM. See parser.py.
+
+    Phase 2 reuses this type for commits, pull requests, and resolved
+    issues, where the natural unit is the whole record rather than a slice
+    of one. `path` carries a stable synthetic identifier in those cases
+    (`commit:abc1234`, `issue:412`) and `reference` carries the
+    human-facing one, so nothing downstream has to special-case them --
+    including the anti-hallucination guarantee, which still holds because
+    every rendered reference comes from a retrieved chunk.
     """
     repo: str
     path: str
@@ -36,6 +58,10 @@ class CodeChunk:
     kind: str = "module"                 # function | method | class | section | module
     symbol: str = ""                     # function/class/heading name, "" for whole-module
     parent_symbol: str = ""              # enclosing class for methods
+    source: str = SOURCE_CODE
+    reference: str = ""                  # "#412", "abc1234" -- what a human cites
+    url: str = ""
+    timestamp: float = 0.0               # authored/closed time, for recency ranking
 
     @property
     def chunk_id(self) -> str:
@@ -72,10 +98,16 @@ class CodeChunk:
             "kind": self.kind,
             "symbol": self.symbol,
             "parent_symbol": self.parent_symbol,
+            "source": self.source,
+            "reference": self.reference,
+            "url": self.url,
+            "timestamp": self.timestamp,
         }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> CodeChunk:
+        # The Phase 2 fields default, so an index written by Phase 1 loads
+        # unchanged and reads as `source="code"` -- which is what it is.
         return cls(
             repo=raw["repo"],
             path=raw["path"],
@@ -86,6 +118,10 @@ class CodeChunk:
             kind=raw.get("kind", "module"),
             symbol=raw.get("symbol", ""),
             parent_symbol=raw.get("parent_symbol", ""),
+            source=raw.get("source", SOURCE_CODE),
+            reference=raw.get("reference", ""),
+            url=raw.get("url", ""),
+            timestamp=float(raw.get("timestamp", 0) or 0),
         )
 
 
@@ -186,9 +222,23 @@ class RepositoryContext:
         return not self.chunks
 
     @property
+    def code_chunks(self) -> list[RetrievedChunk]:
+        return [rc for rc in self.chunks if rc.chunk.source == SOURCE_CODE]
+
+    @property
+    def history_chunks(self) -> list[RetrievedChunk]:
+        """Commits, PRs, and resolved issues -- the Phase 2 corpora."""
+        return [rc for rc in self.chunks if rc.chunk.source != SOURCE_CODE]
+
+    @property
     def relevant_files(self) -> list[str]:
-        """Unique file paths, most-relevant first (dict preserves order)."""
-        return list(dict.fromkeys(rc.chunk.path for rc in self.chunks))
+        """Unique source-file paths, most-relevant first.
+
+        Code only: a commit or issue chunk has a synthetic `path`
+        (`commit:abc1234`) that is not a file and must never be rendered
+        as one.
+        """
+        return list(dict.fromkeys(rc.chunk.path for rc in self.code_chunks))
 
     @property
     def relevant_symbols(self) -> list[str]:

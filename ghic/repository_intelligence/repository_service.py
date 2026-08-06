@@ -70,6 +70,7 @@ class RepositoryIntelligenceService:
         state_store: RepositoryStateStore | None = None,
         index_queue: IndexQueue | None = None,
         metrics: RepositoryIntelligenceMetrics | None = None,
+        issue_history_items: list[dict[str, Any]] | None = None,
     ) -> None:
         self.cfg = cfg or RepositoryIntelligenceConfig()
         self.embedder = embedder or build_embedding_provider(self.cfg)
@@ -81,6 +82,10 @@ class RepositoryIntelligenceService:
         self.state_store = state_store
         self.index_queue = index_queue
         self.metrics = metrics or METRICS
+        # Explicit issue/PR records for history indexing. None means "read
+        # the project's own collected corpus"; injected in tests and by a
+        # caller that already has an authenticated GitHub client.
+        self.issue_history_items = issue_history_items
 
     # ------------------------------------------------------------------
     # Read path -- runs inside the webhook. Fast, or it returns nothing.
@@ -300,11 +305,40 @@ class RepositoryIntelligenceService:
             return self._index_incremental(repo, checkout, change_set)
         return self._index_full(repo, checkout)
 
+    def _history_chunks(self, repo: str, checkout: Any) -> list[Any]:
+        """Phase 2 corpora for this repository, or [] when both are off.
+
+        Failures here are absorbed: commit and history intelligence are
+        additive, and a repository whose history can't be read should still
+        get a working code index.
+        """
+        if not (self.cfg.index_commits or self.cfg.index_issue_history):
+            return []
+        try:
+            from .sources import build_history_chunks, load_collected_issues
+
+            issue_items = (
+                self.issue_history_items
+                if self.issue_history_items is not None
+                else load_collected_issues(repo)
+            )
+            return build_history_chunks(
+                repo, self.cfg,
+                checkout_path=getattr(checkout, "path", None),
+                issue_items=issue_items,
+                max_commits=self.cfg.max_commits,
+            )
+        except Exception as e:
+            logger.warning("history indexing failed for %s (%s); code index is unaffected",
+                           repo, e)
+            return []
+
     def _index_full(self, repo: str, checkout: Any) -> bool:
         store, metadata = self.indexer.build(
             repo, checkout.path,
             default_branch=checkout.default_branch, commit_sha=checkout.commit_sha,
         )
+        self._add_history(repo, checkout, store)
         if self.cfg.vector_provider == "postgres":
             from .vector_pg import PostgresVectorStore
 
@@ -374,6 +408,16 @@ class RepositoryIntelligenceService:
         self._mark_ready(repo, checkout, metadata)
         return True
 
+    def _add_history(self, repo: str, checkout: Any, store: Any) -> int:
+        """Embed and add the Phase 2 corpora into an already-built store."""
+        chunks = self._history_chunks(repo, checkout)
+        if not chunks:
+            return 0
+        vectors = self.embedder.embed_documents([c.embedding_text() for c in chunks])
+        store.add(vectors, chunks)
+        self.metrics.increment("history_chunks_indexed", len(chunks))
+        return len(chunks)
+
     def _index_exists(self, repo: str, commit_sha: str) -> bool:
         if self.cfg.vector_provider == "postgres":
             from .vector_pg import PostgresVectorStore
@@ -422,6 +466,11 @@ class RepositoryIntelligenceService:
             store, metadata = self.indexer.build(
                 repo, root, default_branch=default_branch, commit_sha=commit_sha,
             )
+            # Same Phase 2 corpora as the git path: a local checkout has a
+            # .git directory too, and injected issue records don't need one.
+            from types import SimpleNamespace
+
+            self._add_history(repo, SimpleNamespace(path=root), store)
         except Exception as e:
             logger.warning("local indexing failed for %s (%s: %s)", repo, type(e).__name__, e)
             return None

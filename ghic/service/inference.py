@@ -224,6 +224,7 @@ def format_comment(
 
 
 _MAX_EVIDENCE_FILES = 5
+_MAX_EVIDENCE_HISTORY = 3
 
 
 def _repository_evidence_lines(repository_context: Any) -> list[str]:
@@ -250,17 +251,42 @@ def _repository_evidence_lines(repository_context: Any) -> list[str]:
 
     lines = ["", "---", "", "### Repository Evidence", ""]
 
-    by_file: dict[str, list[Any]] = {}
-    for retrieved in repository_context.chunks:
-        by_file.setdefault(retrieved.chunk.path, []).append(retrieved.chunk)
+    code_chunks = getattr(repository_context, "code_chunks", list(repository_context.chunks))
+    history_chunks = getattr(repository_context, "history_chunks", [])
 
-    lines.append("**Relevant files**")
-    lines.append("")
-    for path, chunks in list(by_file.items())[:_MAX_EVIDENCE_FILES]:
-        symbols = [c.qualified_symbol for c in chunks if c.qualified_symbol]
-        spans = ", ".join(f"{c.start_line}-{c.end_line}" for c in chunks[:2])
-        suffix = f" — `{'`, `'.join(symbols[:2])}`" if symbols else ""
-        lines.append(f"- `{path}` (lines {spans}){suffix}")
+    if code_chunks:
+        by_file: dict[str, list[Any]] = {}
+        for retrieved in code_chunks:
+            by_file.setdefault(retrieved.chunk.path, []).append(retrieved.chunk)
+
+        lines.append("**Relevant files**")
+        lines.append("")
+        for path, chunks in list(by_file.items())[:_MAX_EVIDENCE_FILES]:
+            symbols = [c.qualified_symbol for c in chunks if c.qualified_symbol]
+            spans = ", ".join(f"{c.start_line}-{c.end_line}" for c in chunks[:2])
+            suffix = f" — `{'`, `'.join(symbols[:2])}`" if symbols else ""
+            lines.append(f"- `{path}` (lines {spans}){suffix}")
+
+    if history_chunks:
+        # Rendered from retrieved chunk metadata, like the file list --
+        # so a cited commit SHA or issue number is one that exists in the
+        # index, not one the model produced.
+        lines += ["", "**Related history**", ""]
+        for retrieved in history_chunks[:_MAX_EVIDENCE_HISTORY]:
+            chunk = retrieved.chunk
+            label = {
+                "commit": "commit", "pull_request": "PR", "issue": "issue",
+            }.get(chunk.kind, "record")
+            title = (chunk.symbol or "").strip()
+            reference = f"[{chunk.reference}]({chunk.url})" if chunk.url else chunk.reference
+            lines.append(
+                f"- {label} {reference}" + (f" — {title}" if title else "")
+            )
+        lines += [
+            "",
+            "_Surfaced by similarity to this issue — possible leads, not "
+            "confirmed matches._",
+        ]
 
     metadata = getattr(repository_context, "metadata", None)
     if metadata is not None and (metadata.primary_language or metadata.frameworks):

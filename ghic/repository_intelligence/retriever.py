@@ -26,7 +26,7 @@ from .. import utils
 from .config import RepositoryIntelligenceConfig
 from .embeddings import EmbeddingProvider
 from .indexer import VectorStore
-from .models import RetrievedChunk
+from .models import SOURCE_CODE, RetrievedChunk
 
 logger = utils.get_logger(__name__)
 
@@ -153,7 +153,22 @@ class SemanticRetriever:
         # plain cosine similarity while the order isn't strictly by it.
         above_floor = [rc for rc in candidates if rc.score >= self.cfg.min_similarity]
         above_floor.sort(key=lambda rc: -_ranking_score(rc))
-        return _diversify(above_floor, top_k)
+
+        # Code and history answer different questions, so they get separate
+        # budgets rather than competing for the same slots. Without this,
+        # a repository with thousands of indexed issues drowns its own code
+        # -- issue text matches issue text far more strongly than code
+        # does, which is the docs-vs-code problem from Phase 1 in a
+        # sharper form.
+        history = [rc for rc in above_floor if rc.chunk.source != SOURCE_CODE]
+        code = [rc for rc in above_floor if rc.chunk.source == SOURCE_CODE]
+        if not history:
+            return _diversify(code, top_k)
+
+        history_slots = min(self.cfg.history_result_slots, top_k)
+        selected_history = _diversify(history, history_slots)
+        selected_code = _diversify(code, top_k - len(selected_history))
+        return selected_code + selected_history
 
 
 _PROSE_LANGUAGES = frozenset({"Markdown", "reStructuredText"})
@@ -178,9 +193,18 @@ _TEST_RANK_FACTOR = 0.75
 
 
 def _ranking_score(rc: RetrievedChunk) -> float:
+    score = rc.score
+    if rc.chunk.source != SOURCE_CODE:
+        # History decays gently with age: a resolution from last month is
+        # more likely to still apply than one from four years ago. A
+        # prior, not a filter -- an old issue describing exactly this bug
+        # is still the right answer.
+        from .sources import recency_weight
+
+        return score * recency_weight(rc.chunk.timestamp)
     if _TEST_PATH_RE.search(rc.chunk.path.lower()):
-        return rc.score * _TEST_RANK_FACTOR
-    return rc.score
+        return score * _TEST_RANK_FACTOR
+    return score
 
 
 def _diversify(chunks: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:

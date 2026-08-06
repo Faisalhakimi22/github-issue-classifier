@@ -346,6 +346,106 @@ indexes untouched for `GHIC_REPO_STALE_DAYS` (30). It keys on
 repository that is still being searched shouldn't be evicted just because
 its code hasn't changed.
 
+## Phase 2: Commit, Pull Request, and Historical Issue Intelligence
+
+Three new corpora, answering questions the code alone can't:
+
+| Corpus | Question it answers | Source |
+|---|---|---|
+| **Commits** | "When did this break, and what changed?" | `git log` on the existing clone |
+| **Pull requests** | "Is someone already fixing this?" | GitHub issues API (PRs come through it) |
+| **Resolved issues** | "How did we resolve this last time?" | Collected corpus or the API |
+
+**They reuse the entire Phase 1 pipeline unchanged** — same embedder,
+vector store, retriever, similarity floor, diversification, prompt builder,
+and comment renderer. The only change to the engine was one field:
+`CodeChunk.source`. That was the point of the Phase 1 seam
+(`RepositoryIndexer` takes content, not a repository), and it's why Phase 2
+added no parallel infrastructure. A Phase 1 index still loads — `source`
+defaults to `"code"`, which is what it is.
+
+### Design decisions
+
+**Records are not chunked.** A commit, PR, or issue is indexed whole.
+Splitting a 40-line issue body into three pieces retrieves fragments that
+read as decontextualized noise, and the value of this corpus is the
+*pairing* of a problem with its resolution — destroyed by cutting between
+them.
+
+**Diffs are summarized, not embedded.** A patch can be tens of thousands of
+lines and is mostly retrieval noise (whitespace, imports, lockfiles). What
+retrieves well is the subject, body, and touched paths — so that is what
+gets embedded. Embedding raw patches dilutes the signal and costs far more
+tokens.
+
+**Noise commits are dropped.** Merge commits restate their branch; release
+and version-bump commits match everything and explain nothing.
+
+**Open issues are excluded from history.** They're the current backlog, not
+history — and the existing duplicate detector already covers them.
+
+**A declined issue is never presented as a resolution.** Closed-as-
+not-planned is genuinely useful context ("we've seen this and declined
+it"), but it is rendered as `Outcome: closed as not_planned (not a
+resolution)` so it can never read as a fix.
+
+**Code and history get separate retrieval budgets.** Issue text matches
+issue text far more strongly than code does, so a repository with thousands
+of indexed issues would drown its own code — the Phase 1 docs-vs-code
+problem in a sharper form. `history_result_slots` (3) is reserved for
+history; the rest goes to code.
+
+**History decays with age, gently.** A resolution from last month is more
+likely to still apply than one from four years ago. A one-year half-life
+applied as a ranking prior, not a filter — a five-year-old issue describing
+exactly this bug is still the right answer.
+
+**The anti-hallucination guarantee extends unchanged.** Commit SHAs, PR
+numbers, and issue numbers in the comment are rendered in Python from
+retrieved chunk metadata, exactly like the file list. The prompt frames
+history as *possible* leads and forbids citing anything not shown —
+"this was fixed in #412" stated as fact would be precisely the confident
+wrongness this design exists to prevent.
+
+### A bug worth recording
+
+`git log --name-only` appends each commit's file list *after* the formatted
+line. With the record separator at the end of the format, those paths land
+at the start of the next record and get parsed as its SHA — a commit came
+back referenced as `src/csv_` instead of its hash. Fixed by putting the
+separator at the *start* of the format. Found by an end-to-end run against
+a real repository, not by a unit test: a mocked `git log` would have
+returned whatever shape the author assumed.
+
+### Configuration
+
+Both corpora are off by default and separately gated — they have different
+costs (commit history needs a deeper clone; issue history needs API calls
+or collected data) and different value per repository.
+
+```bash
+GHIC_COMMIT_INTELLIGENCE=true     # index commits
+GHIC_HISTORY_INTELLIGENCE=true    # index closed issues + PRs
+GHIC_MAX_COMMITS=2000
+GHIC_MAX_HISTORY_ITEMS=2000
+```
+
+Commit indexing calls `git fetch --deepen` on demand rather than making
+every Phase 1 clone pay for depth it doesn't use.
+
+### What's tested, and what isn't
+
+Commit intelligence is exercised against a real git repository built in
+`tmp_path` — real `git init`, real commits, real `git log` parsing. Issue
+and PR intelligence are exercised against record dictionaries in the shape
+GitHub returns.
+
+**`IssueHistorySource.from_github` is not covered by a live API test.** It
+is a thin adapter (one call, failures swallowed) over a client method a
+deployment must provide; the parsing and ranking it feeds are fully
+tested. That boundary is where an integration test against a real
+installation belongs.
+
 ## Extending it (later phases)
 
 `VectorStore`, `EmbeddingProvider`, and `RepositoryIndexer` are the three

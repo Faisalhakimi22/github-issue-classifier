@@ -59,6 +59,7 @@ Each `reasoning` item is one short, concrete, evidence-grounded observation (e.g
 
 
 _MAX_PROMPT_CHUNKS = 6
+_MAX_HISTORY_CHUNKS = 3
 _MAX_CHUNK_CHARS = 1_200
 
 
@@ -89,21 +90,48 @@ def build_repository_section(repo_context: Any) -> str:
         if metadata.readme_summary:
             lines.append(f"README summary: {metadata.readme_summary}")
 
-    lines.append("")
-    lines.append(
-        "The following code was retrieved by semantic search against this "
-        "repository. It is a partial view -- the most relevant fragments, not "
-        "the whole codebase."
-    )
-    for retrieved in list(repo_context.chunks)[:_MAX_PROMPT_CHUNKS]:
-        chunk = retrieved.chunk
-        text = chunk.text
-        if len(text) > _MAX_CHUNK_CHARS:
-            text = text[:_MAX_CHUNK_CHARS] + "\n... [truncated]"
-        header = f"{chunk.path}:{chunk.start_line}-{chunk.end_line}"
-        if chunk.qualified_symbol:
-            header += f" ({chunk.kind} {chunk.qualified_symbol})"
-        lines += ["", header, "```" + _fence_language(chunk.language), text, "```"]
+    code_chunks = getattr(repo_context, "code_chunks", list(repo_context.chunks))
+    history_chunks = getattr(repo_context, "history_chunks", [])
+
+    if code_chunks:
+        lines.append("")
+        lines.append(
+            "The following code was retrieved by semantic search against this "
+            "repository. It is a partial view -- the most relevant fragments, not "
+            "the whole codebase."
+        )
+        for retrieved in list(code_chunks)[:_MAX_PROMPT_CHUNKS]:
+            chunk = retrieved.chunk
+            text = chunk.text
+            if len(text) > _MAX_CHUNK_CHARS:
+                text = text[:_MAX_CHUNK_CHARS] + "\n... [truncated]"
+            header = f"{chunk.path}:{chunk.start_line}-{chunk.end_line}"
+            if chunk.qualified_symbol:
+                header += f" ({chunk.kind} {chunk.qualified_symbol})"
+            lines += ["", header, "```" + _fence_language(chunk.language), text, "```"]
+
+    if history_chunks:
+        # Framed as history, not as code, and explicitly as *possibly*
+        # related: a similar past issue is a lead, and presenting it as an
+        # established fact ("this was fixed in #412") is the kind of
+        # confident wrongness this whole design avoids.
+        lines += [
+            "",
+            "Related project history, retrieved by similarity. These are "
+            "candidates a maintainer may find relevant -- not confirmed "
+            "matches, and not necessarily the same root cause. Refer to them "
+            "only as possibilities, never as established fact, and never cite "
+            "a commit, pull request, or issue that does not appear below.",
+        ]
+        for retrieved in list(history_chunks)[:_MAX_HISTORY_CHUNKS]:
+            chunk = retrieved.chunk
+            label = {
+                "commit": "Commit", "pull_request": "Pull request", "issue": "Issue",
+            }.get(chunk.kind, "Record")
+            text = chunk.text
+            if len(text) > _MAX_CHUNK_CHARS:
+                text = text[:_MAX_CHUNK_CHARS] + "\n... [truncated]"
+            lines += ["", f"{label} {chunk.reference}", text]
 
     lines += [
         "",

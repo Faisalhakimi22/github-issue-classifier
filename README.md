@@ -270,7 +270,18 @@ same QStash queue and returns empty, and every failure mode (git missing,
 clone denied, index corrupt, embeddings down) degrades to text-only
 analysis. The default embedder is lexical (offline, no API key, no cost);
 `GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai` swaps in real semantic
-embeddings without touching anything else. Production infrastructure is provider-based: vectors in Postgres/pgvector
+embeddings without touching anything else. The same engine indexes a repository's **history** as well as its code
+(Phase 2): commits ("when did this break?"), pull requests ("is someone
+already fixing this?"), and resolved issues ("how did we handle this last
+time?"). These reuse the entire code-retrieval pipeline unchanged — one
+added field on the chunk type, no parallel infrastructure — and get their
+own reserved result slots so history can't crowd out the code. Commit SHAs
+and issue numbers in the comment are rendered from retrieved metadata like
+the file list, and the prompt frames them as possible leads rather than
+established fact. Both corpora are off by default
+(`GHIC_COMMIT_INTELLIGENCE`, `GHIC_HISTORY_INTELLIGENCE`).
+
+Production infrastructure is provider-based: vectors in Postgres/pgvector
 (reusing the same `DATABASE_URL` as the ledger — no new infrastructure) or
 a local index for development; durable repository state with a real
 lifecycle (`queued → indexing → ready`, plus `failed`/`updating`) rather

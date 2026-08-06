@@ -243,6 +243,21 @@ class RepositoryIntelligenceConfig:
     repo_summarization: bool = True
     auto_index: bool = True               # queue an index for unknown repos
 
+    # --- Phase 2 corpora (commits / PRs / resolved issues) -------------
+    # Each is separately gated: they have different costs (commit history
+    # needs a deeper clone, issue history needs API calls or collected
+    # data) and different value per repository, so an operator should be
+    # able to run one without the others.
+    index_commits: bool = False
+    index_issue_history: bool = False
+    max_commits: int = 2_000
+    max_history_items: int = 2_000
+    # Slots reserved for history in a retrieval result. Code and history
+    # answer different questions ("where is this" vs "how was this handled
+    # before"), so they get separate budgets rather than competing --
+    # the same lesson the docs-vs-code cap taught in Phase 1.
+    history_result_slots: int = 3
+
     # --- Behaviour ----------------------------------------------------
     index_ttl_seconds: int = 7 * 24 * 60 * 60   # re-index weekly even if the SHA is unknown
     max_incremental_files: int = 200      # above this, a full rebuild is cheaper
@@ -325,6 +340,12 @@ class RepositoryIntelligenceConfig:
             ),
             index_ttl_seconds=_env_int("GHIC_REPO_CACHE_TTL", cls.index_ttl_seconds),
             stale_index_days=_env_int("GHIC_REPO_STALE_DAYS", cls.stale_index_days),
+            index_commits=_env_bool("GHIC_COMMIT_INTELLIGENCE", cls.index_commits),
+            index_issue_history=_env_bool(
+                "GHIC_HISTORY_INTELLIGENCE", cls.index_issue_history
+            ),
+            max_commits=_env_int("GHIC_MAX_COMMITS", cls.max_commits),
+            max_history_items=_env_int("GHIC_MAX_HISTORY_ITEMS", cls.max_history_items),
         )
 
 
