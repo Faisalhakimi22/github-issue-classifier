@@ -38,12 +38,33 @@ from .models import (
     RepositoryMetadata,
     RetrievedChunk,
 )
+from .metrics import METRICS, RepositoryIntelligenceMetrics
+from .providers import build_service, health_snapshot
+from .queue import IndexQueue, InlineIndexQueue, NullIndexQueue, QStashIndexQueue
 from .repository_service import RepositoryIntelligenceService
 from .retriever import SemanticRetriever, build_query
+from .state import (
+    RepositoryRecord,
+    RepositoryState,
+    RepositoryStateStore,
+    build_state_store,
+)
 
 __all__ = [
     "RepositoryIntelligenceConfig",
     "RepositoryIntelligenceService",
+    "build_service",
+    "health_snapshot",
+    "RepositoryState",
+    "RepositoryRecord",
+    "RepositoryStateStore",
+    "build_state_store",
+    "IndexQueue",
+    "QStashIndexQueue",
+    "InlineIndexQueue",
+    "NullIndexQueue",
+    "METRICS",
+    "RepositoryIntelligenceMetrics",
     "RepositoryIndexer",
     "SemanticRetriever",
     "EmbeddingProvider",

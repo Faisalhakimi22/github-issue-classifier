@@ -333,6 +333,99 @@ separate connection string); on Docker/Fly it's a file at
 `GHIC_IDEMPOTENCY_FILE` (default `data/idempotency.json`, same volume as
 the ledger).
 
+## 9. Repository Intelligence (optional)
+
+Semantic code retrieval over the repository an issue was opened on. Design
+notes in
+[models/REPOSITORY_INTELLIGENCE_CARD.md](../models/REPOSITORY_INTELLIGENCE_CARD.md);
+this section is the operational part.
+
+### What it needs
+
+Unlike every other feature here, this one has real infrastructure
+requirements — it clones repositories, stores vectors, and runs jobs that
+take minutes:
+
+| Need | Why | Provider |
+|---|---|---|
+| Persistent vector storage | Indexes must outlive a process | `GHIC_VECTOR_PROVIDER=postgres` (pgvector) or a real disk |
+| Durable state | Lifecycle, not "is there a directory?" | Auto: Postgres → file → memory |
+| A job queue | Indexing must never touch the webhook path | QStash (already configured if async processing is on) |
+| `git` on PATH | Cloning | — |
+
+The vector and state stores both reuse `DATABASE_URL`, so a deploy that
+already has Postgres for the ledger needs no new services.
+
+### Deployment matrix
+
+| Platform | Works? | Configuration |
+|---|---|---|
+| Docker / Fly.io / Railway / Render | **Recommended** | A volume for `GHIC_REPO_INTEL_CACHE_DIR`; `local` vectors are fine, Postgres is better with >1 replica |
+| Kubernetes | Yes | Postgres vectors (pods are cattle); a PVC only for the clone scratch dir |
+| Vercel / Lambda / Cloud Run | Only with Postgres | **Auto-disables itself** without `GHIC_VECTOR_PROVIDER=postgres` — see below |
+| Local development | Yes | Defaults are fine; `GHIC_INDEX_QUEUE_PROVIDER=inline` to index without a queue |
+
+### The Vercel auto-disable
+
+On a platform with an ephemeral filesystem, `build_service()` returns None
+and logs the reason unless a persistent vector store is configured. This is
+deliberate: a local index there is rebuilt on every cold start and thrown
+away minutes later — slow, expensive against a paid embedding provider, and
+producing no working feature while appearing to be enabled. To run it on
+Vercel:
+
+```bash
+vercel env add GHIC_USE_REPO_INTELLIGENCE production   # true
+vercel env add GHIC_VECTOR_PROVIDER production         # postgres
+# DATABASE_URL is already set by the Postgres integration
+```
+
+Check it took effect: `/healthz` reports a `repository_intelligence` block
+with `state_durable` and `queue_durable`. Both false means the deploy is
+running without real persistence — the failure that otherwise looks
+identical to a healthy one.
+
+### Rollout
+
+```bash
+# 1. Index one repository by hand and look at what retrieval returns.
+python -m ghic.repo_index --repo owner/name
+python -m ghic.repo_index --repo owner/name --query "csv import crashes"
+
+# 2. Turn it on. Retrieval quality varies a lot by codebase, so step 1
+#    first is worth the two minutes.
+GHIC_USE_REPO_INTELLIGENCE=true
+
+# 3. Watch it.
+curl -H "X-GHIC-Token: $SECRET" https://<host>/repositories
+curl -H "X-GHIC-Token: $SECRET" https://<host>/repositories/metrics
+```
+
+Feature flags let you narrow the rollout without redeploying:
+`GHIC_VECTOR_SEARCH=false` (kill switch for retrieval),
+`GHIC_REPO_AUTO_INDEX=false` (index only via the CLI),
+`GHIC_INCREMENTAL_INDEXING=false` (always full rebuilds).
+
+### Operations
+
+- **Secrets never enter an index.** Credential-shaped files (`.env*`,
+  `*.pem`, `id_rsa`, `credentials*`, kubeconfig, terraform state) are
+  excluded by path, and token-shaped values are redacted from file content
+  before chunking. Both layers are tested; see
+  `tests/test_repository_production.py::TestSecretHandling`.
+- **Storage grows silently.** A repository indexed once and never queried
+  keeps its chunks. `service.cleanup()` drops indexes untouched for
+  `GHIC_REPO_STALE_DAYS` (default 30) — run it from a cron job or a
+  maintenance task.
+- **A wedged repository recovers on its own.** If a worker dies mid-index,
+  the repository sits in `indexing` until `STALE_IN_FLIGHT_SECONDS` (1
+  hour) passes, then re-queues.
+- **Failure never reaches the webhook.** Git missing, clone denied, index
+  corrupt, embeddings down, database unreachable — all degrade to
+  text-only analysis with no evidence section. That path is covered by
+  `TestFallback` and by a webhook-level test that injects a component
+  violating its own non-raising contract.
+
 ## Security posture
 
 - HMAC (`X-Hub-Signature-256`) verified on every webhook with a constant-time

@@ -179,16 +179,22 @@ def create_app(
     # been indexed gets queued rather than indexed inline -- indexing takes
     # far longer than a webhook may.
     if repo_intelligence is None and settings.use_repo_intelligence:
-        from ..repository_intelligence import (
-            RepositoryIntelligenceConfig,
-            RepositoryIntelligenceService,
-        )
+        from ..repository_intelligence import build_service
 
-        repo_intelligence = RepositoryIntelligenceService(
-            RepositoryIntelligenceConfig.from_env(),
-            index_scheduler=lambda repo: _schedule_indexing(app, repo),
+        # build_service resolves every provider from the environment and
+        # returns None when the engine shouldn't run here at all -- most
+        # importantly on an ephemeral filesystem with no persistent vector
+        # store, where indexing would be rebuilt and discarded on every
+        # cold start. None is handled everywhere exactly like "feature off".
+        repo_intelligence = build_service(
+            qstash_token=settings.qstash_token,
+            callback_url=(
+                f"{settings.public_base_url}/internal/index-repository"
+                if settings.public_base_url else ""
+            ),
+            qstash_region=settings.qstash_region,
+            database_url=settings.database_url,
         )
-        logger.info("repository intelligence enabled (%s)", repo_intelligence.embedder.name)
     app.state.repo_intelligence = repo_intelligence
     # repo full name -> installation id, populated from webhook payloads so
     # a queued indexing job can authenticate a private clone.
@@ -205,7 +211,7 @@ def create_app(
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
-        return {
+        payload = {
             "status": "ok",
             "version": __version__,
             "model": app.state.predictor.model_name,
@@ -213,6 +219,45 @@ def create_app(
             "repo_thresholds": app.state.settings.repo_thresholds,
             "dry_run": app.state.settings.dry_run,
         }
+        if app.state.settings.use_repo_intelligence:
+            # Reports durability explicitly: "enabled but nothing persists"
+            # looks identical to a healthy deploy until someone wonders why
+            # no repository is ever ready.
+            from ..repository_intelligence import health_snapshot
+
+            payload["repository_intelligence"] = health_snapshot(app.state.repo_intelligence)
+        return payload
+
+    @app.get("/repositories")
+    def repositories(request: Request, limit: int = 50) -> dict[str, Any]:
+        """Indexing status per repository, for the dashboard.
+
+        Token-gated like /stats: index state discloses which repositories
+        this installation can see, plus their languages and README
+        summaries.
+        """
+        _require_token(request)
+        service = app.state.repo_intelligence
+        if service is None:
+            return {"enabled": False, "repositories": []}
+        return {
+            "enabled": True,
+            "repositories": [r.as_dict() for r in service.list_repositories(limit=limit)],
+        }
+
+    @app.get("/repositories/metrics")
+    def repository_metrics(request: Request) -> dict[str, Any]:
+        """Engine counters and timings. Process-scoped -- see metrics.py."""
+        _require_token(request)
+        from ..repository_intelligence import METRICS
+
+        service = app.state.repo_intelligence
+        snapshot = METRICS.snapshot()
+        if service is not None and service.index_queue is not None:
+            depth = service.index_queue.depth()
+            if depth is not None:
+                snapshot["gauges"]["index_queue_depth"] = depth
+        return snapshot
 
     @app.get("/stats")
     def stats(request: Request) -> dict[str, Any]:
@@ -355,10 +400,20 @@ def create_app(
 
         payload = await request.json()
         repo = str(payload.get("repo") or "")
-        installation_id = payload.get("installation_id")
         if not repo:
             raise HTTPException(status_code=422, detail="missing repo")
 
+        # Carried from the webhook that queued this job, minutes and a
+        # process boundary ago -- it's what joins the two in the logs.
+        from ..repository_intelligence.metrics import set_correlation_id
+
+        set_correlation_id(str(payload.get("correlation_id") or ""))
+
+        # The queue payload may predate this repo being seen, so fall back
+        # to the most recent installation id observed for it.
+        installation_id = (
+            payload.get("installation_id") or app.state.repo_installations.get(repo)
+        )
         token = ""
         if app.state.gh is not None and installation_id:
             try:
@@ -372,40 +427,6 @@ def create_app(
         return {"ok": True, "repo": repo, "indexed": indexed}
 
     return app
-
-
-def _schedule_indexing(app: FastAPI, repo: str) -> bool:
-    """Queue a repository for background indexing. True if it was queued.
-
-    Requires the QStash queue: without it there is nowhere to run a
-    minutes-long job that isn't the webhook's own request thread, and
-    blocking a webhook on a clone is the one thing this design refuses to
-    do. Deploys without a queue simply never auto-index -- they use
-    `python -m ghic.repo_index` (see the CLI) instead, and issue analysis
-    continues without code evidence in the meantime.
-    """
-    s: ServiceSettings = app.state.settings
-    if not s.can_use_async_queue:
-        return False
-
-    # The installation id seen most recently for this repo, so the indexing
-    # job can mint a token and clone a private repository. Captured from the
-    # webhook payload in _process_issue_job -- the queued job has no other
-    # way to learn it, and a public-repo clone works without one anyway.
-    installation_id = app.state.repo_installations.get(repo)
-    try:
-        from .qstash import publish
-
-        publish(
-            destination_url=f"{s.public_base_url}/internal/index-repository",
-            payload={"repo": repo, "installation_id": installation_id},
-            token=s.qstash_token,
-            region=s.qstash_region,
-        )
-        return True
-    except Exception as e:
-        logger.warning("could not queue indexing for %s: %s", repo, e)
-        return False
 
 
 def _utcnow_iso() -> str:

@@ -178,6 +178,174 @@ The `--query` form is worth running before enabling the feature on a real
 repository: retrieval quality varies a lot by codebase, and it shows
 exactly what the maintainer-facing evidence section would contain.
 
+## Production infrastructure (Phase 1.5)
+
+Phase 1 stored everything on the local filesystem and inferred state from
+it ("is there an index directory?"). That works on one box and fails
+everywhere else. Phase 1.5 keeps every Phase 1 interface and adds the
+infrastructure behind it — a service constructed the Phase 1 way still
+works identically, which is enforced by
+`test_phase_one_construction_still_works`.
+
+### What's swappable, and what actually ships
+
+| Seam | Interface | Ships | Not implemented |
+|---|---|---|---|
+| Vector store | `VectorStore` | `local` (numpy/FAISS), `postgres` (pgvector) | Qdrant, Pinecone, Milvus, Chroma |
+| State store | `RepositoryStateStore` | Postgres, file, memory | — |
+| Queue | `IndexQueue` | QStash, inline (dev), none | Redis, Celery, RabbitMQ |
+| Embeddings | `EmbeddingProvider` | hashing (offline), OpenAI-compatible | Voyage, Jina, Gemini, local BGE/E5 |
+
+The "not implemented" column is deliberate and worth defending: each of
+those is a client library plus a running service this test suite cannot
+exercise. Shipping adapter code that looks plausible but has never
+connected to the thing it claims to support is worse than shipping the
+interface — it reads as done, and fails in someone's production. The
+interfaces are three to five methods each; the contracts are documented
+above; adding one is a small, testable piece of work for whoever has that
+service to test against.
+
+**Naming an unimplemented provider raises rather than falling back.**
+`GHIC_VECTOR_PROVIDER=pinecone` fails loudly at startup. Silently
+substituting a local index would deliver exactly the failure the operator
+was configuring their way out of.
+
+### Persistence: pgvector on the Postgres that's already there
+
+`PostgresVectorStore` reuses `DATABASE_URL` — the same database the ledger
+and idempotency store use, and the same pure-Python `pg8000` driver, so
+production persistence needs no new infrastructure and no compiled wheels
+(which is what serverless bundle limits punish). Two search paths, chosen
+at connect time: pgvector's `<=>` cosine operator with an IVFFlat index
+when the extension is available, and in-Python scoring over one
+repository's rows when it isn't. The fallback exists so the feature works
+on a managed Postgres that won't grant `CREATE EXTENSION`, not because
+it's a good idea at scale — it's logged as such.
+
+Vectors are scoped by a `repo` column, so one table serves thousands of
+repositories without their indexes interfering, and per-path deletes make
+incremental updates possible.
+
+### Incremental indexing
+
+`git diff --name-status OLD NEW` gives the exact change set; a re-index
+becomes "delete chunks for changed and deleted paths, re-embed only the
+changed ones". Three guards make it safe rather than clever:
+
+- **The old commit must be reachable.** A `--depth 1` clone usually does
+  *not* contain the previously indexed commit, so the diff would fail or
+  silently produce a wrong change set. `commit_exists()` checks; a miss
+  returns None and the caller does a full rebuild. A wrong incremental
+  update leaves an index permanently describing code that no longer
+  exists, and nothing would ever detect it.
+- **It's bounded.** Above `max_incremental_files` (200), per-path deletes
+  stop being cheaper than one bulk rebuild.
+- **Deletions are explicit.** A removed file's chunks must go, or the
+  evidence section keeps citing a path that no longer exists — the exact
+  hallucination-shaped failure this subsystem exists to prevent, arriving
+  through a stale index.
+
+Postgres-only, because a monolithic local index file can't do per-path
+deletes without rewriting itself entirely, at which point it isn't
+incremental.
+
+### Lifecycle
+
+`not_indexed → queued → indexing → ready`, plus `updating`, `failed`, and
+`archived`. Two subtleties:
+
+`UPDATING` is **searchable**: an incremental re-index leaves the previous
+index in place, so an issue arriving mid-update gets slightly stale
+evidence rather than none.
+
+In-flight states suppress duplicate queueing — a busy repository queues one
+index job, not one per issue — but only for `STALE_IN_FLIGHT_SECONDS` (1
+hour). A worker that dies mid-index would otherwise wedge a repository in
+`INDEXING` forever with nothing ever retrying it.
+
+### The auto-disable rule
+
+On an ephemeral filesystem (Vercel, Lambda, Cloud Run — detected from the
+platform's own environment markers) with no persistent vector store
+configured, `build_service()` returns **None** and logs why. Running anyway
+would re-clone and re-embed on every cold start, discard the result minutes
+later, cost real money against a paid embedding provider, and produce no
+working feature — all while appearing enabled. Failing visibly at startup
+beats degrading invisibly forever. `None` is handled everywhere exactly
+like "feature off": analysis continues on issue text alone.
+
+`/healthz` reports `state_durable` and `queue_durable` explicitly, because
+"enabled but nothing persists" otherwise looks identical to a healthy
+deploy until someone asks why no repository is ever ready.
+
+### Secrets never enter the index
+
+Two layers, because one isn't enough for a failure this bad — a secret
+reaching the index reaches the embedding provider, the vector database, and
+potentially a public GitHub comment:
+
+1. **Path exclusion** (`is_sensitive_path`) drops `.env*`, `*.pem`, `*.key`,
+   `id_rsa`, `credentials*`, `secrets*`, `.npmrc`, kubeconfig, terraform
+   state, and service-account JSON — checked *before* the extension
+   allowlist, so adding an extension later can't silently start indexing
+   them.
+2. **Content redaction** (`redact_secrets`) runs on every file before
+   chunking, replacing GitHub/OpenAI/Anthropic/Groq/Slack/AWS/Google token
+   shapes, JWTs, credentialed database URLs, PEM private-key blocks, and
+   `password = "..."`-style assignments.
+
+Pattern-based, not entropy-based, on purpose: an entropy heuristic over
+source code flags hashes, UUIDs, and base64 fixtures constantly, and a
+redactor that shreds ordinary code is one an operator switches off.
+
+### Observability
+
+Counters, timers, and gauges via `RepositoryIntelligenceMetrics`, exposed
+at `/repositories/metrics`; per-repository status at `/repositories`.
+Correlation IDs come from GitHub's own `X-GitHub-Delivery` where one exists
+— inventing a second identifier when GitHub supplies a unique, user-visible
+one just creates two things to correlate — and ride the queue payload so a
+worker's logs join up with the webhook that triggered it minutes and a
+process boundary earlier.
+
+**Counters are per process.** On a horizontally-scaled deploy each
+container reports its own and they reset on recycle. Durable
+per-repository facts (chunk counts, index duration, retrieval hit rate)
+live in the state store instead, which is why `RepositoryRecord` carries
+them.
+
+### Recommended production stack
+
+| Component | Choice | Why |
+|---|---|---|
+| Host | Fly.io / Railway / Render / K8s | A real filesystem and a long-lived process |
+| Vectors | `GHIC_VECTOR_PROVIDER=postgres` + pgvector | Survives restarts, shared across workers |
+| State | `auto` → Postgres | Same `DATABASE_URL`, no new infrastructure |
+| Queue | QStash | Durable, already used for async issue processing |
+| Embeddings | `openai` | Semantic matching; the lexical default can't paraphrase |
+
+On Vercel specifically: keep `GHIC_USE_REPO_INTELLIGENCE=false` unless
+`GHIC_VECTOR_PROVIDER=postgres` is set, and expect indexing to happen on
+the QStash worker rather than in the request path either way.
+
+### Scaling notes
+
+Chunk volume is the axis that matters: ~1k chunks per moderate repository,
+so 10k repositories is ~10M rows. That is comfortable for Postgres with an
+IVFFlat index and a `repo`-scoped query, and it is the point where a
+dedicated vector database starts to earn its operational cost — which is
+what the `VectorStore` seam is for. Indexing throughput is bounded by the
+embedding provider, not by this code: batch size and concurrency are the
+knobs (`GHIC_INDEX_BATCH_SIZE`), and the queue is what keeps that pressure
+off the webhook path entirely.
+
+Storage grows silently — a repository indexed once after an App install and
+never queried again keeps its chunks forever — so `service.cleanup()` drops
+indexes untouched for `GHIC_REPO_STALE_DAYS` (30). It keys on
+`last_accessed_at` rather than `indexed_at` deliberately: a stable
+repository that is still being searched shouldn't be evicted just because
+its code hasn't changed.
+
 ## Extending it (later phases)
 
 `VectorStore`, `EmbeddingProvider`, and `RepositoryIndexer` are the three

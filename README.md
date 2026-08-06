@@ -270,11 +270,25 @@ same QStash queue and returns empty, and every failure mode (git missing,
 clone denied, index corrupt, embeddings down) degrades to text-only
 analysis. The default embedder is lexical (offline, no API key, no cost);
 `GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai` swaps in real semantic
-embeddings without touching anything else. Off by default
-(`GHIC_USE_REPO_INTELLIGENCE=false`) and needs persistent storage to be
-useful — index and query it directly with `python -m ghic.repo_index`.
-Full design notes, including the ranking corrections that came out of real
-output, in
+embeddings without touching anything else. Production infrastructure is provider-based: vectors in Postgres/pgvector
+(reusing the same `DATABASE_URL` as the ledger — no new infrastructure) or
+a local index for development; durable repository state with a real
+lifecycle (`queued → indexing → ready`, plus `failed`/`updating`) rather
+than state inferred from the filesystem; a swappable index queue; and
+incremental re-indexing that diffs `git` and re-embeds only what changed,
+falling back to a full rebuild whenever the diff can't be trusted. Secrets
+never enter an index — credential-shaped files are excluded by path and
+token-shaped values are redacted from file content before chunking.
+
+On an ephemeral filesystem (Vercel, Lambda, Cloud Run) with no persistent
+vector store configured, the engine **disables itself and says why** rather
+than re-indexing on every cold start and discarding the result; `/healthz`
+reports whether state and queue are actually durable. Off by default
+(`GHIC_USE_REPO_INTELLIGENCE=false`); index and query it directly with
+`python -m ghic.repo_index`, inspect status at `/repositories` and counters
+at `/repositories/metrics`. Full design notes — including the ranking
+corrections that came out of real output, the recommended production stack,
+and which providers are deliberately *not* implemented — in
 [models/REPOSITORY_INTELLIGENCE_CARD.md](models/REPOSITORY_INTELLIGENCE_CARD.md).
 
 **Async webhook processing** (`ghic/service/qstash.py`,

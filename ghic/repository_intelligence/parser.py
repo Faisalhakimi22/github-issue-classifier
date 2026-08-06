@@ -38,6 +38,8 @@ from .config import (
     FRAMEWORK_MARKERS,
     LANGUAGE_BY_EXTENSION,
     RepositoryIntelligenceConfig,
+    is_sensitive_path,
+    redact_secrets,
 )
 from .models import CodeChunk, RepositoryMetadata
 
@@ -102,6 +104,11 @@ def is_indexable(path: Path, root: Path, cfg: RepositoryIntelligenceConfig) -> b
     if any(part in EXCLUDED_DIRECTORIES for part in relative.parts[:-1]):
         return False
     if path.name in EXCLUDED_FILENAMES:
+        return False
+    # Checked before the extension allowlist, not after: a credential file
+    # must be excluded because of what it is, not because its extension
+    # happens to be absent from the allowlist today.
+    if is_sensitive_path(relative.as_posix()):
         return False
     name_lower = path.name.lower()
     if any(name_lower.endswith(suffix.lower()) for suffix in EXCLUDED_FILE_SUFFIXES):
@@ -223,6 +230,12 @@ def chunk_file(
     language = LANGUAGE_BY_EXTENSION.get(Path(relative_path).suffix.lower(), "")
     if not text.strip() or not language:
         return []
+
+    # Redact before chunking, so a secret is never embedded, never stored
+    # in the vector database, and never quotable as evidence -- there is no
+    # later stage where it could be stripped, because by then it exists in
+    # an index and possibly in an embedding provider's logs.
+    text = redact_secrets(text)
 
     if language == _PYTHON:
         chunks = _chunk_python(repo, relative_path, text, language, cfg)

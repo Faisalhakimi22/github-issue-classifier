@@ -48,8 +48,11 @@ class Checkout:
     default_branch: str
 
 
-def _run_git(args: list[str], cwd: Path | None, timeout: float) -> str:
+def run_git(args: list[str], cwd: Path | None, timeout: float) -> str:
     """Run git, raising RepositoryCacheError with a redacted message.
+
+    Public because incremental.py drives its own git plumbing (diff,
+    cat-file) against a checkout this module produced.
 
     stderr from a failed authenticated clone can echo the remote URL, which
     contains the installation token; `_redact` strips it before the message
@@ -117,8 +120,8 @@ class RepositoryCache:
         else:
             self._clone(repo, target, authed, url)
 
-        commit_sha = _run_git(["rev-parse", "HEAD"], target, self.cfg.git_timeout_seconds)
-        branch = _run_git(
+        commit_sha = run_git(["rev-parse", "HEAD"], target, self.cfg.git_timeout_seconds)
+        branch = run_git(
             ["rev-parse", "--abbrev-ref", "HEAD"], target, self.cfg.git_timeout_seconds
         )
         return Checkout(path=target, commit_sha=commit_sha, default_branch=branch)
@@ -128,27 +131,27 @@ class RepositoryCache:
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
         logger.info("cloning %s (depth=%d)", repo, self.cfg.clone_depth)
-        _run_git(
+        run_git(
             ["clone", "--depth", str(self.cfg.clone_depth), "--single-branch",
              "--no-tags", authed_url, str(target)],
             None, self.cfg.git_timeout_seconds,
         )
         # Drop the token from .git/config immediately.
-        _run_git(["remote", "set-url", "origin", clean_url], target,
+        run_git(["remote", "set-url", "origin", clean_url], target,
                  self.cfg.git_timeout_seconds)
 
     def _update(self, target: Path, authed_url: str, clean_url: str) -> None:
         try:
-            _run_git(["remote", "set-url", "origin", authed_url], target,
+            run_git(["remote", "set-url", "origin", authed_url], target,
                      self.cfg.git_timeout_seconds)
-            _run_git(["fetch", "--depth", str(self.cfg.clone_depth), "origin"], target,
+            run_git(["fetch", "--depth", str(self.cfg.clone_depth), "origin"], target,
                      self.cfg.git_timeout_seconds)
-            _run_git(["reset", "--hard", "FETCH_HEAD"], target, self.cfg.git_timeout_seconds)
-            _run_git(["clean", "-fdx"], target, self.cfg.git_timeout_seconds)
+            run_git(["reset", "--hard", "FETCH_HEAD"], target, self.cfg.git_timeout_seconds)
+            run_git(["clean", "-fdx"], target, self.cfg.git_timeout_seconds)
         finally:
             # Restore the tokenless remote even if the fetch failed.
             try:
-                _run_git(["remote", "set-url", "origin", clean_url], target,
+                run_git(["remote", "set-url", "origin", clean_url], target,
                          self.cfg.git_timeout_seconds)
             except RepositoryCacheError:
                 pass
