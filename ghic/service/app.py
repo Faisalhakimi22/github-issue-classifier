@@ -69,10 +69,12 @@ def create_app(
     assignment_recommender: Any = None,
     llm_service: Any = None,
     idempotency: Any = None,
+    repo_intelligence: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
     `category_predictor` / `effort_predictor` / `assignment_recommender` /
-    `llm_service` / `idempotency` are injectable for tests."""
+    `llm_service` / `idempotency` / `repo_intelligence` are injectable for
+    tests."""
     settings = settings or load_settings()
     if predictor is None:
         settings.validate()
@@ -171,6 +173,26 @@ def create_app(
             database_url=settings.database_url, file_path=settings.idempotency_path,
         )
     app.state.idempotency = idempotency
+    # Repository Intelligence: semantic code retrieval over the issue's own
+    # repository (off unless GHIC_USE_REPO_INTELLIGENCE=true). Constructed
+    # with an index_scheduler bound to this app so a repo that has never
+    # been indexed gets queued rather than indexed inline -- indexing takes
+    # far longer than a webhook may.
+    if repo_intelligence is None and settings.use_repo_intelligence:
+        from ..repository_intelligence import (
+            RepositoryIntelligenceConfig,
+            RepositoryIntelligenceService,
+        )
+
+        repo_intelligence = RepositoryIntelligenceService(
+            RepositoryIntelligenceConfig.from_env(),
+            index_scheduler=lambda repo: _schedule_indexing(app, repo),
+        )
+        logger.info("repository intelligence enabled (%s)", repo_intelligence.embedder.name)
+    app.state.repo_intelligence = repo_intelligence
+    # repo full name -> installation id, populated from webhook payloads so
+    # a queued indexing job can authenticate a private clone.
+    app.state.repo_installations = {}
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -303,7 +325,87 @@ def create_app(
         payload = await request.json()
         return _process_issue_job(app, payload)
 
+    @app.post("/internal/index-repository")
+    async def index_repository_callback(request: Request) -> dict[str, Any]:
+        """QStash's callback target for repository indexing.
+
+        Same signature verification as process-issue. Indexing is slow by
+        nature (clone + walk + embed), which is exactly why it lives behind
+        the queue instead of in the webhook: this endpoint may take minutes,
+        and nothing is waiting on it. A failed index returns 200 with
+        indexed=false rather than a 5xx -- QStash retrying a clone that
+        failed because the repo is private and the App lacks contents:read
+        would just fail identically several more times.
+        """
+        s: ServiceSettings = app.state.settings
+        if app.state.repo_intelligence is None:
+            raise HTTPException(status_code=503, detail="repository intelligence not enabled")
+        if not s.can_use_async_queue:
+            raise HTTPException(status_code=503, detail="async processing not configured")
+
+        body = await request.body()
+        from .qstash import verify_signature
+
+        signing_keys = [s.qstash_current_signing_key, s.qstash_next_signing_key]
+        if not verify_signature(
+            request.headers.get("Upstash-Signature"), body, signing_keys,
+            f"{s.public_base_url}/internal/index-repository",
+        ):
+            raise HTTPException(status_code=401, detail="invalid qstash signature")
+
+        payload = await request.json()
+        repo = str(payload.get("repo") or "")
+        installation_id = payload.get("installation_id")
+        if not repo:
+            raise HTTPException(status_code=422, detail="missing repo")
+
+        token = ""
+        if app.state.gh is not None and installation_id:
+            try:
+                token = app.state.gh.installation_token(int(installation_id))
+            except Exception as e:
+                # A public repo still clones without a token, so this is a
+                # degradation (private repos fail later), not a hard stop.
+                logger.warning("could not mint installation token for %s: %s", repo, e)
+
+        indexed = app.state.repo_intelligence.index_repository(repo, token=token)
+        return {"ok": True, "repo": repo, "indexed": indexed}
+
     return app
+
+
+def _schedule_indexing(app: FastAPI, repo: str) -> bool:
+    """Queue a repository for background indexing. True if it was queued.
+
+    Requires the QStash queue: without it there is nowhere to run a
+    minutes-long job that isn't the webhook's own request thread, and
+    blocking a webhook on a clone is the one thing this design refuses to
+    do. Deploys without a queue simply never auto-index -- they use
+    `python -m ghic.repo_index` (see the CLI) instead, and issue analysis
+    continues without code evidence in the meantime.
+    """
+    s: ServiceSettings = app.state.settings
+    if not s.can_use_async_queue:
+        return False
+
+    # The installation id seen most recently for this repo, so the indexing
+    # job can mint a token and clone a private repository. Captured from the
+    # webhook payload in _process_issue_job -- the queued job has no other
+    # way to learn it, and a public-repo clone works without one anyway.
+    installation_id = app.state.repo_installations.get(repo)
+    try:
+        from .qstash import publish
+
+        publish(
+            destination_url=f"{s.public_base_url}/internal/index-repository",
+            payload={"repo": repo, "installation_id": installation_id},
+            token=s.qstash_token,
+            region=s.qstash_region,
+        )
+        return True
+    except Exception as e:
+        logger.warning("could not queue indexing for %s: %s", repo, e)
+        return False
 
 
 def _utcnow_iso() -> str:
@@ -527,6 +629,37 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
     # or overrides pred.proba. None when disabled or on any failure;
     # LLMService itself never raises. See ghic/llm/ and
     # models/LLM_ANALYSIS_CARD.md.
+    # Repository Intelligence: semantic code retrieval over this repo, fed
+    # to the LLM as evidence and rendered as the comment's Repository
+    # Evidence section. Never raises and never blocks on indexing -- an
+    # unindexed repo queues a background job and returns empty, so the
+    # first issue on a new repo is analyzed from text alone. See
+    # ghic/repository_intelligence/repository_service.py.
+    repo_context = None
+    if app.state.repo_intelligence is not None:
+        if installation_id:
+            app.state.repo_installations[repo] = installation_id
+        # get_context is contractually non-raising, but this is wrapped
+        # anyway -- same as every other assistive head above. The contract
+        # is one implementation's promise; this is the webhook's guarantee,
+        # and the webhook shouldn't be able to break because a component
+        # someone swapped in violated its interface.
+        try:
+            repo_context = app.state.repo_intelligence.get_context(
+                repo,
+                issue.get("title", ""),
+                issue.get("body") or "",
+                category=(category or {}).get("predicted", "") if category else "",
+                predicted_label=pred.predicted_label,
+            )
+            logger.info(
+                "repository context for %s#%d: indexed=%s files=%d",
+                repo, number, repo_context.indexed, len(repo_context.relevant_files),
+            )
+        except Exception as e:
+            logger.warning("repository intelligence failed for %s#%d: %s", repo, number, e)
+            repo_context = None
+
     llm_analysis = None
     if app.state.llm_service is not None:
         context = IssueContext(
@@ -538,6 +671,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             metadata={"created_at": issue.get("created_at")},
             ml_probability=pred.proba,
             ml_predicted_label=pred.predicted_label,
+            repository_context=repo_context,
         )
         llm_analysis = app.state.llm_service.analyze_issue(context)
 
@@ -579,7 +713,10 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
     if not s.dry_run and gh is not None and installation_id:
         if s.post_comment:
             if llm_analysis is not None:
-                comment = format_llm_comment(pred, llm_analysis, related, disagreement=disagreement)
+                comment = format_llm_comment(
+                    pred, llm_analysis, related, disagreement=disagreement,
+                    repository_context=repo_context,
+                )
             else:
                 comment = format_comment(pred, related, category)
                 if info_request:
@@ -602,6 +739,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             "missing_info": info_request,
             "llm_analysis": llm_analysis.as_dict() if llm_analysis else None,
             "llm_ml_disagreement": disagreement,
+            "repository_context": repo_context.as_dict() if repo_context else None,
             "actions": actions, "dry_run": s.dry_run}
 
 

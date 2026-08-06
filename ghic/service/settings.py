@@ -136,6 +136,24 @@ class ServiceSettings:
     openrouter_api_key: str = ""
     openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
+    # Repository Intelligence: semantic code retrieval over the repo an
+    # issue was opened on, fed to the LLM as evidence and surfaced as a
+    # "Repository Evidence" section in the comment. See
+    # ghic/repository_intelligence/ and models/REPOSITORY_INTELLIGENCE_CARD.md.
+    #
+    # Off by default, like every other assistive feature here: it shells out
+    # to git, writes clones and vector indexes to disk, and (optionally)
+    # calls an embeddings API — none of which a fresh deploy should start
+    # doing unasked. With it off, nothing in the issue path changes.
+    #
+    # Requires a writable, persistent cache directory to be useful. On
+    # Vercel's ephemeral filesystem an index does not survive between
+    # invocations, so the engine degrades to "never indexed" on every
+    # request — hence GHIC_USE_REPO_INTELLIGENCE staying off there unless
+    # the operator mounts real storage. Docker/Fly deploys with a volume
+    # are the intended home.
+    use_repo_intelligence: bool = False
+
     # Async webhook processing via Upstash QStash — see ghic/service/qstash.py
     # and models/ASYNC_PROCESSING_CARD.md for why this exists (neither
     # FastAPI's BackgroundTasks nor Vercel's waitUntil() reliably keeps a
@@ -277,6 +295,7 @@ def load_settings() -> ServiceSettings:
         openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
         openrouter_model=os.environ.get("OPENROUTER_MODEL")
         or "nvidia/nemotron-3-ultra-550b-a55b:free",
+        use_repo_intelligence=_env_bool("GHIC_USE_REPO_INTELLIGENCE", False),
         use_async_processing=_env_bool("GHIC_USE_ASYNC_PROCESSING", False),
         qstash_token=os.environ.get("QSTASH_TOKEN", ""),
         qstash_current_signing_key=os.environ.get("QSTASH_CURRENT_SIGNING_KEY", ""),

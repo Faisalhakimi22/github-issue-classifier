@@ -247,6 +247,36 @@ compatible API (which both shipped providers are), so another backend
 Off by default (`GHIC_USE_LLM_ANALYSIS=false`); full design/testing
 notes in [models/LLM_ANALYSIS_CARD.md](models/LLM_ANALYSIS_CARD.md).
 
+**Repository Intelligence** (`ghic/repository_intelligence/`): retrieval-
+augmented reasoning over the repository an issue was opened on. The repo is
+shallow-cloned and indexed in the background (structural chunking — Python
+via `ast`, Markdown by heading, C-family via a declaration/brace scanner —
+then embedded into a vector index); when an issue arrives, a query built
+from its title and identifier-like tokens retrieves the most relevant code,
+which is passed to the LLM as evidence and surfaced as a **Repository
+Evidence** section naming the files and functions involved.
+
+The anti-hallucination guarantee is structural, not a prompt request: the
+prompt contains only chunks that were actually retrieved, and the comment's
+file list is rendered in Python from retrieved-chunk metadata rather than
+from model output — so a path in a GHIC comment exists in the index by
+construction. When nothing clears the confidence floor, every layer says so
+("No directly related source files were confidently identified") instead of
+guessing.
+
+Retrieval never blocks and never fails a webhook: `get_context()` only reads
+an existing index, an unindexed repo queues a background job through the
+same QStash queue and returns empty, and every failure mode (git missing,
+clone denied, index corrupt, embeddings down) degrades to text-only
+analysis. The default embedder is lexical (offline, no API key, no cost);
+`GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai` swaps in real semantic
+embeddings without touching anything else. Off by default
+(`GHIC_USE_REPO_INTELLIGENCE=false`) and needs persistent storage to be
+useful — index and query it directly with `python -m ghic.repo_index`.
+Full design notes, including the ranking corrections that came out of real
+output, in
+[models/REPOSITORY_INTELLIGENCE_CARD.md](models/REPOSITORY_INTELLIGENCE_CARD.md).
+
 **Async webhook processing** (`ghic/service/qstash.py`,
 `ghic/service/idempotency.py`): `/webhook` can validate, idempotency-check,
 and return 200 in well under a second, deferring the actual scoring/LLM/

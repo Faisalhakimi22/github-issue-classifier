@@ -38,6 +38,12 @@ class IssueContext:
     metadata: dict[str, Any]
     ml_probability: float
     ml_predicted_label: int
+    # Retrieved code evidence from the Repository Intelligence Engine, or
+    # None when the repo isn't indexed / retrieval found nothing confident.
+    # Typed loosely to keep ghic.llm independent of
+    # ghic.repository_intelligence -- the LLM layer works identically with
+    # or without that subsystem installed. See prompts.build_user_prompt().
+    repository_context: Any = None
 
 
 @dataclass(frozen=True)

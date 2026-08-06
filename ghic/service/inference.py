@@ -223,12 +223,68 @@ def format_comment(
     return "\n".join(lines)
 
 
+_MAX_EVIDENCE_FILES = 5
+
+
+def _repository_evidence_lines(repository_context: Any) -> list[str]:
+    """Render the Repository Evidence section from retrieved chunks.
+
+    Built in Python from `RetrievedChunk` metadata -- deliberately never
+    from LLM output. That is what makes "GHIC never hallucinates a file"
+    a structural property instead of a request the model can ignore: every
+    path and symbol printed here came out of the index, so it exists in the
+    repository at the indexed commit by construction.
+
+    Renders nothing at all when the engine is off or the repo isn't indexed
+    (no section is better than an empty one), and renders the honest
+    "nothing found" line when the engine ran but found no confident match.
+    """
+    if repository_context is None:
+        return []
+    if getattr(repository_context, "is_empty", True):
+        if not getattr(repository_context, "indexed", False):
+            return []  # engine off or repo not yet indexed -- say nothing
+        from ..repository_intelligence.models import EMPTY_CONTEXT_NOTE
+
+        return ["", "---", "", "### Repository Evidence", "", f"_{EMPTY_CONTEXT_NOTE}_"]
+
+    lines = ["", "---", "", "### Repository Evidence", ""]
+
+    by_file: dict[str, list[Any]] = {}
+    for retrieved in repository_context.chunks:
+        by_file.setdefault(retrieved.chunk.path, []).append(retrieved.chunk)
+
+    lines.append("**Relevant files**")
+    lines.append("")
+    for path, chunks in list(by_file.items())[:_MAX_EVIDENCE_FILES]:
+        symbols = [c.qualified_symbol for c in chunks if c.qualified_symbol]
+        spans = ", ".join(f"{c.start_line}-{c.end_line}" for c in chunks[:2])
+        suffix = f" — `{'`, `'.join(symbols[:2])}`" if symbols else ""
+        lines.append(f"- `{path}` (lines {spans}){suffix}")
+
+    metadata = getattr(repository_context, "metadata", None)
+    if metadata is not None and (metadata.primary_language or metadata.frameworks):
+        facts = []
+        if metadata.primary_language:
+            facts.append(metadata.primary_language)
+        facts.extend(metadata.frameworks[:2])
+        lines += ["", f"_Repository context: {' · '.join(facts)}._"]
+
+    lines += [
+        "",
+        "_Files identified by semantic search over the repository at its last "
+        "indexed commit — a starting point for investigation, not a diagnosis._",
+    ]
+    return lines
+
+
 def format_llm_comment(
     pred: Prediction,
     analysis: Any,
     related: list[dict[str, Any]] | None = None,
     disagreement: bool = False,
     generated_at: datetime | None = None,
+    repository_context: Any = None,
 ) -> str:
     """Polished, first-party-feeling markdown comment built from an LLM
     IssueAnalysis on top of the ML prediction. `analysis` is a
@@ -345,6 +401,8 @@ def format_llm_comment(
         "",
         analysis.recommended_action,
     ]
+
+    lines += _repository_evidence_lines(repository_context)
 
     if related:
         lines += ["", "---", "", "**Possibly related prior issues** (by text similarity — please verify):"]

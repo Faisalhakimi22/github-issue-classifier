@@ -14,6 +14,7 @@ after the fact.
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from .models import IssueContext
 
@@ -57,6 +58,75 @@ Respond with ONLY a single JSON object. No markdown, no code fences, no prose be
 Each `reasoning` item is one short, concrete, evidence-grounded observation (e.g. "Includes a full stack trace and reproduction steps.") -- never a restatement of the priority/severity/category you already gave, never a reference to how you arrived at it. `recommended_action` names one concrete action ("Investigate immediately -- this affects a core workflow.", "Route to the support team -- this reads as a usage question.", "Ask the reporter for a stack trace before triaging further."), not a generic "review this issue". `risk_reasons` justify `risk_level` specifically (e.g. "Blocks a production workflow", "Reproducible", "Regression after a recent update") -- only include ones that genuinely apply to this issue. `business_impact` must be grounded in what the issue actually says (e.g. "Data import unavailable" when the issue is literally about a broken import) -- an empty array is the correct answer far more often than not; never pad it. `missing_information` and `recommended_labels` may also be empty arrays when nothing applies -- do not pad them. Never invent details not present in the issue text or metadata."""
 
 
+_MAX_PROMPT_CHUNKS = 6
+_MAX_CHUNK_CHARS = 1_200
+
+
+def build_repository_section(repo_context: Any) -> str:
+    """Render retrieved repository evidence for the prompt, or "" for none.
+
+    This is the *only* path by which repository facts reach the model. It
+    contains nothing but chunks the retriever actually returned, and it
+    states its own limits explicitly ("this is a partial view", "do not
+    assume anything not shown"). The model cannot describe a file it was
+    never shown, because it was never shown a file list -- only these
+    chunks.
+    """
+    if repo_context is None or getattr(repo_context, "is_empty", True):
+        return ""
+
+    lines = ["", "--- Repository code retrieved for this issue ---"]
+
+    metadata = getattr(repo_context, "metadata", None)
+    if metadata is not None:
+        facts = [
+            f"Primary language: {metadata.primary_language}" if metadata.primary_language else "",
+            f"Frameworks: {', '.join(metadata.frameworks)}" if metadata.frameworks else "",
+            f"Project type: {metadata.project_type}" if metadata.project_type else "",
+            f"Entry points: {', '.join(metadata.entry_points)}" if metadata.entry_points else "",
+        ]
+        lines += [f for f in facts if f]
+        if metadata.readme_summary:
+            lines.append(f"README summary: {metadata.readme_summary}")
+
+    lines.append("")
+    lines.append(
+        "The following code was retrieved by semantic search against this "
+        "repository. It is a partial view -- the most relevant fragments, not "
+        "the whole codebase."
+    )
+    for retrieved in list(repo_context.chunks)[:_MAX_PROMPT_CHUNKS]:
+        chunk = retrieved.chunk
+        text = chunk.text
+        if len(text) > _MAX_CHUNK_CHARS:
+            text = text[:_MAX_CHUNK_CHARS] + "\n... [truncated]"
+        header = f"{chunk.path}:{chunk.start_line}-{chunk.end_line}"
+        if chunk.qualified_symbol:
+            header += f" ({chunk.kind} {chunk.qualified_symbol})"
+        lines += ["", header, "```" + _fence_language(chunk.language), text, "```"]
+
+    lines += [
+        "",
+        "Ground any statement you make about this repository in the code above. "
+        "Refer to files and functions by their exact names as shown. Do NOT "
+        "mention or infer the existence of any file, function, class, or module "
+        "that does not appear above -- if the retrieved code doesn't answer "
+        "something, say the available code doesn't show it rather than "
+        "guessing. Absence of a file here does not mean it doesn't exist in the "
+        "repository, only that it wasn't retrieved; never claim something is "
+        "missing from the codebase on this basis.",
+    ]
+    return "\n".join(lines)
+
+
+def _fence_language(language: str) -> str:
+    return {
+        "Python": "python", "JavaScript": "javascript", "TypeScript": "typescript",
+        "Go": "go", "Rust": "rust", "Java": "java", "C#": "csharp",
+        "Markdown": "markdown", "reStructuredText": "rst",
+    }.get(language, "")
+
+
 def build_user_prompt(context: IssueContext) -> str:
     body = (context.body or "").strip()
     if len(body) > _BODY_CHAR_LIMIT:
@@ -80,4 +150,19 @@ def build_user_prompt(context: IssueContext) -> str:
     ]
     if context.metadata:
         lines += ["", f"Additional metadata: {json.dumps(context.metadata, default=str)}"]
+
+    repository_section = build_repository_section(context.repository_context)
+    if repository_section:
+        lines.append(repository_section)
+    else:
+        # Said explicitly rather than left silent: a model given no code
+        # section and no instruction about it will happily speculate about
+        # the codebase from the issue text alone.
+        lines += [
+            "",
+            "--- Repository code ---",
+            "No repository code was retrieved for this issue. Reason about the "
+            "issue text alone, and do not speculate about specific files, "
+            "functions, classes, or the project's internal structure.",
+        ]
     return "\n".join(lines)

@@ -1062,6 +1062,128 @@ def make_llm_analysis(**overrides):
     return IssueAnalysis(**defaults)
 
 
+class StubRepoIntelligence:
+    """Mirrors RepositoryIntelligenceService's contract: get_context never
+    raises and returns a RepositoryContext (possibly empty)."""
+
+    def __init__(self, context=None, raises=None):
+        self.context = context
+        self.raises = raises
+        self.calls = []
+
+    def get_context(self, repo, title, body, **kwargs):
+        self.calls.append((repo, title, body, kwargs))
+        if self.raises:
+            raise self.raises
+        return self.context
+
+
+def make_repo_context(**overrides):
+    from ghic.repository_intelligence.models import (
+        CodeChunk,
+        RepositoryContext,
+        RepositoryMetadata,
+        RetrievedChunk,
+    )
+
+    chunk = CodeChunk(
+        repo="acme/widgets", path="src/csv_parser.py", language="Python",
+        text="def parse_csv(path):\n    return open(path).read()",
+        start_line=10, end_line=11, kind="function", symbol="parse_csv",
+    )
+    defaults = dict(
+        repo="acme/widgets",
+        metadata=RepositoryMetadata(repo="acme/widgets", primary_language="Python",
+                                    frameworks=["FastAPI"]),
+        chunks=[RetrievedChunk(chunk=chunk, score=0.72)],
+        indexed=True,
+    )
+    defaults.update(overrides)
+    return RepositoryContext(**defaults)
+
+
+class TestRepositoryIntelligenceIntegration:
+    def test_evidence_section_lists_retrieved_files(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
+                          threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(
+            pred, make_llm_analysis(), repository_context=make_repo_context(),
+        )
+        assert "### Repository Evidence" in comment
+        assert "`src/csv_parser.py`" in comment
+        assert "parse_csv" in comment
+        assert "lines 10-11" in comment
+
+    def test_no_evidence_section_when_engine_is_off(self):
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
+                          threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(pred, make_llm_analysis(), repository_context=None)
+        assert "Repository Evidence" not in comment
+
+    def test_unindexed_repo_renders_no_section_rather_than_an_empty_one(self):
+        from ghic.repository_intelligence.models import RepositoryContext
+
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
+                          threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(
+            pred, make_llm_analysis(),
+            repository_context=RepositoryContext(repo="acme/widgets", indexed=False),
+        )
+        assert "Repository Evidence" not in comment
+
+    def test_indexed_but_nothing_found_says_so_explicitly(self):
+        from ghic.repository_intelligence.models import EMPTY_CONTEXT_NOTE, RepositoryContext
+
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
+                          threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(
+            pred, make_llm_analysis(),
+            repository_context=RepositoryContext(
+                repo="acme/widgets", indexed=True, note=EMPTY_CONTEXT_NOTE
+            ),
+        )
+        assert "### Repository Evidence" in comment
+        assert EMPTY_CONTEXT_NOTE in comment
+
+    def test_webhook_passes_repository_context_to_the_llm(self):
+        repo_ctx = make_repo_context()
+        llm = StubLLMService(analysis=make_llm_analysis())
+        app = create_app(
+            make_settings(dry_run=True), predictor=StubPredictor(),
+            llm_service=llm, repo_intelligence=StubRepoIntelligence(repo_ctx),
+        )
+        post_webhook(TestClient(app), issue_opened_payload())
+        assert llm.calls[0].repository_context is repo_ctx
+
+    def test_webhook_response_includes_repository_context(self):
+        app = create_app(
+            make_settings(dry_run=True), predictor=StubPredictor(),
+            repo_intelligence=StubRepoIntelligence(make_repo_context()),
+        )
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.json()["repository_context"]["relevant_files"] == ["src/csv_parser.py"]
+
+    def test_absent_when_not_configured(self):
+        app = create_app(make_settings(dry_run=True), predictor=StubPredictor())
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.status_code == 200
+        assert resp.json()["repository_context"] is None
+
+    def test_repo_intelligence_failure_never_breaks_the_webhook(self):
+        """get_context is contractually non-raising, but the webhook must
+        survive even a broken implementation that violates that."""
+        gh = StubGitHub()
+        app = create_app(
+            make_settings(dry_run=False, post_comment=True), predictor=StubPredictor(),
+            gh_client=gh, llm_service=StubLLMService(analysis=make_llm_analysis()),
+            repo_intelligence=StubRepoIntelligence(raises=RuntimeError("index exploded")),
+        )
+        resp = post_webhook(TestClient(app), issue_opened_payload())
+        assert resp.status_code == 200
+        assert gh.comments  # the comment still went out, without evidence
+        assert "Repository Evidence" not in gh.comments[0][2]
+
+
 class TestLLMAnalysisComment:
     def test_llm_comment_used_when_analysis_available(self):
         gh = StubGitHub()
