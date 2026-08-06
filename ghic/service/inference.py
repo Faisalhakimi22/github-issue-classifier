@@ -354,81 +354,70 @@ def format_llm_comment(
     from ..llm.models import LOW_CONFIDENCE_THRESHOLD
 
     if disagreement:
-        actionability = "Needs Maintainer Review"
+        verdict = "Needs maintainer review"
     elif pred.predicted_label == 1:
-        actionability = "Likely Actionable"
+        verdict = "Likely actionable"
     else:
-        actionability = "Likely Not Actionable"
+        verdict = "Likely not actionable"
 
-    lines = [
-        "## 🤖 GHIC Analysis",
-        "",
-        analysis.summary,
-        "",
-        "---",
-        "",
-        "| | |",
-        "|---|---|",
-        f"| **Classification** | {analysis.category} |",
-        f"| **Actionability** | {actionability} |",
-        f"| **Statistical Risk Score** | {pred.proba:.0%} |",
-        f"| **Priority** | {analysis.priority.title()} |",
-        f"| **Severity** | {analysis.severity.title()} |",
-        "",
-        "_This score is based on historical issue patterns._",
-    ]
+    # The verdict, category and priority go in the heading, so the whole
+    # triage decision is legible from GitHub's notification list and the
+    # collapsed-comment preview without opening anything.
+    headline = f"## 🤖 GHIC · {verdict} · {analysis.category} · {analysis.priority.title()} priority"
+
+    lines = [headline, "", analysis.summary, ""]
+
     if disagreement:
         lines += [
+            "> ⚠️ The statistical score and the AI review disagree here. Worth a "
+            "direct look before triaging on the score alone.",
             "",
-            "_The statistical prediction and the AI review reached different "
-            "conclusions on this one. Given the evidence below, GHIC recommends "
-            "a maintainer take a direct look before this gets triaged on the "
-            "score alone._",
         ]
 
-    lines += [
-        "",
-        "---",
-        "",
-        "### Risk Assessment",
-        "",
-        f"**{analysis.risk_level.title()}**",
-        "",
-    ]
-    lines += [f"- {reason}" for reason in analysis.risk_reasons]
+    # The single most useful line in the comment, so it sits directly under
+    # the summary in bold rather than eight sections down under its own
+    # heading.
+    lines += [f"**→ {analysis.recommended_action}**", ""]
 
-    if analysis.business_impact:
-        lines += ["", "---", "", "### Business Impact", "", "**Potential Impact**", ""]
-        lines += [f"- {item}" for item in analysis.business_impact]
-
-    lines += ["", "---", "", "### Why GHIC Reached This Conclusion", ""]
+    # Reasoning as a tight list. No heading: three bullets under a summary
+    # read as "why" without being told, and "Why GHIC Reached This
+    # Conclusion" was longer than some of the bullets under it.
     lines += [f"- {point}" for point in analysis.reasoning]
     if analysis.confidence < LOW_CONFIDENCE_THRESHOLD:
-        lines += [
-            "",
-            "_The available information is insufficient to reach a "
-            "high-confidence assessment._",
-        ]
+        lines.append(
+            "- _Thin evidence — not enough here for a high-confidence read._"
+        )
+    lines.append("")
 
     if analysis.missing_information:
-        lines += [
-            "", "---", "", "### Missing Information", "",
-            "To speed up investigation, consider adding:", "",
-        ]
-        lines += [f"- {item}" for item in analysis.missing_information]
+        needs = "; ".join(analysis.missing_information)
+        lines += [f"**Would help:** {needs}", ""]
 
     if analysis.recommended_labels:
-        lines += ["", "---", "", "### Suggested Labels", ""]
-        lines += [" ".join(f"`{label}`" for label in analysis.recommended_labels)]
+        labels = " ".join(f"`{label}`" for label in analysis.recommended_labels)
+        lines += [f"**Labels:** {labels}", ""]
 
-    lines += [
+    # Everything below is supporting detail: true, occasionally useful, and
+    # not what the maintainer opened the issue to find out. Collapsed so
+    # the comment is ~15 lines on arrival instead of 74.
+    detail: list[str] = [
+        "| | |",
+        "|---|---|",
+        f"| Statistical risk score | {pred.proba:.0%} (from historical issue patterns) |",
+        f"| Severity | {analysis.severity.title()} |",
+        f"| Overall risk | {analysis.risk_level.title()} |",
         "",
-        "---",
+        "**Risk factors**",
         "",
-        "### Recommended Next Step",
-        "",
-        analysis.recommended_action,
     ]
+    detail += [f"- {reason}" for reason in analysis.risk_reasons]
+    if analysis.business_impact:
+        detail += ["", "**Potential impact**", ""]
+        detail += [f"- {item}" for item in analysis.business_impact]
+
+    lines += ["<details><summary>Scoring detail</summary>", ""]
+    lines += detail
+    lines += ["", "</details>"]
 
     lines += _repository_evidence_lines(repository_context)
 
@@ -462,20 +451,14 @@ def format_llm_comment(
             for r in related
         ]
 
+    # One <sub> line instead of an "Analysis Details" table. The old table
+    # carried three rows: "Status: AI Analysis Completed" (self-evident --
+    # you are reading the result), "Pipeline: Machine Learning + AI Review"
+    # (internal architecture, which this comment is meant not to expose),
+    # and the timestamp, which is the only part worth keeping.
     timestamp = (generated_at or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M UTC")
     lines += [
         "",
-        "---",
-        "",
-        "### Analysis Details",
-        "",
-        "| | |",
-        "|---|---|",
-        "| **Status** | AI Analysis Completed |",
-        "| **Pipeline** | Machine Learning + AI Review |",
-        f"| **Generated** | {timestamp} |",
-        "",
-        "> GHIC combines statistical machine learning with AI reasoning to assist "
-        "maintainers. Final triage decisions always remain with project maintainers.",
+        f"<sub>GHIC · assistive triage, a maintainer decides · {timestamp}</sub>",
     ]
     return "\n".join(lines)

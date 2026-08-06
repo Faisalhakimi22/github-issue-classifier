@@ -1195,7 +1195,7 @@ class TestLLMAnalysisComment:
         assert resp.status_code == 200
         assert resp.json()["llm_analysis"]["category"] == "bug"
         comment = gh.comments[0][2]
-        assert "GHIC Analysis" in comment
+        assert "GHIC" in comment
         assert "High" in comment  # priority
         assert "Application version" in comment
         assert "`bug`" in comment and "`backend`" in comment
@@ -1203,12 +1203,31 @@ class TestLLMAnalysisComment:
         assert "numeric__" not in comment
         assert "tfidf__" not in comment
         assert "feature importance" not in comment.lower()
-        # v2: no implementation-flavored naming anywhere in the comment.
+        # No implementation-flavored naming anywhere in the comment.
         assert "ML Actionability Score" not in comment
         assert "prompt" not in comment.lower()
         assert "token" not in comment.lower()
         assert "temperature" not in comment.lower()
         assert "provider" not in comment.lower()
+
+    def test_comment_stays_scannable(self):
+        """Regression guard on length. Each phase added a section that was
+        defensible alone; together they produced a 74-line wall for ~16
+        lines of content. This pins the shape: everything a maintainer
+        needs above the first fold, detail behind it."""
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
+                          threshold=0.5, predicted_label=1, model_name="stub")
+        comment = format_llm_comment(pred, make_llm_analysis())
+
+        above_fold = comment.split("<details>")[0]
+        content_lines = [ln for ln in above_fold.split("\n") if ln.strip()]
+        assert len(content_lines) <= 10, f"{len(content_lines)} lines before the fold"
+
+        # Horizontal rules were the main source of visual noise: eight of
+        # them separating one-line sections.
+        assert comment.count("\n---") <= 1
+        # One heading, not eight.
+        assert sum(1 for ln in comment.split("\n") if ln.startswith("#")) == 1
 
     def test_falls_back_to_ml_comment_when_llm_unavailable(self):
         gh = StubGitHub()
@@ -1254,12 +1273,12 @@ class TestLLMAnalysisComment:
             predicted_label=0, model_name="stub",
         )
         comment = format_llm_comment(pred, make_llm_analysis(), disagreement=True)
-        assert "Needs Maintainer Review" in comment
-        assert "Likely Not Actionable" not in comment
-        assert "Likely Actionable" not in comment
-        # Never expose the underlying mechanism as "the models disagree".
-        assert "disagree" not in comment.lower()
-        assert "reached different conclusions" in comment
+        assert "Needs maintainer review" in comment
+        assert "Likely not actionable" not in comment
+        # The headline carries the verdict, so it must not also claim the
+        # opposite one anywhere.
+        assert comment.splitlines()[0].count("Likely") == 0
+        assert "disagree" in comment.lower()  # stated plainly to the reader
 
     def test_no_disagreement_renders_the_plain_verdict(self):
         pred = Prediction(
@@ -1267,30 +1286,39 @@ class TestLLMAnalysisComment:
             predicted_label=0, model_name="stub",
         )
         comment = format_llm_comment(pred, make_llm_analysis(), disagreement=False)
-        assert "Likely Not Actionable" in comment
-        assert "Needs Maintainer Review" not in comment
-        assert "reached different conclusions" not in comment
+        assert "Likely not actionable" in comment
+        assert "Needs maintainer review" not in comment
 
-    def test_executive_summary_leads_the_comment(self):
-        """The old '### Summary' heading is gone -- analysis.summary is now
-        an unheaded lead paragraph right under the title, doubling as the
-        executive summary a maintainer reads first."""
+    def test_verdict_category_and_priority_are_in_the_heading(self):
+        """So the triage decision is legible from GitHub's notification
+        list without opening the comment."""
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
+                          threshold=0.5, predicted_label=1, model_name="stub")
+        heading = format_llm_comment(pred, make_llm_analysis()).splitlines()[0]
+        assert heading.startswith("## ")
+        assert "Likely actionable" in heading
+        assert "bug" in heading
+        assert "High priority" in heading
+
+    def test_summary_and_next_step_lead_before_any_detail(self):
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
                            threshold=0.5, predicted_label=1, model_name="stub")
         comment = format_llm_comment(pred, make_llm_analysis())
         assert "### Summary" not in comment
-        title_idx = comment.index("GHIC Analysis")
         summary_idx = comment.index("The app crashes on save.")
-        table_idx = comment.index("| **Classification**")
-        assert title_idx < summary_idx < table_idx
+        action_idx = comment.index("Investigate immediately")
+        detail_idx = comment.index("<details>")
+        assert summary_idx < action_idx < detail_idx
 
-    def test_statistical_risk_score_replaces_ml_actionability_score(self):
+    def test_statistical_risk_score_is_present_but_not_leading(self):
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.42,
                            threshold=0.5, predicted_label=0, model_name="stub")
         comment = format_llm_comment(pred, make_llm_analysis())
-        assert "**Statistical Risk Score** | 42%" in comment
+        assert "42%" in comment
         assert "ML Actionability Score" not in comment
-        assert "based on historical issue patterns" in comment
+        assert "historical issue patterns" in comment
+        # The score is supporting detail, not the headline.
+        assert comment.index("<details>") < comment.index("42%")
 
     def test_risk_assessment_section_renders_level_and_reasons(self):
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
@@ -1299,42 +1327,50 @@ class TestLLMAnalysisComment:
             pred, make_llm_analysis(risk_level="critical",
                                      risk_reasons=["Blocks a production workflow", "Reproducible"]),
         )
-        assert "### Risk Assessment" in comment
-        assert "**Critical**" in comment
+        assert "Risk factors" in comment
+        assert "Critical" in comment
         assert "- Blocks a production workflow" in comment
         assert "- Reproducible" in comment
+        # Detail, not headline: risk lives behind the fold.
+        assert comment.index("<details>") < comment.index("Risk factors")
 
-    def test_business_impact_section_shown_only_when_present(self):
+    def test_business_impact_shown_only_when_present(self):
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
                            threshold=0.5, predicted_label=1, model_name="stub")
         with_impact = format_llm_comment(
             pred, make_llm_analysis(business_impact=["Data import unavailable"]),
         )
-        assert "### Business Impact" in with_impact
+        assert "Potential impact" in with_impact
         assert "Data import unavailable" in with_impact
 
         without_impact = format_llm_comment(pred, make_llm_analysis(business_impact=[]))
-        assert "### Business Impact" not in without_impact
+        assert "Potential impact" not in without_impact
 
     def test_low_confidence_adds_explicit_disclaimer(self):
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
                            threshold=0.5, predicted_label=1, model_name="stub")
         low = format_llm_comment(pred, make_llm_analysis(confidence=0.2))
-        assert "insufficient to reach a high-confidence assessment" in low
+        assert "Thin evidence" in low
 
         high = format_llm_comment(pred, make_llm_analysis(confidence=0.9))
-        assert "insufficient to reach a high-confidence assessment" not in high
+        assert "Thin evidence" not in high
 
-    def test_missing_information_uses_framed_intro_and_is_capped(self):
+    def test_missing_information_renders_inline(self):
+        """One line, not a heading plus an intro plus a bullet list -- the
+        old version spent five lines framing a single item."""
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
                            threshold=0.5, predicted_label=1, model_name="stub")
         comment = format_llm_comment(
             pred, make_llm_analysis(missing_information=["Server stack trace", "Browser version"]),
         )
-        assert "To speed up investigation, consider adding:" in comment
-        assert "- Server stack trace" in comment
+        assert "**Would help:** Server stack trace; Browser version" in comment
+        assert "### Missing Information" not in comment
 
-    def test_analysis_details_footer_hides_internals_and_shows_metadata(self):
+    def test_footer_is_one_line_and_hides_internals(self):
+        """The old footer was a three-row 'Analysis Details' table whose
+        two extra rows said 'AI Analysis Completed' (self-evident) and
+        named the internal pipeline (which this format exists not to
+        expose). Only the timestamp survived."""
         from datetime import datetime, timezone
 
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.5,
@@ -1342,10 +1378,12 @@ class TestLLMAnalysisComment:
         fixed = datetime(2026, 8, 6, 18, 42, tzinfo=timezone.utc)
         comment = format_llm_comment(pred, make_llm_analysis(), generated_at=fixed)
 
-        assert "### Analysis Details" in comment
-        assert "AI Analysis Completed" in comment
-        assert "Machine Learning + AI Review" in comment
         assert "2026-08-06 18:42 UTC" in comment
+        assert comment.rstrip().endswith("</sub>")
+        assert "a maintainer decides" in comment
+        assert "### Analysis Details" not in comment
+        assert "AI Analysis Completed" not in comment
+        assert "Machine Learning + AI Review" not in comment
         assert "feature importance" not in comment.lower()
         assert "prompt" not in comment.lower()
         assert "temperature" not in comment.lower()
@@ -1370,7 +1408,7 @@ class TestLLMAnalysisComment:
         assert resp.status_code == 200
         assert resp.json()["llm_ml_disagreement"] is True
         comment = gh.comments[0][2]
-        assert "Needs Maintainer Review" in comment
+        assert "Needs maintainer review" in comment
 
 
 class TestCategoryDerivation:
