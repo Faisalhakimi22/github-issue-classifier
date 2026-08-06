@@ -270,7 +270,25 @@ same QStash queue and returns empty, and every failure mode (git missing,
 clone denied, index corrupt, embeddings down) degrades to text-only
 analysis. The default embedder is lexical (offline, no API key, no cost);
 `GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai` swaps in real semantic
-embeddings without touching anything else. **Engineering Intelligence** (`ghic/engineering_intelligence/`) reasons over
+embeddings without touching anything else. **Engineering Automation** (`ghic/automation/`) turns that analysis into
+artifacts a maintainer would otherwise write by hand: an implementation
+plan (which function, why, what to verify — never a generated patch), a
+triage checklist, a draft PR description, suggested tests, evidence-backed
+labels, reviewer suggestions from commit authorship, and a weekly digest.
+Every suggestion carries its own audit trail — inputs digest, engine
+version, confidence, reason, evidence — so it's reproducible and
+reviewable.
+
+Everything is **advisory**, enforced structurally rather than by policy:
+`ActionKind` has no `MERGE`/`CLOSE`/`DELETE` member to select,
+`AutomationService` holds no GitHub client so it cannot act on its own
+suggestions, and a test walks the package source and fails if any GitHub
+write method is ever called from it. Each capability is independently
+flagged and defaults off (`GHIC_FIX_SUGGESTIONS`, `GHIC_PR_DRAFTS`,
+`GHIC_SMART_LABELS`, …); design notes in
+[models/AUTOMATION_CARD.md](models/AUTOMATION_CARD.md).
+
+**Engineering Intelligence** (`ghic/engineering_intelligence/`) reasons over
 that retrieved evidence rather than adding to it: a possible root cause
 (commits that touched the relevant code shortly before the issue appeared),
 regression and release-window correlation, a recurrence check, engineering

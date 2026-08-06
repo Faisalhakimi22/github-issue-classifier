@@ -70,6 +70,7 @@ def create_app(
     llm_service: Any = None,
     idempotency: Any = None,
     repo_intelligence: Any = None,
+    automation_service: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
     `category_predictor` / `effort_predictor` / `assignment_recommender` /
@@ -199,6 +200,18 @@ def create_app(
     # repo full name -> installation id, populated from webhook payloads so
     # a queued indexing job can authenticate a private clone.
     app.state.repo_installations = {}
+    # Phase 4 automation. Constructed only when at least one capability
+    # flag is set; holds no GitHub client by design (see ghic/automation/).
+    if automation_service is None:
+        from ..automation import AutomationFlags, AutomationService
+
+        flags = AutomationFlags.from_env()
+        automation_service = (
+            AutomationService(flags, engine_version=__version__) if flags.any_enabled else None
+        )
+        if automation_service is not None:
+            logger.info("automation enabled: %s", flags)
+    app.state.automation = automation_service
 
     def _require_token(request: Request) -> None:
         s: ServiceSettings = app.state.settings
@@ -370,6 +383,112 @@ def create_app(
         payload = await request.json()
         return _process_issue_job(app, payload)
 
+    @app.post("/automation/analyze")
+    def automation_analyze(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+        """Advisory automation for an arbitrary issue (Feature 10).
+
+        One endpoint rather than five (`/fix-plan`, `/pr-draft`,
+        `/test-plan`, `/checklist`): they share every input and the same
+        retrieval + analysis pipeline, so splitting them would mean
+        re-retrieving the same evidence up to four times for one issue.
+        Callers select what they want with `include`; the response shape
+        is the same bundle either way, and each section is separately
+        flagged server-side regardless.
+
+        Read-only and advisory: this endpoint cannot label, assign, close,
+        comment, or open a pull request.
+        """
+        _require_token(request)
+        service = app.state.repo_intelligence
+        automation = app.state.automation
+        if service is None or automation is None:
+            raise HTTPException(
+                status_code=503,
+                detail="repository intelligence and automation must both be enabled",
+            )
+
+        repo = str(payload.get("repo") or "")
+        title = str(payload.get("title") or "")
+        body = str(payload.get("body") or "")
+        number = int(payload.get("issue_number") or 0)
+        if not repo or not title:
+            raise HTTPException(status_code=422, detail="repo and title are required")
+
+        context = service.get_context(repo, title, body)
+        analysis = None
+        if app.state.settings.use_engineering_intelligence:
+            from ..engineering_intelligence import EngineeringAnalyzer
+
+            analysis = EngineeringAnalyzer().analyze(
+                repo, title, body, context, issue_number=number,
+            )
+
+        bundle = automation.build(
+            repo, number, title, body, analysis=analysis, repository_context=context,
+        )
+        return {
+            "ok": True,
+            "advisory_only": True,
+            "repository_context": context.as_dict() if context else None,
+            "engineering_analysis": analysis.as_dict() if analysis else None,
+            "automation": bundle.as_dict() if bundle else None,
+        }
+
+    @app.get("/automation/weekly-digest")
+    def automation_weekly_digest(
+        request: Request, repo: str, fmt: str = "markdown"
+    ) -> dict[str, Any]:
+        """Repository digest from indexed history (Feature 9).
+
+        `fmt=markdown` for GitHub/email, `fmt=text` for Slack/Teams.
+        """
+        _require_token(request)
+        service = app.state.repo_intelligence
+        if service is None:
+            raise HTTPException(status_code=503, detail="repository intelligence not enabled")
+
+        from ..automation import build_weekly_digest
+        from ..engineering_intelligence import ComponentAnalyzer, cluster_history
+
+        chunks = _all_indexed_chunks(service, repo)
+        if not chunks:
+            return {"ok": True, "repo": repo, "digest": "", "note": "repository not indexed"}
+
+        stats = ComponentAnalyzer().analyze(chunks)
+        clusters = cluster_history(chunks)
+        return {
+            "ok": True,
+            "repo": repo,
+            "format": fmt,
+            "digest": build_weekly_digest(repo, stats, clusters, fmt=fmt),
+        }
+
+    @app.get("/automation/repository-analytics")
+    def automation_repository_analytics(request: Request, repo: str) -> dict[str, Any]:
+        """Structured analytics behind the dashboard widgets (Feature 11)."""
+        _require_token(request)
+        service = app.state.repo_intelligence
+        if service is None:
+            raise HTTPException(status_code=503, detail="repository intelligence not enabled")
+
+        from ..engineering_intelligence import (
+            ComponentAnalyzer,
+            cluster_history,
+            summarize_repository,
+        )
+
+        chunks = _all_indexed_chunks(service, repo)
+        analyzer = ComponentAnalyzer()
+        stats = analyzer.analyze(chunks)
+        return {
+            "ok": True,
+            "repo": repo,
+            "summary": summarize_repository(stats),
+            "components": [s.as_dict() for s in stats.values()],
+            "hotspots": [s.as_dict() for s in analyzer.hotspots(stats)],
+            "clusters": [c.as_dict() for c in cluster_history(chunks)],
+        }
+
     @app.post("/internal/index-repository")
     async def index_repository_callback(request: Request) -> dict[str, Any]:
         """QStash's callback target for repository indexing.
@@ -427,6 +546,24 @@ def create_app(
         return {"ok": True, "repo": repo, "indexed": indexed}
 
     return app
+
+
+def _all_indexed_chunks(service: Any, repo: str) -> list[Any]:
+    """Every chunk indexed for `repo`, for repository-wide analytics.
+
+    Analytics need the whole corpus, not a query's top-k -- component
+    health computed over ten retrieved chunks would describe the query,
+    not the repository. Returns [] when the repo isn't indexed, which the
+    callers report honestly rather than rendering empty widgets.
+    """
+    pointer = service.index_cache.get_latest(repo)
+    if pointer is None:
+        return []
+    loaded = service.index_cache.load(repo, *pointer)
+    if loaded is None:
+        return []
+    store, _ = loaded
+    return list(getattr(store, "_chunks", []))
 
 
 def _epoch(iso: Any) -> float | None:
@@ -714,6 +851,20 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             logger.warning("engineering analysis failed for %s#%d: %s", repo, number, e)
             engineering_analysis = None
 
+    # Phase 4 automation: advisory artifacts only. This service holds no
+    # GitHub client and cannot act on anything it suggests -- see
+    # ghic/automation/. Each capability is separately flagged.
+    automation = None
+    if app.state.automation is not None and repo_context is not None:
+        try:
+            automation = app.state.automation.build(
+                repo, number, issue.get("title", ""), issue.get("body") or "",
+                analysis=engineering_analysis, repository_context=repo_context,
+            )
+        except Exception as e:
+            logger.warning("automation failed for %s#%d: %s", repo, number, e)
+            automation = None
+
     llm_analysis = None
     if app.state.llm_service is not None:
         context = IssueContext(
@@ -771,6 +922,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
                     pred, llm_analysis, related, disagreement=disagreement,
                     repository_context=repo_context,
                     engineering_analysis=engineering_analysis,
+                    automation=automation,
                 )
             else:
                 comment = format_comment(pred, related, category)
@@ -798,6 +950,7 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             "engineering_analysis": (
                 engineering_analysis.as_dict() if engineering_analysis else None
             ),
+            "automation": automation.as_dict() if automation else None,
             "actions": actions, "dry_run": s.dry_run}
 
 

@@ -312,6 +312,7 @@ def format_llm_comment(
     generated_at: datetime | None = None,
     repository_context: Any = None,
     engineering_analysis: Any = None,
+    automation: Any = None,
 ) -> str:
     """Polished, first-party-feeling markdown comment built from an LLM
     IssueAnalysis on top of the ML prediction. `analysis` is a
@@ -446,6 +447,13 @@ def format_llm_comment(
         if engineering_lines:
             lines += engineering_lines
             lines += render_attribution_note()
+
+    # Phase 4 automation: advisory suggestions, collapsed behind <details>
+    # so the analysis stays the thing a maintainer reads first.
+    if automation is not None:
+        from ..automation import render_automation_sections
+
+        lines += render_automation_sections(automation)
 
     if related:
         lines += ["", "---", "", "**Possibly related prior issues** (by text similarity — please verify):"]
