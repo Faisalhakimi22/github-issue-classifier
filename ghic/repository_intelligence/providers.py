@@ -245,6 +245,18 @@ def health_snapshot(service: Any | None, cfg: RepositoryIntelligenceConfig | Non
                 else "not configured"
             ),
         }
+    # Whether this runtime can index at all. Cloning shells out to git, and
+    # serverless Python runtimes generally don't ship it -- so a deploy can
+    # be fully "enabled" (persistent vectors, durable queue, healthy state)
+    # and still never produce an index, because every queued job dies at
+    # the clone. That is a confusing failure to diagnose from the outside,
+    # so it is reported rather than inferred: can_index=false means index
+    # out of band (python -m ghic.repo_index) and let this deploy serve
+    # reads, which needs no git.
+    import shutil
+
+    git_available = shutil.which("git") is not None
+
     return {
         "enabled": True,
         "platform": platform_name(),
@@ -254,4 +266,12 @@ def health_snapshot(service: Any | None, cfg: RepositoryIntelligenceConfig | Non
         "queue": service.index_queue.name if service.index_queue else None,
         "queue_durable": service.index_queue.durable if service.index_queue else False,
         "incremental_indexing": service.cfg.incremental_indexing,
+        "can_index": git_available,
+        "indexing_note": (
+            ""
+            if git_available
+            else "git is not available in this runtime; index out of band with "
+                 "`python -m ghic.repo_index` against the same database. Retrieval "
+                 "works without it."
+        ),
     }
