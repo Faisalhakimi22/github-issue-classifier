@@ -1,0 +1,196 @@
+name: Verify repository index
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to verify, as owner/name."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      GHIC_VERIFY_REPOSITORY: ${{ inputs.repo }}
+
+    steps:
+      - name: Checkout GHIC
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Postgres client
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Verify index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+          
+          from ghic._pg import session
+          
+          repo = os.environ["GHIC_VERIFY_REPOSITORY"]
+          database_url = (
+              os.environ.get("GHIC_DATABASE_URL")
+              or os.environ.get("DATABASE_URL")
+              or os.environ.get("POSTGRES_URL")
+          )
+          if not database_url:
+              raise SystemExit("missing DATABASE_URL/GHIC_DATABASE_URL/POSTGRES_URL")
+          
+          def rows(conn, sql, **params):
+              return conn.run(sql, **params)
+          
+          def iso_from_epoch(value):
+              if value in (None, ""):
+                  return ""
+              try:
+                  return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+              except (TypeError, ValueError, OSError):
+                  return str(value)
+          
+          report = {"repo": repo}
+          with session(database_url) as conn:
+              tables = [
+                  row[0]
+                  for row in rows(conn, """
+                      SELECT table_name
+                      FROM information_schema.tables
+                      WHERE table_schema = 'public'
+                        AND table_name IN ('ghic_repository_state', 'ghic_repo_chunks')
+                      ORDER BY table_name
+                  """)
+              ]
+              report["tables"] = {name: name in tables for name in (
+                  "ghic_repository_state", "ghic_repo_chunks"
+              )}
+          
+              columns = rows(conn, """
+                  SELECT table_name, column_name, data_type
+                  FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name IN ('ghic_repository_state', 'ghic_repo_chunks')
+                  ORDER BY table_name, ordinal_position
+              """)
+              report["columns"] = [
+                  {"table": row[0], "column": row[1], "type": row[2]} for row in columns
+              ]
+          
+              if "ghic_repository_state" in tables:
+                  state = rows(conn, """
+                      SELECT repo, state, data, updated_at
+                      FROM ghic_repository_state
+                      WHERE repo = :repo
+                  """, repo=repo)
+                  if state:
+                      raw = state[0][2]
+                      data = json.loads(raw) if isinstance(raw, str) else raw
+                      report["state"] = {
+                          "repo": state[0][0],
+                          "state": state[0][1],
+                          "updated_at": state[0][3].isoformat(),
+                          "indexed_commit_sha": data.get("indexed_commit_sha", ""),
+                          "default_branch": data.get("default_branch", ""),
+                          "embedding_provider": data.get("embedding_provider", ""),
+                          "vector_backend": data.get("vector_backend", ""),
+                          "chunk_count": data.get("chunk_count", 0),
+                          "file_count": data.get("file_count", 0),
+                          "primary_language": data.get("primary_language", ""),
+                          "frameworks": data.get("frameworks", []),
+                          "indexed_at": iso_from_epoch(data.get("indexed_at")),
+                          "metadata": data.get("metadata_json", {}),
+                      }
+                  else:
+                      report["state"] = None
+          
+              if "ghic_repo_chunks" in tables:
+                  total = rows(
+                      conn,
+                      "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo",
+                      repo=repo,
+                  )[0][0]
+                  report["chunk_total"] = total
+                  report["chunks_by_kind"] = [
+                      {"kind": row[0], "count": row[1]}
+                      for row in rows(conn, """
+                          SELECT kind, count(*)
+                          FROM ghic_repo_chunks
+                          WHERE repo = :repo
+                          GROUP BY kind
+                          ORDER BY count(*) DESC, kind
+                      """, repo=repo)
+                  ]
+                  report["chunks_by_language"] = [
+                      {"language": row[0], "count": row[1]}
+                      for row in rows(conn, """
+                          SELECT language, count(*)
+                          FROM ghic_repo_chunks
+                          WHERE repo = :repo
+                          GROUP BY language
+                          ORDER BY count(*) DESC, language
+                      """, repo=repo)
+                  ]
+                  indicator = rows(conn, """
+                      SELECT
+                        sum(CASE WHEN path LIKE 'commit:%' OR kind = 'commit' THEN 1 ELSE 0 END),
+                        sum(CASE WHEN path LIKE 'pr:%' OR kind = 'pull_request' THEN 1 ELSE 0 END),
+                        sum(CASE WHEN path LIKE 'issue:%' OR kind = 'issue' THEN 1 ELSE 0 END),
+                        sum(CASE WHEN lower(language) = 'markdown'
+                                  OR lower(path) LIKE '%.md'
+                                  OR lower(path) LIKE '%.mdx'
+                                  OR lower(path) LIKE 'docs/%'
+                                  OR lower(path) LIKE '%readme%'
+                                 THEN 1 ELSE 0 END),
+                        sum(CASE WHEN path NOT LIKE 'commit:%'
+                                  AND path NOT LIKE 'pr:%'
+                                  AND path NOT LIKE 'issue:%'
+                                 THEN 1 ELSE 0 END)
+                      FROM ghic_repo_chunks
+                      WHERE repo = :repo
+                  """, repo=repo)[0]
+                  report["record_counts"] = {
+                      "commit_records": indicator[0],
+                      "pull_request_records": indicator[1],
+                      "resolved_issue_records": indicator[2],
+                      "documentation_records": indicator[3],
+                      "file_backed_code_or_doc_records": indicator[4],
+                  }
+                  report["sample_paths"] = [
+                      {
+                          "path": row[0],
+                          "language": row[1],
+                          "kind": row[2],
+                          "symbol": row[3],
+                          "start_line": row[4],
+                          "end_line": row[5],
+                      }
+                      for row in rows(conn, """
+                          SELECT path, language, kind, symbol, start_line, end_line
+                          FROM ghic_repo_chunks
+                          WHERE repo = :repo
+                          ORDER BY path, start_line
+                          LIMIT 12
+                      """, repo=repo)
+                  ]
+          
+          print(json.dumps(report, indent=2, sort_keys=True))
+          PY
