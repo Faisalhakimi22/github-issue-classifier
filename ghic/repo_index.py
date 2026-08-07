@@ -23,6 +23,8 @@ from . import utils
 from .repository_intelligence import (
     RepositoryIntelligenceConfig,
     RepositoryIntelligenceService,
+    RepositoryMetadata,
+    build_service,
 )
 
 logger = utils.get_logger(__name__)
@@ -42,10 +44,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     cfg = RepositoryIntelligenceConfig.from_env()
-    service = RepositoryIntelligenceService(cfg)
+    service = build_service(cfg)
+    if service is None:
+        print("repository intelligence is not available with the current configuration",
+              file=sys.stderr)
+        return 1
 
     if args.list:
-        return _list_indexes(cfg, as_json=args.json)
+        return _list_indexes(service, cfg, as_json=args.json)
 
     if not args.repo:
         parser.error("--repo is required unless --list is given")
@@ -67,10 +73,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         ok = service.index_repository(args.repo, token=args.token, force=args.force)
         metadata = None
-        loaded = service.index_cache.get_latest(args.repo)
-        if ok and loaded:
-            pair = service.index_cache.load(args.repo, *loaded)
-            metadata = pair[1] if pair else None
+        if ok:
+            metadata = _metadata_from_state(service, args.repo)
+            if metadata is None:
+                loaded = service.index_cache.get_latest(args.repo)
+                if loaded:
+                    pair = service.index_cache.load(args.repo, *loaded)
+                    metadata = pair[1] if pair else None
 
     if not ok:
         print(f"indexing failed for {args.repo} (see logs)", file=sys.stderr)
@@ -109,7 +118,37 @@ def _query(
     return 0
 
 
-def _list_indexes(cfg: RepositoryIntelligenceConfig, *, as_json: bool) -> int:
+def _metadata_from_state(
+    service: RepositoryIntelligenceService, repo: str
+) -> RepositoryMetadata | None:
+    record = service.status(repo)
+    if record is None or not record.metadata_json:
+        return None
+    try:
+        return RepositoryMetadata.from_dict(record.metadata_json)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _list_indexes(
+    service: RepositoryIntelligenceService,
+    cfg: RepositoryIntelligenceConfig,
+    *,
+    as_json: bool,
+) -> int:
+    records = service.list_repositories()
+    if records:
+        payload = [record.as_dict() for record in records]
+        if as_json:
+            print(json.dumps(payload, indent=2))
+        else:
+            for record in records:
+                print(
+                    f"{record.repo}  {record.indexed_commit_sha[:8]}  "
+                    f"{record.embedding_provider or '(unknown)'}  {record.state.value}"
+                )
+        return 0
+
     pointer_dir = cfg.index_dir / "_latest"
     entries: list[dict[str, object]] = []
     if pointer_dir.is_dir():

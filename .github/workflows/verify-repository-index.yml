@@ -117,7 +117,7 @@ jobs:
                           "primary_language": data.get("primary_language", ""),
                           "frameworks": data.get("frameworks", []),
                           "indexed_at": iso_from_epoch(data.get("indexed_at")),
-                          "metadata": data.get("metadata_json", {}),
+                          "metadata": data.get("metadata", {}),
                       }
                   else:
                       report["state"] = None
