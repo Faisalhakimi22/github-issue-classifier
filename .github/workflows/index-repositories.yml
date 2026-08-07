@@ -1,0 +1,110 @@
+name: Index repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to index, as owner/name. Leave empty to use GHIC_INDEX_REPOSITORIES."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even when the current commit is already indexed."
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [ghic-index-repository]
+  schedule:
+    - cron: "17 */12 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ghic-repo-index-${{ github.event.inputs.repo || github.event.client_payload.repo || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      GHIC_INDEX_REPOSITORIES: ${{ secrets.GHIC_INDEX_REPOSITORIES }}
+      GHIC_INDEX_GITHUB_TOKEN: ${{ secrets.GHIC_INDEX_GITHUB_TOKEN }}
+      GHIC_INDEX_REPOSITORY: ${{ github.event.inputs.repo || github.event.client_payload.repo }}
+      GHIC_INDEX_FORCE: ${{ github.event.inputs.force || github.event.client_payload.force || 'false' }}
+      GHIC_VECTOR_PROVIDER: postgres
+      GHIC_STATE_PROVIDER: postgres
+      GHIC_INDEX_QUEUE_PROVIDER: none
+      GHIC_REPO_AUTO_INDEX: "false"
+      GHIC_REPO_INTEL_CACHE_DIR: ${{ runner.temp }}/ghic-repo-intel
+
+    steps:
+      - name: Checkout GHIC
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install indexer
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Index repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GHIC_DATABASE_URL:-}${DATABASE_URL:-}${POSTGRES_URL:-}" ]; then
+            echo "::error::Set a GitHub Actions secret named DATABASE_URL, GHIC_DATABASE_URL, or POSTGRES_URL."
+            exit 1
+          fi
+
+          raw="${GHIC_INDEX_REPOSITORY:-}"
+          if [ -z "$raw" ]; then
+            raw="${GHIC_INDEX_REPOSITORIES:-}"
+          fi
+
+          if [ -z "$raw" ]; then
+            echo "::notice::No repository configured. Run manually with the repo input, or set GHIC_INDEX_REPOSITORIES."
+            exit 0
+          fi
+
+          raw="${raw//$'\r'/}"
+          raw="${raw//,/ }"
+          repos=()
+          for repo in $raw; do
+            if [[ ! "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::Invalid repository '$repo'. Expected owner/name."
+              exit 1
+            fi
+            repos+=("$repo")
+          done
+
+          if [ "${#repos[@]}" -eq 0 ]; then
+            echo "::notice::No repository configured after parsing inputs."
+            exit 0
+          fi
+
+          index_args=()
+          case "${GHIC_INDEX_FORCE,,}" in
+            true|1|yes|on) index_args+=(--force) ;;
+          esac
+
+          token_args=()
+          if [ -n "${GHIC_INDEX_GITHUB_TOKEN:-}" ]; then
+            token_args=(--token "$GHIC_INDEX_GITHUB_TOKEN")
+          fi
+
+          for repo in "${repos[@]}"; do
+            echo "::group::Index $repo"
+            python -m ghic.repo_index --repo "$repo" "${index_args[@]}" "${token_args[@]}" --json
+            echo "::endgroup::"
+          done

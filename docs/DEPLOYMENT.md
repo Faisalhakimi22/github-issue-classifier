@@ -392,6 +392,33 @@ with `state_durable` and `queue_durable`. Both false means the deploy is
 running without real persistence — the failure that otherwise looks
 identical to a healthy one.
 
+### Full-free indexing on GitHub Actions
+
+Vercel can serve retrieval from Postgres, but it cannot build the index when
+`git` is missing from the runtime. The free path is to run indexing out of
+band in GitHub Actions and write vectors into the same Postgres database the
+Vercel API reads from.
+
+The repo includes `.github/workflows/index-repositories.yml` for that:
+
+1. In this repository, open **Settings -> Secrets and variables -> Actions**.
+2. Add one database secret. Use whichever name matches your deploy:
+   `DATABASE_URL`, `GHIC_DATABASE_URL`, or `POSTGRES_URL`.
+3. Optional for private repos: add `GHIC_INDEX_GITHUB_TOKEN`, a fine-grained
+   GitHub token that can read repository contents for the repos you want to
+   index.
+4. Optional for scheduled indexing: add `GHIC_INDEX_REPOSITORIES` with
+   comma-, space-, or newline-separated repo names, for example
+   `owner/api, owner/web`.
+5. Run **Actions -> Index repositories -> Run workflow**. Pass `owner/name`
+   in the `repo` input for one repo, or leave it empty to use
+   `GHIC_INDEX_REPOSITORIES`.
+
+The workflow also accepts `repository_dispatch` events with type
+`ghic-index-repository` and payload `{"repo":"owner/name","force":false}`.
+That is the hook to trigger indexing from another service later without
+changing the worker.
+
 ### Rollout
 
 ```bash

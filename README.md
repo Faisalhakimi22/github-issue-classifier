@@ -335,6 +335,12 @@ at `/repositories/metrics`. Full design notes — including the ranking
 corrections that came out of real output, the recommended production stack,
 and which providers are deliberately *not* implemented — in
 [models/REPOSITORY_INTELLIGENCE_CARD.md](models/REPOSITORY_INTELLIGENCE_CARD.md).
+For a zero-cost Vercel deployment, use the included
+`.github/workflows/index-repositories.yml` workflow as the index worker: set
+a GitHub Actions `DATABASE_URL`/`GHIC_DATABASE_URL`/`POSTGRES_URL` secret,
+optionally set `GHIC_INDEX_REPOSITORIES`, then run **Actions -> Index
+repositories**. The workflow has `git`, clones the target repo, and writes
+the vectors to the same Postgres store that the Vercel API reads from.
 
 **Async webhook processing** (`ghic/service/qstash.py`,
 `ghic/service/idempotency.py`): `/webhook` can validate, idempotency-check,
