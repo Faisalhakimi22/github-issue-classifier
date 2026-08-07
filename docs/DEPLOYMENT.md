@@ -24,6 +24,7 @@ GitHub → Settings → Developer settings → **GitHub Apps** → *New GitHub A
 | App name | e.g. `issue-triage-bot` (globally unique) |
 | Homepage URL | your repo URL |
 | Webhook URL | `https://<your-host>/webhook` |
+| Setup URL | `https://<your-marketing-site>/github/setup` |
 | Webhook secret | generate one: `python -c "import secrets; print(secrets.token_hex(32))"` |
 | **Repository permissions** | Issues: **Read & write** · Metadata: Read-only |
 | **Subscribe to events** | Issues |
@@ -52,6 +53,12 @@ GHIC_APP_ID=123456
 GHIC_PRIVATE_KEY_PATH=/secrets/issue-triage-bot.pem   # or GHIC_PRIVATE_KEY inline
 GHIC_WEBHOOK_SECRET=<the secret>
 ```
+
+The Setup URL is the post-install handoff, not a webhook. After someone
+installs or updates the App on a repository, GitHub redirects the browser to
+that URL with `installation_id` and `setup_action`; the marketing site then
+forwards the user to the GHIC hub. If this field is blank or points at the
+wrong deployment, installation succeeds but the user will not land in the hub.
 
 ## 3. Deploy the service
 
