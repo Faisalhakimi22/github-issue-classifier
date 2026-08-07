@@ -252,33 +252,16 @@ class RepositoryIntelligenceService:
             record and record.embedding_provider and
             record.embedding_provider != self.embedder.name
         )
-        index_exists = self._index_exists(repo, checkout.commit_sha)
-
         # Nothing changed: the cheapest possible outcome, and the common one
         # on a repo that gets many issues and few pushes.
         if (
             not force and not embedder_changed
-            and previous_sha == checkout.commit_sha and index_exists
+            and previous_sha == checkout.commit_sha
+            and self._index_exists(repo, checkout.commit_sha)
         ):
             self.metrics.increment("index_jobs_skipped_unchanged")
             self._mark(repo, RepositoryState.READY, indexed_commit_sha=checkout.commit_sha)
             logger.info("index for %s already current at %s", repo, checkout.commit_sha[:8])
-            return True
-
-        # Repair the lifecycle state for indexes written before a state store
-        # was wired into the CLI. Local indexes are keyed by commit SHA, so
-        # this is exact for the filesystem backend. For Postgres, the chunks
-        # table predates a commit column; callers that need a guaranteed fresh
-        # rebuild can pass --force, while the default preserves an existing
-        # usable index and records the commit observed by this run.
-        if not force and record is None and index_exists:
-            metadata = self._metadata_from_existing_index(repo, checkout)
-            self.metrics.increment("index_jobs_skipped_unchanged")
-            self._mark_ready(repo, checkout, metadata)
-            logger.info(
-                "restored repository state for %s from existing index at %s",
-                repo, checkout.commit_sha[:8],
-            )
             return True
 
         try:
@@ -442,28 +425,6 @@ class RepositoryIntelligenceService:
                 self.cfg.database_url, repo, self.embedder.dimensions
             ).size > 0
         return self.index_cache.has(repo, commit_sha, self.embedder.name)
-
-    def _metadata_from_existing_index(self, repo: str, checkout: Any) -> RepositoryMetadata:
-        if self.cfg.vector_provider != "postgres":
-            loaded = self.index_cache.load(repo, checkout.commit_sha, self.embedder.name)
-            if loaded is not None:
-                return loaded[1]
-
-        from . import parser
-
-        files = parser.walk_repository(checkout.path, self.cfg)
-        metadata = parser.detect_metadata(
-            checkout.path, repo, files, self.cfg,
-            default_branch=checkout.default_branch, commit_sha=checkout.commit_sha,
-        )
-        if self.cfg.vector_provider == "postgres":
-            from .vector_pg import PostgresVectorStore
-
-            chunk_count = PostgresVectorStore(
-                self.cfg.database_url, repo, self.embedder.dimensions
-            ).size
-            metadata = replace(metadata, chunk_count=chunk_count)
-        return metadata
 
     # ------------------------------------------------------------------
     # State helpers
