@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ghic-repo-index-${{ github.event.inputs.repo || github.event.client_payload.repo || 'scheduled' }}
+  group: ghic-repo-index-${{ inputs.repo || github.event.client_payload.repo || 'scheduled' }}
   cancel-in-progress: false
 
 jobs:
@@ -34,13 +34,12 @@ jobs:
       POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
       GHIC_INDEX_REPOSITORIES: ${{ secrets.GHIC_INDEX_REPOSITORIES }}
       GHIC_INDEX_GITHUB_TOKEN: ${{ secrets.GHIC_INDEX_GITHUB_TOKEN }}
-      GHIC_INDEX_REPOSITORY: ${{ github.event.inputs.repo || github.event.client_payload.repo }}
-      GHIC_INDEX_FORCE: ${{ github.event.inputs.force || github.event.client_payload.force || 'false' }}
+      GHIC_INDEX_REPOSITORY: ${{ inputs.repo || github.event.client_payload.repo }}
+      GHIC_INDEX_FORCE: ${{ inputs.force || github.event.client_payload.force || 'false' }}
       GHIC_VECTOR_PROVIDER: postgres
       GHIC_STATE_PROVIDER: postgres
       GHIC_INDEX_QUEUE_PROVIDER: none
       GHIC_REPO_AUTO_INDEX: "false"
-      GHIC_REPO_INTEL_CACHE_DIR: ${{ runner.temp }}/ghic-repo-intel
 
     steps:
       - name: Checkout GHIC
@@ -61,6 +60,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export GHIC_REPO_INTEL_CACHE_DIR="${RUNNER_TEMP}/ghic-repo-intel"
 
           if [ -z "${GHIC_DATABASE_URL:-}${DATABASE_URL:-}${POSTGRES_URL:-}" ]; then
             echo "::error::Set a GitHub Actions secret named DATABASE_URL, GHIC_DATABASE_URL, or POSTGRES_URL."
