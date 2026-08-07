@@ -1,0 +1,266 @@
+name: Retrieval quality
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to query, as owner/name."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  retrieval-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      GHIC_QUERY_REPOSITORY: ${{ inputs.repo }}
+
+    steps:
+      - name: Checkout GHIC
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install read-only retrieval dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Query existing Postgres index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from collections import Counter
+          from typing import Any
+          
+          import numpy as np
+          
+          from ghic._pg import session
+          from ghic.repository_intelligence.config import RepositoryIntelligenceConfig
+          from ghic.repository_intelligence.embeddings import HashingEmbeddingProvider, tokenize
+          from ghic.repository_intelligence.models import CodeChunk, RetrievedChunk
+          from ghic.repository_intelligence.retriever import SemanticRetriever, build_query
+          
+          QUERIES = [
+              "webhook signature verification fails",
+              "CSV import UnicodeDecodeError",
+              "GitHub issue classification prediction",
+              "duplicate issue detection",
+              "repository indexing",
+          ]
+          
+          repo = os.environ["GHIC_QUERY_REPOSITORY"]
+          database_url = (
+              os.environ.get("GHIC_DATABASE_URL")
+              or os.environ.get("DATABASE_URL")
+              or os.environ.get("POSTGRES_URL")
+          )
+          if not database_url:
+              raise SystemExit("missing DATABASE_URL/GHIC_DATABASE_URL/POSTGRES_URL")
+          
+          cfg = RepositoryIntelligenceConfig(vector_provider="postgres")
+          embedder = HashingEmbeddingProvider(cfg.embedding_dimensions)
+          
+          
+          def rows(conn: Any, sql: str, **params: Any) -> list[Any]:
+              return conn.run(sql, **params)
+          
+          
+          def scalar(conn: Any, sql: str, **params: Any) -> Any:
+              result = rows(conn, sql, **params)
+              return result[0][0] if result else None
+          
+          
+          def row_to_retrieved(row: Any, score: float) -> RetrievedChunk:
+              return RetrievedChunk(
+                  chunk=CodeChunk(
+                      repo=repo,
+                      path=row[0],
+                      language=row[1] or "",
+                      kind=row[2] or "module",
+                      symbol=row[3] or "",
+                      parent_symbol=row[4] or "",
+                      start_line=int(row[5] or 0),
+                      end_line=int(row[6] or 0),
+                      text=row[7],
+                  ),
+                  score=score,
+              )
+          
+          
+          class ReadOnlyPostgresStore:
+              def __init__(self, count: int, has_pgvector: bool) -> None:
+                  self._count = count
+                  self._has_pgvector = has_pgvector
+          
+              @property
+              def size(self) -> int:
+                  return self._count
+          
+              def search(self, query: np.ndarray, top_k: int) -> list[RetrievedChunk]:
+                  if top_k <= 0:
+                      return []
+                  if self._has_pgvector:
+                      with session(database_url) as conn:
+                          result = rows(conn, """
+                              SELECT path, language, kind, symbol, parent_symbol,
+                                     start_line, end_line, text,
+                                     1 - (embedding <=> CAST(:q AS vector)) AS score
+                              FROM ghic_repo_chunks
+                              WHERE repo = :repo AND embedding IS NOT NULL
+                              ORDER BY embedding <=> CAST(:q AS vector)
+                              LIMIT :k
+                          """, repo=repo, q=json.dumps([float(v) for v in query]), k=top_k)
+                      return [row_to_retrieved(row, float(row[8])) for row in result]
+          
+                  with session(database_url) as conn:
+                      result = rows(conn, """
+                          SELECT path, language, kind, symbol, parent_symbol,
+                                 start_line, end_line, text, embedding_json
+                          FROM ghic_repo_chunks
+                          WHERE repo = :repo AND embedding_json IS NOT NULL
+                      """, repo=repo)
+                  scored = []
+                  for row in result:
+                      raw = row[8]
+                      values = json.loads(raw) if isinstance(raw, str) else raw
+                      vector = np.asarray(values, dtype=np.float32)
+                      if vector.shape == query.shape:
+                          scored.append((float(vector @ query), row))
+                  scored.sort(key=lambda pair: -pair[0])
+                  return [row_to_retrieved(row, score) for score, row in scored[:top_k]]
+          
+          
+          def matched_terms(query: str, chunk: CodeChunk) -> list[str]:
+              query_terms = set(tokenize(query))
+              haystack = " ".join([
+                  chunk.path,
+                  chunk.kind,
+                  chunk.symbol,
+                  chunk.parent_symbol,
+                  chunk.text[:2000],
+              ])
+              chunk_terms = Counter(tokenize(haystack))
+              return sorted(
+                  (term for term in query_terms if chunk_terms.get(term)),
+                  key=lambda term: (-chunk_terms[term], term),
+              )[:12]
+          
+          
+          def snippet(text: str, query: str) -> str:
+              clean = re.sub(r"\s+", " ", text).strip()
+              terms = [term for term in tokenize(query) if len(term) > 3]
+              lowered = clean.lower()
+              pos = min(
+                  [lowered.find(term.lower()) for term in terms if term.lower() in lowered]
+                  or [0]
+              )
+              start = max(0, pos - 90)
+              end = min(len(clean), pos + 260)
+              return clean[start:end]
+          
+          
+          with session(database_url) as conn:
+              before_count = scalar(
+                  conn,
+                  "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo",
+                  repo=repo,
+              )
+              state_rows = rows(conn, """
+                  SELECT state, data, updated_at
+                  FROM ghic_repository_state
+                  WHERE repo = :repo
+              """, repo=repo)
+              embedding_rows = scalar(conn, """
+                  SELECT count(*) FROM ghic_repo_chunks
+                  WHERE repo = :repo AND embedding IS NOT NULL
+              """, repo=repo)
+          
+          store = ReadOnlyPostgresStore(before_count, embedding_rows > 0)
+          retriever = SemanticRetriever(embedder, cfg)
+          query_reports = []
+          for query in QUERIES:
+              retrieved = retriever.retrieve(store, query, "", top_k=5)
+              query_reports.append({
+                  "query": query,
+                  "built_query": build_query(query, ""),
+                  "top_results": [
+                      {
+                          "rank": rank,
+                          "path": item.chunk.path,
+                          "kind": item.chunk.kind,
+                          "language": item.chunk.language,
+                          "symbol": item.chunk.qualified_symbol,
+                          "start_line": item.chunk.start_line,
+                          "end_line": item.chunk.end_line,
+                          "score": round(item.score, 6),
+                          "matched_terms": matched_terms(query, item.chunk),
+                          "snippet": snippet(item.chunk.text, query),
+                      }
+                      for rank, item in enumerate(retrieved, start=1)
+                  ],
+              })
+          
+          with session(database_url) as conn:
+              after_count = scalar(
+                  conn,
+                  "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo",
+                  repo=repo,
+              )
+              after_state = rows(conn, """
+                  SELECT state, data, updated_at
+                  FROM ghic_repository_state
+                  WHERE repo = :repo
+              """, repo=repo)
+          
+          state_payload = None
+          if state_rows:
+              raw = state_rows[0][1]
+              data = json.loads(raw) if isinstance(raw, str) else raw
+              state_payload = {
+                  "state": state_rows[0][0],
+                  "indexed_commit_sha": data.get("indexed_commit_sha", ""),
+                  "chunk_count": data.get("chunk_count", 0),
+                  "updated_at": state_rows[0][2].isoformat(),
+              }
+          
+          after_state_payload = None
+          if after_state:
+              raw = after_state[0][1]
+              data = json.loads(raw) if isinstance(raw, str) else raw
+              after_state_payload = {
+                  "state": after_state[0][0],
+                  "indexed_commit_sha": data.get("indexed_commit_sha", ""),
+                  "chunk_count": data.get("chunk_count", 0),
+                  "updated_at": after_state[0][2].isoformat(),
+              }
+          
+          print(json.dumps({
+              "repo": repo,
+              "read_only": True,
+              "used_existing_postgres_index": True,
+              "invoked_git": False,
+              "invoked_repo_index": False,
+              "chunk_count_before": before_count,
+              "chunk_count_after": after_count,
+              "chunk_count_unchanged": before_count == after_count,
+              "embedding_rows": embedding_rows,
+              "state_before": state_payload,
+              "state_after": after_state_payload,
+              "queries": query_reports,
+          }, indent=2, sort_keys=True))
+          PY
