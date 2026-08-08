@@ -359,6 +359,8 @@ class TestEmbeddings:
 
         def handler(request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content)
+            assert payload["dimensions"] == 4
+            assert "output_dimension" not in payload
             return httpx.Response(200, json={
                 "data": [{"embedding": [0.0, 1.0, 0.0, 0.0]} for _ in payload["input"]]
             })
@@ -370,6 +372,29 @@ class TestEmbeddings:
         vectors = provider.embed_documents(["a", "b"])
         assert vectors.shape == (2, 4)
         np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, rtol=1e-5)
+
+    def test_codestral_provider_uses_output_dimension(self):
+        import httpx
+
+        from ghic.repository_intelligence.embeddings import OpenAICompatibleEmbeddingProvider
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content)
+            assert payload["model"] == "mistralai/codestral-embed-2505"
+            assert payload["output_dimension"] == 512
+            assert "dimensions" not in payload
+            return httpx.Response(200, json={
+                "data": [{"embedding": [1.0] + [0.0] * 511}]
+            })
+
+        provider = OpenAICompatibleEmbeddingProvider(
+            api_key="k",
+            model="mistralai/codestral-embed-2505",
+            dimensions=512,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        vector = provider.embed_query("find webhook verification code")
+        assert vector.shape == (512,)
 
     def test_openai_provider_detects_response_dimensions(self):
         import httpx

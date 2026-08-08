@@ -251,11 +251,15 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
 
         client = self._client
         payload = {"model": self.model, "input": texts}
-        # `dimensions` is an OpenAI v3 extension; older/compatible servers
-        # reject unknown fields, so it is only sent when it would change
-        # anything.
+        # Codestral's OpenRouter route exposes Mistral's `output_dimension`
+        # parameter; other OpenAI-compatible models keep the standard key.
         if self._dimensions:
-            payload["dimensions"] = self._dimensions
+            dimension_key = (
+                "output_dimension"
+                if self.model == "mistralai/codestral-embed-2505"
+                else "dimensions"
+            )
+            payload[dimension_key] = self._dimensions
 
         def _call() -> list[list[float]]:
             owned = client is None
