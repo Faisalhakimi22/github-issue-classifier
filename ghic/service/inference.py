@@ -180,7 +180,7 @@ def format_comment(
         else "likely **non-actionable** (duplicate / question / won't-fix territory)"
     )
     lines = [
-        "### 🤖 Issue triage prediction",
+        "### GHIC · Issue triage prediction",
         "",
         f"This issue is {verdict}.",
         "",
@@ -373,7 +373,7 @@ def format_llm_comment(
     # The verdict, category and priority go in the heading, so the whole
     # triage decision is legible from GitHub's notification list and the
     # collapsed-comment preview without opening anything.
-    headline = f"## 🤖 GHIC · {verdict} · {analysis.category} · {analysis.priority.title()} priority"
+    headline = f"## GHIC · {verdict} · {analysis.category} · {analysis.priority.title()} priority"
 
     lines = [headline, "", analysis.summary, ""]
 

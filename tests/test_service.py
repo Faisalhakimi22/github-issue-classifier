@@ -1204,7 +1204,8 @@ class TestLLMAnalysisComment:
         assert resp.status_code == 200
         assert resp.json()["llm_analysis"]["category"] == "bug"
         comment = gh.comments[0][2]
-        assert "GHIC" in comment
+        assert comment.startswith("## GHIC ·")
+        assert "🤖" not in comment
         assert "High" in comment  # priority
         assert "Application version" in comment
         assert "`bug`" in comment and "`backend`" in comment
@@ -1248,7 +1249,7 @@ class TestLLMAnalysisComment:
         assert resp.status_code == 200
         assert resp.json()["llm_analysis"] is None
         comment = gh.comments[0][2]
-        assert "Issue triage prediction" in comment  # the original format_comment header
+        assert comment.startswith("### GHIC · Issue triage prediction")
 
     def test_no_llm_service_configured_behaves_like_before(self):
         client = make_client(make_settings())
@@ -1618,6 +1619,8 @@ class TestComment:
         assert "87%" in text
         assert "actionable bug" in text
         assert "can be wrong" in text
+        assert text.startswith("### GHIC · Issue triage prediction")
+        assert "🤖" not in text
 
     def test_comment_shows_confidence_bar_not_raw_features(self):
         pred = Prediction(
