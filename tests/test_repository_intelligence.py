@@ -672,6 +672,46 @@ class TestRetrieval:
             "tests/test_import.py",
         ]
 
+    def test_specific_functions_survive_same_file_diversification(self):
+        def candidate(kind, symbol, score):
+            return RetrievedChunk(
+                CodeChunk(
+                    repo="acme/demo",
+                    path="ghic/label.py",
+                    language="Python",
+                    text=f"{kind} {symbol} handles CSV input",
+                    start_line=1,
+                    end_line=2,
+                    kind=kind,
+                    symbol=symbol,
+                ),
+                score,
+            )
+
+        candidates = [
+            candidate("module", "", 0.7457),
+            candidate("function", "_write_labeled_csv", 0.7411),
+            candidate("function", "main", 0.7319),
+            candidate("function", "_read_collected_csv", 0.7176),
+        ]
+
+        class CandidateStore:
+            size = len(candidates)
+
+            def search(self, query, top_k):
+                return candidates[:top_k]
+
+        retriever = SemanticRetriever(
+            HashingEmbeddingProvider(8),
+            RepositoryIntelligenceConfig(min_similarity=0.15, top_k=2),
+        )
+        results = retriever.retrieve(CandidateStore(), "Windows-1252 CSV crash", "")
+
+        assert [item.chunk.symbol for item in results] == [
+            "_write_labeled_csv",
+            "_read_collected_csv",
+        ]
+
 
 # ---------------------------------------------------------------------------
 # Caching + lifecycle
@@ -763,6 +803,8 @@ class TestFallback:
         service.retriever.embedder = BrokenEmbedder(service.cfg.embedding_dimensions)
         context = service.get_context("acme/demo", "csv parsing", "")
         assert context.is_empty
+        assert not context.indexed
+        assert context.note == UNAVAILABLE_CONTEXT_NOTE
 
     def test_indexing_a_missing_directory_returns_none(self, service, tmp_path):
         assert service.index_local_path("acme/gone", tmp_path / "does-not-exist") is None
@@ -809,6 +851,8 @@ class TestPromptConstruction:
         )
         assert "partial view" in section
         assert "do not" in section.lower()
+        assert "exact file and function or class" in section
+        assert "recommended action traceable" in section
 
     def test_empty_context_produces_no_section(self):
         from ghic.llm.prompts import build_repository_section

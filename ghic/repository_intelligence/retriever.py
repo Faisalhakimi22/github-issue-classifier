@@ -129,8 +129,9 @@ class SemanticRetriever:
         """Top-k chunks above the similarity floor, diversified across files.
 
         Returns [] rather than low-confidence guesses -- see the module
-        docstring. Never raises: a retrieval failure degrades to "no
-        evidence", which the comment states plainly.
+        docstring. Operational failures raise ``RepositoryRetrievalError``
+        so the service facade can distinguish "no confident match" from
+        "retrieval unavailable" in maintainer-facing output.
         """
         top_k = top_k or self.cfg.top_k
         query = build_query(title, body, category=category, predicted_label=predicted_label)
@@ -144,7 +145,7 @@ class SemanticRetriever:
             candidates = store.search(vector, top_k * 3)
         except Exception as e:  # embedding API down, malformed index, ...
             logger.warning("repository retrieval failed: %s", e)
-            return []
+            raise RepositoryRetrievalError("repository retrieval unavailable") from e
 
         # The floor gates on the *true* similarity (is this a confident
         # match at all?); ordering then applies ranking priors (given two
@@ -194,6 +195,17 @@ _TEST_RANK_FACTOR = 0.75
 # the same vocabulary. A small prior lets similarly relevant executable code
 # lead without overriding a materially stronger documentation match.
 _PROSE_RANK_FACTOR = 0.95
+# Generic module and CLI-entrypoint chunks provide orientation, but a nearby
+# named function/class is normally the implementation a maintainer can act
+# on. This small prior matters before the per-file cap: otherwise two broad
+# chunks can consume both slots and hide the directly relevant function.
+# A materially stronger generic chunk still wins, so semantic similarity
+# remains the primary signal.
+_GENERIC_CODE_RANK_FACTOR = 0.95
+
+
+class RepositoryRetrievalError(RuntimeError):
+    """The index could not be queried; distinct from a confident empty result."""
 
 
 def _ranking_score(rc: RetrievedChunk) -> float:
@@ -210,6 +222,9 @@ def _ranking_score(rc: RetrievedChunk) -> float:
         return score * _TEST_RANK_FACTOR
     if rc.chunk.language in _PROSE_LANGUAGES:
         return score * _PROSE_RANK_FACTOR
+    symbol = rc.chunk.qualified_symbol.rsplit(".", 1)[-1]
+    if rc.chunk.kind == "module" or symbol == "main":
+        return score * _GENERIC_CODE_RANK_FACTOR
     return score
 
 

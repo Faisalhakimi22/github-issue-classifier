@@ -142,7 +142,12 @@ def build_repository_section(repo_context: Any) -> str:
         "something, say the available code doesn't show it rather than "
         "guessing. Absence of a file here does not mean it doesn't exist in the "
         "repository, only that it wasn't retrieved; never claim something is "
-        "missing from the codebase on this basis.",
+        "missing from the codebase on this basis. When a retrieved fragment "
+        "directly explains the reported behavior, name its exact file and "
+        "function or class in at least one reasoning item, and make the "
+        "recommended action traceable to that implementation. If the code is "
+        "only adjacent rather than explanatory, say the repository evidence "
+        "is partial instead of forcing a root-cause claim.",
     ]
     return "\n".join(lines)
 

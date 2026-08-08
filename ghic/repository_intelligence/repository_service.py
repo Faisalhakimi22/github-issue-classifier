@@ -40,7 +40,12 @@ from .embeddings import EmbeddingProvider, build_embedding_provider
 from .incremental import diff_change_set, should_use_incremental
 from .indexer import RepositoryIndexer
 from .metrics import METRICS, RepositoryIntelligenceMetrics, set_repo_context
-from .models import EMPTY_CONTEXT_NOTE, RepositoryContext, RepositoryMetadata
+from .models import (
+    EMPTY_CONTEXT_NOTE,
+    UNAVAILABLE_CONTEXT_NOTE,
+    RepositoryContext,
+    RepositoryMetadata,
+)
 from .queue import IndexQueue
 from .retriever import SemanticRetriever
 from .state import (
@@ -111,7 +116,9 @@ class RepositoryIntelligenceService:
             self.metrics.increment("retrieval_errors")
             logger.warning("repository intelligence unavailable for %s (%s: %s)",
                            repo, type(e).__name__, e)
-            return RepositoryContext(repo=repo, note=EMPTY_CONTEXT_NOTE)
+            return RepositoryContext(
+                repo=repo, indexed=False, note=UNAVAILABLE_CONTEXT_NOTE,
+            )
 
         if not context.is_empty:
             self.metrics.increment("retrievals_with_results")
@@ -204,8 +211,6 @@ class RepositoryIntelligenceService:
     ) -> RepositoryContext:
         queued = self._request_indexing(repo, record, reason)
         logger.info("no repository index for %s (%s); queued=%s", repo, reason, queued)
-        from .models import UNAVAILABLE_CONTEXT_NOTE
-
         return RepositoryContext(
             repo=repo, indexed=False, indexing_queued=queued,
             note=UNAVAILABLE_CONTEXT_NOTE,
