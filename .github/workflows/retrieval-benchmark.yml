@@ -79,7 +79,12 @@ jobs:
               tokenize,
           )
           from ghic.repository_intelligence.models import CodeChunk, RetrievedChunk
-          from ghic.repository_intelligence.retriever import SemanticRetriever, build_query
+          from ghic.repository_intelligence import retriever as retriever_module
+          from ghic.repository_intelligence.retriever import (
+              SemanticRetriever,
+              _ranking_score,
+              build_query,
+          )
           from ghic.repository_intelligence.state import RepositoryRecord
 
           QUERIES = [
@@ -151,6 +156,7 @@ jobs:
               def __init__(self, count: int, has_pgvector: bool, dimensions: int) -> None:
                   self._count = count
                   self._has_pgvector = has_pgvector and dimensions > 0
+                  self.search_calls: list[list[RetrievedChunk]] = []
 
               @property
               def size(self) -> int:
@@ -170,7 +176,9 @@ jobs:
                               ORDER BY embedding <=> CAST(:q AS vector)
                               LIMIT :k
                           """, repo=repo, q=json.dumps([float(v) for v in query]), k=top_k)
-                      return [row_to_retrieved(row, float(row[8])) for row in result]
+                      retrieved = [row_to_retrieved(row, float(row[8])) for row in result]
+                      self.search_calls.append(retrieved)
+                      return retrieved
 
                   with session(database_url) as conn:
                       result = rows(conn, """
@@ -188,7 +196,9 @@ jobs:
                       if vector.shape == query_vector.shape:
                           scored.append((float(vector @ query_vector), row))
                   scored.sort(key=lambda pair: -pair[0])
-                  return [row_to_retrieved(row, score) for score, row in scored[:top_k]]
+                  retrieved = [row_to_retrieved(row, score) for score, row in scored[:top_k]]
+                  self.search_calls.append(retrieved)
+                  return retrieved
 
 
           TEST_PATH_RE = re.compile(
@@ -304,7 +314,9 @@ jobs:
               )
               query_reports = []
               for query in QUERIES:
+                  store.search_calls.clear()
                   retrieved = retriever.retrieve(store, query, "", top_k=5)
+                  retrieval_candidates = store.search_calls[-1] if store.search_calls else []
                   query_vector = embedder.embed_query(build_query(query, ""))
                   raw_candidates = store.search(query_vector, 100)
                   selected_ids = {item.chunk.chunk_id for item in retrieved}
@@ -362,6 +374,15 @@ jobs:
                       "top_results": results,
                       "diagnostics": {
                           "current_candidate_pool_size": 15,
+                          "retriever_module": str(retriever_module.__file__),
+                          "retrieval_call_candidates": [
+                              {
+                                  **diagnostic_candidate(rank, item),
+                                  "ranking_score": round(_ranking_score(item), 6),
+                                  "chunk_source": item.chunk.source,
+                              }
+                              for rank, item in enumerate(retrieval_candidates, start=1)
+                          ],
                           "raw_top_15": [
                               diagnostic_candidate(rank, item)
                               for rank, item in enumerate(raw_candidates[:15], start=1)
