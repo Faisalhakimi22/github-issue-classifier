@@ -1647,6 +1647,39 @@ class TestComment:
         assert "Technical details" not in text
         assert "influential" not in text
 
+    def test_ml_fallback_discloses_unavailable_repository_evidence(self):
+        from ghic.repository_intelligence.models import (
+            RepositoryContext,
+            UNAVAILABLE_CONTEXT_NOTE,
+        )
+
+        pred = Prediction(repo="a/b", issue_number=1, proba=0.4, threshold=0.5,
+                          predicted_label=0, model_name="ensemble")
+        text = format_comment(
+            pred,
+            repository_context=RepositoryContext(
+                repo="a/b", indexed=False, note=UNAVAILABLE_CONTEXT_NOTE,
+            ),
+        )
+
+        assert "### Repository Evidence" in text
+        assert UNAVAILABLE_CONTEXT_NOTE in text
+
+    def test_ml_fallback_discloses_confident_empty_repository_result(self):
+        from ghic.repository_intelligence.models import (
+            EMPTY_CONTEXT_NOTE,
+            RepositoryContext,
+        )
+
+        pred = Prediction(repo="a/b", issue_number=1, proba=0.4, threshold=0.5,
+                          predicted_label=0, model_name="ensemble")
+        text = format_comment(
+            pred, repository_context=RepositoryContext(repo="a/b", indexed=True),
+        )
+
+        assert "### Repository Evidence" in text
+        assert EMPTY_CONTEXT_NOTE in text
+
 
 # ---------------------------------------------------------------------------
 # End-to-end inference smoke test against the real trained model

@@ -169,6 +169,7 @@ def format_comment(
     pred: Prediction,
     related: list[dict[str, Any]] | None = None,
     category: dict[str, Any] | None = None,
+    repository_context: Any = None,
 ) -> str:
     """Markdown comment the bot posts on a scored issue."""
     from .explain import confidence_bar, explain_prediction
@@ -215,6 +216,7 @@ def format_comment(
             f"- #{r['number']} — {r['title']} (similarity {r['similarity']:.2f})"
             for r in related
         ]
+    lines += _repository_evidence_lines(repository_context)
     lines += [
         "",
         "_Automated prediction from issue text and metadata at open time — "

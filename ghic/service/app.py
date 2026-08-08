@@ -932,7 +932,9 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
                     automation=automation,
                 )
             else:
-                comment = format_comment(pred, related, category)
+                comment = format_comment(
+                    pred, related, category, repository_context=repo_context,
+                )
                 if info_request:
                     comment += "\n\n---\n\n" + info_request["draft"]
             gh.post_comment(repo, number, comment, installation_id)

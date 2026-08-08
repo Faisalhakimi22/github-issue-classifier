@@ -37,6 +37,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       GHIC_REPO_INTEL_EMBEDDING_API_KEY: ${{ secrets.GHIC_REPO_INTEL_EMBEDDING_API_KEY }}
       GHIC_REPO_INTEL_EMBEDDING_BASE_URL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_BASE_URL }}
+      GHIC_REPO_INTEL_MIN_SIMILARITY: ${{ vars.GHIC_REPO_INTEL_MIN_SIMILARITY }}
       GHIC_QUERY_REPOSITORY: ${{ inputs.repo }}
       GHIC_BENCHMARK_SEMANTIC_PROVIDER: ${{ inputs.semantic_provider }}
       GHIC_BENCHMARK_SEMANTIC_MODEL: ${{ inputs.semantic_model }}
@@ -327,11 +328,16 @@ jobs:
 
               dimensions = state_record.embedding_dimensions or embedder.dimensions
               store = ReadOnlyPostgresStore(chunk_count, embedding_rows > 0, dimensions)
+              min_similarity = (
+                  float(os.environ.get("GHIC_REPO_INTEL_MIN_SIMILARITY") or "0.50")
+                  if name == "semantic"
+                  else 0.15
+              )
               retriever = SemanticRetriever(
                   embedder,
                   RepositoryIntelligenceConfig(
                       vector_provider="postgres",
-                      min_similarity=0.15,
+                      min_similarity=min_similarity,
                       top_k=5,
                   ),
               )
@@ -423,6 +429,7 @@ jobs:
                   "provider_label": name,
                   "status": "queried_existing_index",
                   "embedding": embedder.metadata().as_dict(),
+                  "min_similarity": min_similarity,
                   "queries": query_reports,
               }
 

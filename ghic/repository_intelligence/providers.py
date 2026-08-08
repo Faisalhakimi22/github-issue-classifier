@@ -266,6 +266,8 @@ def health_snapshot(service: Any | None, cfg: RepositoryIntelligenceConfig | Non
         "embedding_model": embedding.model,
         "embedding_dimensions": embedding.dimensions,
         "embedding_signature": embedding.signature,
+        "min_similarity": service.cfg.min_similarity,
+        "auto_index": service.cfg.auto_index,
         "state_durable": service.state_store.durable if service.state_store else False,
         "queue": service.index_queue.name if service.index_queue else None,
         "queue_durable": service.index_queue.durable if service.index_queue else False,

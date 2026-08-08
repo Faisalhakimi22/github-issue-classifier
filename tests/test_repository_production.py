@@ -523,12 +523,17 @@ class TestProviders:
         assert "ephemeral" in snapshot["reason"]
 
     def test_health_snapshot_reports_durability(self, tmp_path):
-        cfg = RepositoryIntelligenceConfig(cache_dir=tmp_path, state_provider="memory")
+        cfg = RepositoryIntelligenceConfig(
+            cache_dir=tmp_path, state_provider="memory",
+            min_similarity=0.50, auto_index=False,
+        )
         service = RepositoryIntelligenceService(cfg, state_store=MemoryStateStore())
         service.index_queue = NullIndexQueue()
         snapshot = health_snapshot(service)
         assert snapshot["enabled"] is True
         assert snapshot["state_durable"] is False
+        assert snapshot["min_similarity"] == 0.50
+        assert snapshot["auto_index"] is False
 
 
 # ---------------------------------------------------------------------------

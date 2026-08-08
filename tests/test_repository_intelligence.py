@@ -712,6 +712,40 @@ class TestRetrieval:
             "_read_collected_csv",
         ]
 
+    def test_semantic_floor_rejects_out_of_domain_scores_without_hiding_matches(self):
+        candidates = [
+            RetrievedChunk(
+                CodeChunk(
+                    repo="acme/demo", path="src/importer.py", language="Python",
+                    text="def read_csv(path): ...", start_line=1, end_line=2,
+                    kind="function", symbol="read_csv",
+                ),
+                0.532,
+            ),
+            RetrievedChunk(
+                CodeChunk(
+                    repo="acme/demo", path="src/analysis.py", language="Python",
+                    text="def analyze_issue(issue): ...", start_line=1, end_line=2,
+                    kind="function", symbol="analyze_issue",
+                ),
+                0.464,
+            ),
+        ]
+
+        class CandidateStore:
+            size = len(candidates)
+
+            def search(self, query, top_k):
+                return candidates[:top_k]
+
+        retriever = SemanticRetriever(
+            HashingEmbeddingProvider(8),
+            RepositoryIntelligenceConfig(min_similarity=0.50, top_k=5),
+        )
+        results = retriever.retrieve(CandidateStore(), "CSV import crash", "")
+
+        assert [item.chunk.symbol for item in results] == ["read_csv"]
+
 
 # ---------------------------------------------------------------------------
 # Caching + lifecycle
