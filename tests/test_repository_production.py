@@ -562,6 +562,21 @@ class TestServiceLifecycle:
         assert service.index_repository("acme/demo")
         assert calls == [True]
 
+    def test_forced_full_rebuild_enables_guarded_dimension_migration(self, repo, cfg):
+        from ghic.repository_intelligence.cache import Checkout
+
+        service = RepositoryIntelligenceService(cfg, state_store=MemoryStateStore())
+        checkout = Checkout(path=repo, commit_sha="sha2", default_branch="main")
+        calls: list[bool] = []
+
+        def capture_full(*args, allow_dimension_migration: bool = False):
+            calls.append(allow_dimension_migration)
+            return True
+
+        service._index_full = capture_full
+        assert service._run_index("acme/demo", checkout, "sha1", force=True)
+        assert calls == [True]
+
     def test_unindexed_repo_is_queued_once_not_per_issue(self, cfg):
         calls: list[str] = []
 

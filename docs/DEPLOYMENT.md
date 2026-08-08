@@ -436,11 +436,27 @@ OPENAI_API_KEY=<secret>
 OpenAI's `/v1/embeddings` response shape. `GHIC_REPO_INTEL_EMBEDDING_API_KEY`
 also works and takes precedence over `OPENAI_API_KEY`.
 
+Codestral Embed through OpenRouter uses this repository configuration:
+
+```bash
+GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai
+GHIC_REPO_INTEL_EMBEDDING_MODEL=mistralai/codestral-embed-2505
+GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS=1536
+GHIC_REPO_INTEL_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+GHIC_REPO_INTEL_EMBEDDING_API_KEY=<openrouter-secret>
+```
+
 Embedding provider, model, dimension, and indexed commit SHA are persisted in
 repository state. If any embedding identity changes, retrieval refuses to use
 the old vectors and indexing performs a full rebuild for that repository. This
 is required: vectors from different embedding models are not comparable, even
 when raw similarity scores look plausible.
+
+Postgres uses one fixed-width pgvector column. A forced full rebuild can
+change that width only when the chunks table contains no other repository;
+the replacement is transactional and rolls back to the old vectors if any
+new vector cannot be stored. Without `--force`, a dimension mismatch fails
+instead of falling back to JSON or mixing embeddings.
 
 To rebuild safely through GitHub Actions:
 

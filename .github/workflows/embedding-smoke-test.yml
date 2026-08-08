@@ -11,6 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
       GHIC_REPO_INTEL_EMBEDDING_PROVIDER: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_PROVIDER }}
       GHIC_REPO_INTEL_EMBEDDING_MODEL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_MODEL }}
       GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS }}
@@ -28,7 +31,7 @@ jobs:
           cache: pip
 
       - name: Install embedding provider
-        run: python -m pip install -e .
+        run: python -m pip install -e ".[postgres]"
 
       - name: Verify OpenRouter Codestral embedding
         shell: bash
@@ -38,6 +41,7 @@ jobs:
           import json
           import os
 
+          from ghic._pg import session
           from ghic.repository_intelligence.config import RepositoryIntelligenceConfig
           from ghic.repository_intelligence.embeddings import (
               OpenAICompatibleEmbeddingProvider,
@@ -56,8 +60,8 @@ jobs:
               raise SystemExit(f"expected provider=openai, got {provider!r}")
           if model != expected_model:
               raise SystemExit(f"expected model={expected_model}, got {model!r}")
-          if dimensions != 512:
-              raise SystemExit(f"expected dimensions=512, got {dimensions}")
+          if dimensions != 1536:
+              raise SystemExit(f"expected dimensions=1536, got {dimensions}")
           if base_url != expected_base_url:
               raise SystemExit(f"expected base URL={expected_base_url}, got {base_url!r}")
           if not api_key:
@@ -72,8 +76,46 @@ jobs:
           if vector.shape != (dimensions,):
               raise SystemExit(f"expected {dimensions} dimensions, got {vector.shape}")
 
+          database_url = (
+              os.environ.get("GHIC_DATABASE_URL")
+              or os.environ.get("DATABASE_URL")
+              or os.environ.get("POSTGRES_URL")
+          )
+          if not database_url:
+              raise SystemExit("missing DATABASE_URL/GHIC_DATABASE_URL/POSTGRES_URL")
+
+          with session(database_url) as conn:
+              extension = conn.run(
+                  "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+              )
+              if not extension:
+                  raise SystemExit("pgvector is not installed in the configured database")
+              conn.run("BEGIN")
+              try:
+                  conn.run(
+                      "CREATE TEMP TABLE ghic_embedding_smoke "
+                      f"(embedding vector({dimensions})) ON COMMIT DROP"
+                  )
+                  conn.run(
+                      "INSERT INTO ghic_embedding_smoke (embedding) "
+                      "VALUES (CAST(:embedding AS vector))",
+                      embedding=json.dumps([float(value) for value in vector]),
+                  )
+                  stored_dimensions = int(conn.run(
+                      "SELECT vector_dims(embedding) FROM ghic_embedding_smoke"
+                  )[0][0])
+                  if stored_dimensions != dimensions:
+                      raise SystemExit(
+                          f"stored vector has {stored_dimensions} dimensions, "
+                          f"expected {dimensions}"
+                      )
+              finally:
+                  conn.run("ROLLBACK")
+
           print(json.dumps({
               "status": "ok",
               "returned_dimensions": int(vector.shape[0]),
+              "stored_dimensions": stored_dimensions,
+              "persistent_rows_written": 0,
           }, sort_keys=True))
           PY

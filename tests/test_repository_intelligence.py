@@ -381,20 +381,20 @@ class TestEmbeddings:
         def handler(request: httpx.Request) -> httpx.Response:
             payload = json.loads(request.content)
             assert payload["model"] == "mistralai/codestral-embed-2505"
-            assert payload["output_dimension"] == 512
+            assert payload["output_dimension"] == 1536
             assert "dimensions" not in payload
             return httpx.Response(200, json={
-                "data": [{"embedding": [1.0] + [0.0] * 511}]
+                "data": [{"embedding": [1.0] + [0.0] * 1535}]
             })
 
         provider = OpenAICompatibleEmbeddingProvider(
             api_key="k",
             model="mistralai/codestral-embed-2505",
-            dimensions=512,
+            dimensions=1536,
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         )
         vector = provider.embed_query("find webhook verification code")
-        assert vector.shape == (512,)
+        assert vector.shape == (1536,)
 
     def test_openai_provider_detects_response_dimensions(self):
         import httpx

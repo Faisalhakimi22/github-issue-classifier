@@ -31,6 +31,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .. import utils
 from .cache import IndexCache, RepositoryCache, RepositoryCacheError
 from .config import RepositoryIntelligenceConfig
@@ -321,7 +323,11 @@ class RepositoryIntelligenceService:
         )
         if incremental:
             return self._index_incremental(repo, checkout, change_set)
-        return self._index_full(repo, checkout)
+        return self._index_full(
+            repo,
+            checkout,
+            allow_dimension_migration=force,
+        )
 
     def _history_chunks(self, repo: str, checkout: Any) -> list[Any]:
         """Phase 2 corpora for this repository, or [] when both are off.
@@ -351,7 +357,13 @@ class RepositoryIntelligenceService:
                            repo, e)
             return []
 
-    def _index_full(self, repo: str, checkout: Any) -> bool:
+    def _index_full(
+        self,
+        repo: str,
+        checkout: Any,
+        *,
+        allow_dimension_migration: bool = False,
+    ) -> bool:
         store, metadata = self.indexer.build(
             repo, checkout.path,
             default_branch=checkout.default_branch, commit_sha=checkout.commit_sha,
@@ -360,14 +372,18 @@ class RepositoryIntelligenceService:
         if self.cfg.vector_provider == "postgres":
             from .vector_pg import PostgresVectorStore
 
-            target = PostgresVectorStore(
-                self.cfg.database_url, repo, self.embedder.dimensions
-            )
-            target.clear()          # replace wholesale; no partial old state
             chunks = list(getattr(store, "_chunks", []))
             vectors = getattr(store, "_vectors", None)
-            if chunks and vectors is not None:
-                target.add(vectors, chunks)
+            if vectors is None:
+                vectors = np.zeros((0, self.embedder.dimensions), dtype=np.float32)
+            PostgresVectorStore.replace_repository(
+                self.cfg.database_url,
+                repo,
+                self.embedder.dimensions,
+                vectors,
+                chunks,
+                allow_dimension_migration=allow_dimension_migration,
+            )
         else:
             self.index_cache.save(
                 repo, checkout.commit_sha, self.embedder.name, store, metadata
@@ -499,14 +515,17 @@ class RepositoryIntelligenceService:
         if self.cfg.vector_provider == "postgres":
             from .vector_pg import PostgresVectorStore
 
-            target = PostgresVectorStore(
-                self.cfg.database_url, repo, self.embedder.dimensions
-            )
-            target.clear()
             chunks = list(getattr(store, "_chunks", []))
             vectors = getattr(store, "_vectors", None)
-            if chunks and vectors is not None:
-                target.add(vectors, chunks)
+            if vectors is None:
+                vectors = np.zeros((0, self.embedder.dimensions), dtype=np.float32)
+            PostgresVectorStore.replace_repository(
+                self.cfg.database_url,
+                repo,
+                self.embedder.dimensions,
+                vectors,
+                chunks,
+            )
         else:
             self.index_cache.save(repo, commit_sha, self.embedder.name, store, metadata)
             self.index_cache.set_latest(repo, commit_sha, self.embedder.name)

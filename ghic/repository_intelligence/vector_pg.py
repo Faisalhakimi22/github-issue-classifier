@@ -66,6 +66,20 @@ _CREATE_INDEXES = (
     "ON ghic_repo_chunks (repo, path)",
 )
 
+_CREATE_VECTOR_INDEX = (
+    "CREATE INDEX IF NOT EXISTS ghic_repo_chunks_embedding_idx "
+    "ON ghic_repo_chunks USING ivfflat (embedding vector_cosine_ops) "
+    "WITH (lists = 100)"
+)
+
+
+class EmbeddingDimensionMismatchError(RuntimeError):
+    """The configured embedder cannot query the table's fixed-width vectors."""
+
+
+class UnsafeEmbeddingMigrationError(RuntimeError):
+    """A table-wide dimension change would invalidate another repository."""
+
 
 class PostgresVectorStore(VectorStore):
     """Vectors in Postgres, scoped to one repository per instance.
@@ -115,28 +129,225 @@ class PostgresVectorStore(VectorStore):
             logger.info("pgvector extension unavailable (%s); using in-Python scoring", e)
             return False
         try:
-            conn.run(
-                f"ALTER TABLE ghic_repo_chunks ADD COLUMN IF NOT EXISTS "
-                f"embedding vector({self.dimensions})"
-            )
+            current_dimensions = self._embedding_column_dimensions(conn)
+            if current_dimensions is None:
+                conn.run(
+                    "ALTER TABLE ghic_repo_chunks ADD COLUMN "
+                    f"embedding vector({self.dimensions})"
+                )
+            elif current_dimensions != self.dimensions:
+                raise EmbeddingDimensionMismatchError(
+                    "ghic_repo_chunks.embedding is "
+                    f"vector({current_dimensions}), but the configured embedding provider "
+                    f"requires vector({self.dimensions}); run an explicit forced full rebuild"
+                )
             # IVFFlat needs training data to be worth building; with few
             # rows a sequential scan is faster anyway, so a failure here is
             # also non-fatal.
-            try:
-                conn.run(
-                    "CREATE INDEX IF NOT EXISTS ghic_repo_chunks_embedding_idx "
-                    "ON ghic_repo_chunks USING ivfflat (embedding vector_cosine_ops) "
-                    "WITH (lists = 100)"
-                )
-            except Exception as e:
-                logger.debug("ivfflat index not created (%s); sequential scan is fine", e)
+            self._create_vector_index(conn)
             return True
+        except EmbeddingDimensionMismatchError:
+            raise
         except Exception as e:
-            # Most likely: an existing column with a different dimension,
-            # i.e. the embedding provider changed. The state store's
-            # embedding_provider field is what should trigger a rebuild.
             logger.warning("could not prepare pgvector column (%s); using in-Python scoring", e)
             return False
+
+    @staticmethod
+    def _embedding_column_dimensions(conn: Any) -> int | None:
+        rows = conn.run(
+            "SELECT format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relname = 'ghic_repo_chunks' "
+            "AND a.attname = 'embedding' AND a.attnum > 0 AND NOT a.attisdropped"
+        )
+        if not rows:
+            return None
+        type_name = str(rows[0][0])
+        if not (type_name.startswith("vector(") and type_name.endswith(")")):
+            raise RuntimeError(
+                "ghic_repo_chunks.embedding must use a fixed-width vector(n) type; "
+                f"found {type_name}"
+            )
+        try:
+            return int(type_name[7:-1])
+        except ValueError as e:
+            raise RuntimeError(f"could not parse pgvector type {type_name}") from e
+
+    @staticmethod
+    def _create_vector_index(conn: Any) -> None:
+        try:
+            conn.run(_CREATE_VECTOR_INDEX)
+        except Exception as e:
+            logger.debug("ivfflat index not created (%s); sequential scan is fine", e)
+
+    @classmethod
+    def replace_repository(
+        cls,
+        database_url: str,
+        repo: str,
+        dimensions: int,
+        vectors: np.ndarray,
+        chunks: list[CodeChunk],
+        *,
+        allow_dimension_migration: bool = False,
+    ) -> PostgresVectorStore:
+        """Atomically replace one repository, migrating vector width only when forced.
+
+        The pgvector column is table-wide. A dimension migration is therefore
+        permitted only when every stored row belongs to ``repo``. All new
+        embeddings are already in memory before this method begins, and the
+        old rows/schema are restored by Postgres if any insert fails.
+        """
+        store = cls.__new__(cls)
+        store.database_url = database_url
+        store.repo = repo
+        store.dimensions = dimensions
+        store._pgvector = False
+        store._pending = []
+        store._replace_all(
+            vectors,
+            chunks,
+            allow_dimension_migration=allow_dimension_migration,
+        )
+        return store
+
+    def _replace_all(
+        self,
+        vectors: np.ndarray,
+        chunks: list[CodeChunk],
+        *,
+        allow_dimension_migration: bool,
+    ) -> None:
+        matrix = self._validate_vectors(vectors, chunks)
+        with self._session() as conn:
+            conn.run(_CREATE_CHUNKS_TABLE)
+            for statement in _CREATE_INDEXES:
+                conn.run(statement)
+            try:
+                conn.run("CREATE EXTENSION IF NOT EXISTS vector")
+            except Exception as e:
+                logger.info("pgvector extension unavailable (%s); using in-Python scoring", e)
+                self._replace_json(conn, matrix, chunks)
+                return
+
+            current_dimensions = self._embedding_column_dimensions(conn)
+            if current_dimensions is None:
+                conn.run(
+                    "ALTER TABLE ghic_repo_chunks ADD COLUMN "
+                    f"embedding vector({self.dimensions})"
+                )
+                current_dimensions = self.dimensions
+            elif current_dimensions != self.dimensions:
+                if not allow_dimension_migration:
+                    raise EmbeddingDimensionMismatchError(
+                        "refusing to replace vector dimensions without an explicit forced "
+                        f"full rebuild (stored={current_dimensions}, configured={self.dimensions})"
+                    )
+                self._validate_dimension_migration(conn, current_dimensions)
+
+            self._replace_pgvector(
+                conn,
+                matrix,
+                chunks,
+                current_dimensions=current_dimensions,
+            )
+            self._pgvector = True
+            self._create_vector_index(conn)
+
+    def _validate_dimension_migration(self, conn: Any, current_dimensions: int) -> None:
+        rows = conn.run(
+            "SELECT repo, count(*), count(embedding), "
+            "min(vector_dims(embedding)), max(vector_dims(embedding)), "
+            "count(embedding_json) "
+            "FROM ghic_repo_chunks GROUP BY repo ORDER BY repo"
+        )
+        other_repositories = [str(row[0]) for row in rows if row[0] != self.repo]
+        if other_repositories:
+            raise UnsafeEmbeddingMigrationError(
+                "refusing a table-wide embedding dimension migration while other "
+                f"repositories have vectors: {', '.join(other_repositories)}"
+            )
+        for row in rows:
+            total = int(row[1])
+            vector_rows = int(row[2])
+            minimum = int(row[3]) if row[3] is not None else None
+            maximum = int(row[4]) if row[4] is not None else None
+            json_rows = int(row[5])
+            if (
+                vector_rows != total
+                or json_rows != 0
+                or minimum != current_dimensions
+                or maximum != current_dimensions
+            ):
+                raise UnsafeEmbeddingMigrationError(
+                    "refusing to migrate an index with incomplete or mixed vector storage"
+                )
+
+    def _replace_pgvector(
+        self,
+        conn: Any,
+        vectors: np.ndarray,
+        chunks: list[CodeChunk],
+        *,
+        current_dimensions: int,
+    ) -> None:
+        migrating = current_dimensions != self.dimensions
+        conn.run("BEGIN")
+        try:
+            conn.run("LOCK TABLE ghic_repo_chunks IN ACCESS EXCLUSIVE MODE")
+            locked_dimensions = self._embedding_column_dimensions(conn)
+            if locked_dimensions != current_dimensions:
+                raise UnsafeEmbeddingMigrationError(
+                    "embedding schema changed while the migration was waiting for its lock"
+                )
+            if migrating:
+                self._validate_dimension_migration(conn, current_dimensions)
+                conn.run("DROP INDEX IF EXISTS ghic_repo_chunks_embedding_idx")
+
+            conn.run("DELETE FROM ghic_repo_chunks WHERE repo = :repo", repo=self.repo)
+            if migrating:
+                conn.run("ALTER TABLE ghic_repo_chunks DROP COLUMN embedding")
+                conn.run(
+                    "ALTER TABLE ghic_repo_chunks ADD COLUMN "
+                    f"embedding vector({self.dimensions})"
+                )
+            self._insert_pgvector_rows(conn, vectors, chunks)
+            conn.run("COMMIT")
+        except Exception:
+            try:
+                conn.run("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def _replace_json(
+        self, conn: Any, vectors: np.ndarray, chunks: list[CodeChunk]
+    ) -> None:
+        conn.run("BEGIN")
+        try:
+            conn.run("DELETE FROM ghic_repo_chunks WHERE repo = :repo", repo=self.repo)
+            self._insert_json_rows(conn, vectors, chunks)
+            conn.run("COMMIT")
+        except Exception:
+            try:
+                conn.run("ROLLBACK")
+            except Exception:
+                pass
+            raise
+
+    def _validate_vectors(
+        self, vectors: np.ndarray, chunks: list[CodeChunk]
+    ) -> np.ndarray:
+        matrix = np.asarray(vectors, dtype=np.float32)
+        if len(matrix) != len(chunks):
+            raise ValueError("vectors and chunks must be the same length")
+        if matrix.ndim != 2 or matrix.shape[1] != self.dimensions:
+            raise ValueError(
+                f"expected a 2D embedding matrix with {self.dimensions} columns"
+            )
+        return matrix
 
     # -- VectorStore interface -------------------------------------------
     @property
@@ -152,46 +363,50 @@ class PostgresVectorStore(VectorStore):
             return 0
 
     def add(self, vectors: np.ndarray, chunks: list[CodeChunk]) -> None:
-        """Buffer then bulk-insert. Batched because a per-chunk round trip
-        to a managed Postgres dominates indexing time entirely."""
-        if len(vectors) != len(chunks):
-            raise ValueError("vectors and chunks must be the same length")
+        """Insert vectors through one shared database session."""
+        vectors = self._validate_vectors(vectors, chunks)
         if not len(chunks):
             return
 
-        batch = 200
         with self._session() as conn:
-            for start in range(0, len(chunks), batch):
-                window = chunks[start:start + batch]
-                window_vectors = vectors[start:start + batch]
-                for vector, chunk in zip(window_vectors, window):
-                    values = [float(v) for v in vector]
-                    if self._pgvector:
-                        conn.run(
-                            "INSERT INTO ghic_repo_chunks "
-                            "(repo, path, language, kind, symbol, parent_symbol, "
-                            " start_line, end_line, text, embedding) "
-                            "VALUES (:repo, :path, :language, :kind, :symbol, :parent, "
-                            ":start, :end, :text, CAST(:embedding AS vector))",
-                            repo=chunk.repo or self.repo, path=chunk.path,
-                            language=chunk.language, kind=chunk.kind, symbol=chunk.symbol,
-                            parent=chunk.parent_symbol, start=chunk.start_line,
-                            end=chunk.end_line, text=chunk.text,
-                            embedding=json.dumps(values),
-                        )
-                    else:
-                        conn.run(
-                            "INSERT INTO ghic_repo_chunks "
-                            "(repo, path, language, kind, symbol, parent_symbol, "
-                            " start_line, end_line, text, embedding_json) "
-                            "VALUES (:repo, :path, :language, :kind, :symbol, :parent, "
-                            ":start, :end, :text, :embedding)",
-                            repo=chunk.repo or self.repo, path=chunk.path,
-                            language=chunk.language, kind=chunk.kind, symbol=chunk.symbol,
-                            parent=chunk.parent_symbol, start=chunk.start_line,
-                            end=chunk.end_line, text=chunk.text,
-                            embedding=json.dumps(values),
-                        )
+            if self._pgvector:
+                self._insert_pgvector_rows(conn, vectors, chunks)
+            else:
+                self._insert_json_rows(conn, vectors, chunks)
+
+    def _insert_pgvector_rows(
+        self, conn: Any, vectors: np.ndarray, chunks: list[CodeChunk]
+    ) -> None:
+        for vector, chunk in zip(vectors, chunks):
+            conn.run(
+                "INSERT INTO ghic_repo_chunks "
+                "(repo, path, language, kind, symbol, parent_symbol, "
+                " start_line, end_line, text, embedding) "
+                "VALUES (:repo, :path, :language, :kind, :symbol, :parent, "
+                ":start, :end, :text, CAST(:embedding AS vector))",
+                repo=chunk.repo or self.repo, path=chunk.path,
+                language=chunk.language, kind=chunk.kind, symbol=chunk.symbol,
+                parent=chunk.parent_symbol, start=chunk.start_line,
+                end=chunk.end_line, text=chunk.text,
+                embedding=json.dumps([float(v) for v in vector]),
+            )
+
+    def _insert_json_rows(
+        self, conn: Any, vectors: np.ndarray, chunks: list[CodeChunk]
+    ) -> None:
+        for vector, chunk in zip(vectors, chunks):
+            conn.run(
+                "INSERT INTO ghic_repo_chunks "
+                "(repo, path, language, kind, symbol, parent_symbol, "
+                " start_line, end_line, text, embedding_json) "
+                "VALUES (:repo, :path, :language, :kind, :symbol, :parent, "
+                ":start, :end, :text, :embedding)",
+                repo=chunk.repo or self.repo, path=chunk.path,
+                language=chunk.language, kind=chunk.kind, symbol=chunk.symbol,
+                parent=chunk.parent_symbol, start=chunk.start_line,
+                end=chunk.end_line, text=chunk.text,
+                embedding=json.dumps([float(v) for v in vector]),
+            )
 
     def search(self, query: np.ndarray, top_k: int) -> list[RetrievedChunk]:
         if top_k <= 0:
