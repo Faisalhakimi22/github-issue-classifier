@@ -690,6 +690,28 @@ class TestLedgerBackend:
         assert t2.summary()["confusion"]["tp"] == 1
         assert t2.summary()["awaiting_outcome"] == 1
 
+    def test_analysis_and_processing_failure_survive_restart(self):
+        from ghic.service.tracking import PredictionTracker
+
+        backend = _FakeLedgerBackend()
+        t1 = PredictionTracker(backend=backend)
+        t1.record_analysis("a/b", 7, {"title": "CSV import fails", "duration_ms": 12.5})
+        t1.record_processing_failure("a/b", 8, RuntimeError("provider unavailable\ntrace"))
+
+        assert backend.records[0]["type"] == "analysis"
+        assert backend.records[0]["repo"] == "a/b"
+        assert backend.records[0]["number"] == 7
+        assert backend.records[0]["at"]
+        assert backend.records[1]["type"] == "processing_failure"
+        assert backend.records[1]["message"] == "Issue processing did not complete."
+        assert "provider unavailable" not in backend.records[1]["message"]
+        assert "traceback" not in backend.records[1]
+
+        t2 = PredictionTracker(backend=backend)
+        summary = t2.summary()
+        assert summary["analyses_recorded"] == 1
+        assert summary["processing_failures"] == 1
+
     def test_database_url_takes_precedence_over_ledger_path(self, tmp_path, monkeypatch):
         from ghic.service import pg_ledger, tracking
 
@@ -1103,6 +1125,69 @@ def make_repo_context(**overrides):
 
 
 class TestRepositoryIntelligenceIntegration:
+    def test_successful_webhook_persists_sanitized_dashboard_analysis(self):
+        from ghic.service.tracking import PredictionTracker
+
+        backend = _FakeLedgerBackend()
+        app = create_app(
+            make_settings(dry_run=True),
+            predictor=StubPredictor(),
+            llm_service=StubLLMService(analysis=make_llm_analysis()),
+            repo_intelligence=StubRepoIntelligence(make_repo_context()),
+        )
+        app.state.tracker = PredictionTracker(backend=backend)
+        payload = issue_opened_payload(
+            html_url="https://github.com/acme/widgets/issues/42",
+            updated_at="2024-07-01T10:05:00Z",
+            labels=[{"name": "bug"}],
+        )
+        payload["repository"].update({
+            "html_url": "https://github.com/acme/widgets",
+            "private": True,
+            "default_branch": "main",
+        })
+        payload["sender"] = {"id": 99, "login": "alice"}
+
+        response = post_webhook(TestClient(app), payload)
+
+        assert response.status_code == 200
+        analysis = [record for record in backend.records if record["type"] == "analysis"]
+        assert len(analysis) == 1
+        record = analysis[0]
+        assert record["title"] == "App crashes on startup"
+        assert record["url"].endswith("/issues/42")
+        assert record["repository_private"] is True
+        assert record["prediction"]["proba_actionable_bug"] == 0.9
+        assert record["llm_analysis"]["priority"] == "high"
+        assert record["repository_evidence_status"] == "available"
+        assert record["repository_context"]["relevant_files"] == ["src/csv_parser.py"]
+        assert record["repository_context"]["chunks"][0]["symbol"] == "parse_csv"
+        assert "text" not in record["repository_context"]["chunks"][0]
+        assert "body" not in record
+        assert "comment" not in record
+        assert record["analysis_status"] == "complete"
+        assert record["needs_maintainer_review"] is True
+        assert record["duration_ms"] >= 0
+
+    def test_failed_webhook_records_failure_not_analysis(self):
+        from ghic.service.tracking import PredictionTracker
+
+        class BrokenPredictor(StubPredictor):
+            def predict(self, **kwargs):
+                raise RuntimeError("model unavailable")
+
+        backend = _FakeLedgerBackend()
+        app = create_app(make_settings(), predictor=BrokenPredictor())
+        app.state.tracker = PredictionTracker(backend=backend)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        response = post_webhook(client, issue_opened_payload())
+
+        assert response.status_code == 500
+        assert [record["type"] for record in backend.records] == ["processing_failure"]
+        assert backend.records[0]["repo"] == "acme/widgets"
+        assert backend.records[0]["number"] == 42
+
     def test_evidence_section_lists_retrieved_files(self):
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
                           threshold=0.5, predicted_label=1, model_name="stub")

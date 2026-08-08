@@ -100,6 +100,8 @@ class PredictionTracker:
         self.confusion = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
         self.actions = 0            # GitHub writes performed (audit records)
         self.label_events = 0       # maintainer label add/remove events observed
+        self.analyses = 0           # complete issue-processing lifecycle records
+        self.processing_failures = 0
         # Dashboard analytics, all rebuilt from the ledger on restart.
         # (Older ledger lines lack timestamps/related counts; they are
         # counted where possible and skipped from date-keyed facets.)
@@ -126,6 +128,10 @@ class PredictionTracker:
                 self.actions += 1
             elif rec.get("type") == "label_event":
                 self._note_label_event(rec)
+            elif rec.get("type") == "analysis":
+                self.analyses += 1
+            elif rec.get("type") == "processing_failure":
+                self.processing_failures += 1
             n += 1
         if n:
             logger.info("replayed %d ledger records (%s)", n, type(self._backend).__name__)
@@ -201,9 +207,52 @@ class PredictionTracker:
             self._note_label_event(rec)
             self._append(rec)
 
+    def record_analysis(
+        self, repo: str, number: int, analysis: dict[str, Any]
+    ) -> None:
+        """Persist one successful end-to-end issue analysis.
+
+        The caller supplies the deliberately reduced dashboard record.  The
+        tracker owns the immutable envelope so a caller cannot accidentally
+        change the event type, repository, issue number, or timestamp.
+        """
+        rec = dict(analysis)
+        rec.update({
+            "type": "analysis",
+            "repo": repo,
+            "number": number,
+            "at": _utcnow(),
+        })
+        with self._lock:
+            self.analyses += 1
+            self._append(rec)
+
+    def record_processing_failure(
+        self, repo: str, number: int, error: Exception, *, stage: str = "issue_analysis"
+    ) -> None:
+        """Persist a dashboard-safe failure event without a traceback."""
+        rec = {
+            "type": "processing_failure",
+            "repo": repo,
+            "number": number,
+            "stage": stage,
+            "error_type": type(error).__name__,
+            "message": "Issue processing did not complete.",
+            "at": _utcnow(),
+        }
+        with self._lock:
+            self.processing_failures += 1
+            self._append(rec)
+
     def record_outcome(self, repo: str, number: int, truth: int) -> bool:
         """Returns True when the outcome matched a tracked prediction."""
-        rec = {"type": "outcome", "repo": repo, "number": number, "truth": truth}
+        rec = {
+            "type": "outcome",
+            "repo": repo,
+            "number": number,
+            "truth": truth,
+            "at": _utcnow(),
+        }
         with self._lock:
             known = (repo, number) in self.pending
             self._note_outcome(rec)
@@ -272,6 +321,8 @@ class PredictionTracker:
             "awaiting_outcome": len(self.pending),
             "github_writes_audited": self.actions,
             "label_events_observed": self.label_events,
+            "analyses_recorded": self.analyses,
+            "processing_failures": self.processing_failures,
             "resolved": resolved,
             "confusion": dict(c),
             "live_precision": round(precision, 4) if precision is not None else None,

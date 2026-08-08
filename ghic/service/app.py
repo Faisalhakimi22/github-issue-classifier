@@ -683,6 +683,32 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
 
 
 def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one issue job and persist its complete, sanitized lifecycle."""
+    import time as _time
+
+    started = _time.perf_counter()
+    issue = payload.get("issue") or {}
+    repo = (payload.get("repository") or {}).get("full_name", "")
+    number = int(issue.get("number", 0))
+    try:
+        result = _process_issue_job_impl(app, payload)
+    except Exception as error:
+        try:
+            app.state.tracker.record_processing_failure(repo, number, error)
+        except Exception as ledger_error:
+            logger.warning("could not persist processing failure: %s", ledger_error)
+        raise
+
+    duration_ms = (_time.perf_counter() - started) * 1000
+    app.state.tracker.record_analysis(
+        repo,
+        number,
+        _dashboard_analysis_record(payload, result, duration_ms),
+    )
+    return result
+
+
+def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
     """The actual work: ML scoring, assistive heads, LLM analysis, and any
     GitHub writes. Runs inline when async processing is off (default) or
     QStash publish failed; runs from POST /internal/process-issue when
@@ -961,6 +987,117 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "automation": automation.as_dict() if automation else None,
             "actions": actions, "dry_run": s.dry_run}
+
+
+def _dashboard_analysis_record(
+    payload: dict[str, Any], result: dict[str, Any], duration_ms: float
+) -> dict[str, Any]:
+    """Reduce a processing result to durable, dashboard-safe evidence.
+
+    Issue bodies, retrieved source text, generated comments, credentials,
+    and provider errors are intentionally excluded.  Paths and symbols are
+    retained because they are the evidence the dashboard must be able to
+    audit after the webhook request has finished.
+    """
+    issue = payload.get("issue") or {}
+    repository = payload.get("repository") or {}
+    installation = payload.get("installation") or {}
+    sender = payload.get("sender") or {}
+    prediction = result.get("prediction") or {}
+    llm = result.get("llm_analysis") or None
+    context = result.get("repository_context") or None
+
+    evidence_status = "disabled"
+    persisted_context = None
+    if context is not None:
+        chunks = []
+        for chunk in (context.get("chunks") or [])[:10]:
+            chunks.append({
+                key: chunk.get(key)
+                for key in (
+                    "path", "language", "kind", "symbol", "parent_symbol",
+                    "start_line", "end_line", "source", "reference", "url", "score",
+                )
+                if chunk.get(key) not in (None, "")
+            })
+        note = str(context.get("note") or "")
+        if chunks:
+            evidence_status = "available"
+        elif note.startswith("Repository evidence unavailable:"):
+            evidence_status = "unavailable"
+        elif context.get("indexed"):
+            evidence_status = "insufficient"
+        else:
+            evidence_status = "not_indexed"
+        persisted_context = {
+            "indexed": bool(context.get("indexed")),
+            "indexing_queued": bool(context.get("indexing_queued")),
+            "note": note,
+            "relevant_files": list(context.get("relevant_files") or [])[:10],
+            "relevant_symbols": list(context.get("relevant_symbols") or [])[:10],
+            "chunks": chunks,
+        }
+
+    related = [
+        {
+            key: candidate.get(key)
+            for key in ("number", "title", "similarity")
+            if candidate.get(key) not in (None, "")
+        }
+        for candidate in (result.get("related_issues") or [])[:10]
+    ]
+    missing_information = list((llm or {}).get("missing_information") or [])
+    review_reasons = []
+    if result.get("llm_ml_disagreement"):
+        review_reasons.append("classifier and AI analysis disagree")
+    if missing_information:
+        review_reasons.append("reported issue is missing requested information")
+    if llm is None:
+        review_reasons.append("AI reasoning was unavailable")
+    if evidence_status == "unavailable":
+        review_reasons.append("repository retrieval was unavailable")
+
+    labels = [
+        str(label.get("name") if isinstance(label, dict) else label)
+        for label in (issue.get("labels") or [])
+        if (label.get("name") if isinstance(label, dict) else label)
+    ]
+    actions = [str(action) for action in (result.get("actions") or [])]
+
+    return {
+        "title": str(issue.get("title") or "")[:500],
+        "url": str(issue.get("html_url") or ""),
+        "issue_state": str(issue.get("state") or "open"),
+        "issue_created_at": issue.get("created_at"),
+        "issue_updated_at": issue.get("updated_at"),
+        "labels": labels[:30],
+        "repository_url": str(repository.get("html_url") or ""),
+        "repository_private": repository.get("private"),
+        "default_branch": str(repository.get("default_branch") or ""),
+        "installation_id": installation.get("id"),
+        "sender_github_id": sender.get("id"),
+        "prediction": {
+            key: prediction.get(key)
+            for key in (
+                "proba_actionable_bug", "threshold", "predicted_label",
+                "predicted_class", "model",
+            )
+            if prediction.get(key) is not None
+        },
+        "category": result.get("category"),
+        "llm_analysis": llm,
+        "llm_ml_disagreement": bool(result.get("llm_ml_disagreement")),
+        "repository_context": persisted_context,
+        "repository_evidence_status": evidence_status,
+        "related_issues": related,
+        "actions": actions,
+        "comment_posted": "comment" in actions,
+        "analysis_status": "complete" if llm is not None else "scored_only",
+        "needs_maintainer_review": bool(review_reasons),
+        "review_reasons": review_reasons,
+        "duration_ms": round(duration_ms, 1),
+        "dry_run": bool(result.get("dry_run")),
+    }
 
 
 # ---------------------------------------------------------------------------
