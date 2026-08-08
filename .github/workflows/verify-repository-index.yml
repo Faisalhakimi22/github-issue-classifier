@@ -85,11 +85,15 @@ jobs:
               )}
           
               columns = rows(conn, """
-                  SELECT table_name, column_name, data_type
-                  FROM information_schema.columns
-                  WHERE table_schema = 'public'
-                    AND table_name IN ('ghic_repository_state', 'ghic_repo_chunks')
-                  ORDER BY table_name, ordinal_position
+                  SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod)
+                  FROM pg_attribute a
+                  JOIN pg_class c ON c.oid = a.attrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'public'
+                    AND c.relname IN ('ghic_repository_state', 'ghic_repo_chunks')
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                  ORDER BY c.relname, a.attnum
               """)
               report["columns"] = [
                   {"table": row[0], "column": row[1], "type": row[2]} for row in columns
@@ -124,8 +128,73 @@ jobs:
                       }
                   else:
                       report["state"] = None
+
+                  report["repository_states"] = []
+                  for state_repo, state_value, raw, updated_at in rows(conn, """
+                      SELECT repo, state, data, updated_at
+                      FROM ghic_repository_state
+                      ORDER BY repo
+                  """):
+                      data = json.loads(raw) if isinstance(raw, str) else raw
+                      report["repository_states"].append({
+                          "repo": state_repo,
+                          "state": state_value,
+                          "updated_at": updated_at.isoformat(),
+                          "indexed_commit_sha": data.get("indexed_commit_sha", ""),
+                          "embedding_provider": data.get("embedding_provider", ""),
+                          "embedding_model": data.get("embedding_model", ""),
+                          "embedding_dimensions": data.get("embedding_dimensions", 0),
+                          "embedding_signature": data.get("embedding_signature", ""),
+                          "vector_backend": data.get("vector_backend", ""),
+                          "chunk_count": data.get("chunk_count", 0),
+                      })
           
               if "ghic_repo_chunks" in tables:
+                  report["pgvector_extension"] = [
+                      {"name": row[0], "version": row[1]}
+                      for row in rows(conn, """
+                          SELECT extname, extversion
+                          FROM pg_extension
+                          WHERE extname = 'vector'
+                      """)
+                  ]
+                  report["chunk_indexes"] = [
+                      {"name": row[0], "definition": row[1]}
+                      for row in rows(conn, """
+                          SELECT indexname, indexdef
+                          FROM pg_indexes
+                          WHERE schemaname = 'public'
+                            AND tablename = 'ghic_repo_chunks'
+                          ORDER BY indexname
+                      """)
+                  ]
+                  chunk_column_names = {
+                      item["column"]
+                      for item in report["columns"]
+                      if item["table"] == "ghic_repo_chunks"
+                  }
+                  if "embedding" in chunk_column_names:
+                      report["vector_storage_by_repository"] = [
+                          {
+                              "repo": row[0],
+                              "rows": row[1],
+                              "pgvector_rows": row[2],
+                              "minimum_dimensions": row[3],
+                              "maximum_dimensions": row[4],
+                              "json_rows": row[5],
+                          }
+                          for row in rows(conn, """
+                              SELECT repo,
+                                     count(*),
+                                     count(embedding),
+                                     min(vector_dims(embedding)),
+                                     max(vector_dims(embedding)),
+                                     count(embedding_json)
+                              FROM ghic_repo_chunks
+                              GROUP BY repo
+                              ORDER BY repo
+                          """)
+                      ]
                   total = rows(
                       conn,
                       "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo",
