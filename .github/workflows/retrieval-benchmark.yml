@@ -100,6 +100,13 @@ jobs:
                   --input issues.csv --output labeled.csv` raises UnicodeDecodeError on
                   byte 0x96. Converting the same file to UTF-8 makes the command work.""",
               ),
+              (
+                  "Android QR scanner preview freezes after device rotation",
+                  """The React Native mobile client stops receiving CameraX frames after
+                  rotating a Pixel 8 from portrait to landscape. Logs report that the
+                  SurfaceRequest was cancelled and ImageAnalysis has no active surface.
+                  Reopening the scanner restores the preview; iOS is unaffected.""",
+              ),
           ]
 
           EXPECTED_TERMS = {
@@ -124,6 +131,10 @@ jobs:
               "Windows-1252 CSV crash": {
                   "csv", "windows", "1252", "unicode", "unicodedecodeerror",
                   "decode", "encoding", "utf", "read", "reader",
+              },
+              "Android QR scanner preview freezes after device rotation": {
+                  "android", "qr", "scanner", "camera", "camerax", "surface",
+                  "react", "native", "rotation", "portrait", "landscape",
               },
           }
 
