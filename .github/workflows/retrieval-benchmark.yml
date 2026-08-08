@@ -87,12 +87,19 @@ jobs:
           )
           from ghic.repository_intelligence.state import RepositoryRecord
 
-          QUERIES = [
-              "webhook signature verification fails",
-              "CSV import UnicodeDecodeError",
-              "GitHub issue classification prediction",
-              "duplicate issue detection",
-              "repository indexing",
+          QUERY_CASES = [
+              ("webhook signature verification fails", ""),
+              ("CSV import UnicodeDecodeError", ""),
+              ("GitHub issue classification prediction", ""),
+              ("duplicate issue detection", ""),
+              ("repository indexing", ""),
+              (
+                  "Windows-1252 CSV crash",
+                  """The labeling CLI crashes before processing rows when its input CSV
+                  was exported using Windows-1252. Running `python -m ghic.label
+                  --input issues.csv --output labeled.csv` raises UnicodeDecodeError on
+                  byte 0x96. Converting the same file to UTF-8 makes the command work.""",
+              ),
           ]
 
           EXPECTED_TERMS = {
@@ -113,6 +120,10 @@ jobs:
               "repository indexing": {
                   "repository", "repo_index", "index", "indexing", "index_repository",
                   "repositoryindexer", "repository_intelligence", "vector",
+              },
+              "Windows-1252 CSV crash": {
+                  "csv", "windows", "1252", "unicode", "unicodedecodeerror",
+                  "decode", "encoding", "utf", "read", "reader",
               },
           }
 
@@ -314,11 +325,12 @@ jobs:
                   ),
               )
               query_reports = []
-              for query in QUERIES:
+              for query, issue_body in QUERY_CASES:
                   store.search_calls.clear()
-                  retrieved = retriever.retrieve(store, query, "", top_k=5)
+                  query_text = build_query(query, issue_body)
+                  retrieved = retriever.retrieve(store, query, issue_body, top_k=5)
                   retrieval_candidates = store.search_calls[-1] if store.search_calls else []
-                  query_vector = embedder.embed_query(build_query(query, ""))
+                  query_vector = embedder.embed_query(query_text)
                   raw_candidates = store.search(query_vector, 100)
                   selected_ids = {item.chunk.chunk_id for item in retrieved}
 
@@ -333,8 +345,8 @@ jobs:
                           "above_floor": item.score >= retriever.cfg.min_similarity,
                           "in_current_candidate_pool": rank <= 15,
                           "selected": item.chunk.chunk_id in selected_ids,
-                          "matched_terms": matched_terms(query, item.chunk),
-                          "snippet": snippet(item.chunk.text, query),
+                          "matched_terms": matched_terms(query_text, item.chunk),
+                          "snippet": snippet(item.chunk.text, query_text),
                       }
 
                   results = []
@@ -351,13 +363,13 @@ jobs:
                           "start_line": item.chunk.start_line,
                           "end_line": item.chunk.end_line,
                           "score": round(item.score, 6),
-                          "matched_terms": matched_terms(query, item.chunk),
+                          "matched_terms": matched_terms(query_text, item.chunk),
                           "relevant": relevant,
                           "relevance_note": (
                               "matched expected issue/code concepts"
                               if relevant else "false positive or only adjacent by heuristic"
                           ),
-                          "snippet": snippet(item.chunk.text, query),
+                          "snippet": snippet(item.chunk.text, query_text),
                       })
                   relevant_impl_files = {
                       r["path"] for r in results
@@ -365,7 +377,8 @@ jobs:
                   }
                   query_reports.append({
                       "query": query,
-                      "built_query": build_query(query, ""),
+                      "built_query": query_text,
+                      "issue_body_chars": len(issue_body),
                       "passed_retrieval_floor": bool(results),
                       "relevant_implementation_files_in_top_5": len(relevant_impl_files),
                       "tests_in_top_5": sum(1 for r in results if r["source_type"] == "test"),
