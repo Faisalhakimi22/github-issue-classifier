@@ -305,6 +305,25 @@ jobs:
               query_reports = []
               for query in QUERIES:
                   retrieved = retriever.retrieve(store, query, "", top_k=5)
+                  query_vector = embedder.embed_query(build_query(query, ""))
+                  raw_candidates = store.search(query_vector, 100)
+                  selected_ids = {item.chunk.chunk_id for item in retrieved}
+
+                  def diagnostic_candidate(rank: int, item: RetrievedChunk) -> dict[str, Any]:
+                      return {
+                          "raw_rank": rank,
+                          "path": item.chunk.path,
+                          "chunk_kind": item.chunk.kind,
+                          "source_type": chunk_type(item.chunk),
+                          "symbol": item.chunk.qualified_symbol,
+                          "score": round(item.score, 6),
+                          "above_floor": item.score >= retriever.cfg.min_similarity,
+                          "in_current_candidate_pool": rank <= 15,
+                          "selected": item.chunk.chunk_id in selected_ids,
+                          "matched_terms": matched_terms(query, item.chunk),
+                          "snippet": snippet(item.chunk.text, query),
+                      }
+
                   results = []
                   for rank, item in enumerate(retrieved, start=1):
                       ctype = chunk_type(item.chunk)
@@ -341,6 +360,18 @@ jobs:
                           1 for r in results if r["source_type"] == "documentation"
                       ),
                       "top_results": results,
+                      "diagnostics": {
+                          "current_candidate_pool_size": 15,
+                          "raw_top_15": [
+                              diagnostic_candidate(rank, item)
+                              for rank, item in enumerate(raw_candidates[:15], start=1)
+                          ],
+                          "implementation_candidates_in_raw_top_100": [
+                              diagnostic_candidate(rank, item)
+                              for rank, item in enumerate(raw_candidates, start=1)
+                              if chunk_type(item.chunk) == "implementation"
+                          ][:20],
+                      },
                   })
               return {
                   "provider_label": name,
