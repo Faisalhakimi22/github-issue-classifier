@@ -190,6 +190,10 @@ _TEST_PATH_RE = re.compile(
 # matching implementation, which is the correct outcome when the issue is
 # genuinely about the test suite.
 _TEST_RANK_FACTOR = 0.75
+# Documentation is useful evidence, but issue text and prose naturally use
+# the same vocabulary. A small prior lets similarly relevant executable code
+# lead without overriding a materially stronger documentation match.
+_PROSE_RANK_FACTOR = 0.95
 
 
 def _ranking_score(rc: RetrievedChunk) -> float:
@@ -204,6 +208,8 @@ def _ranking_score(rc: RetrievedChunk) -> float:
         return score * recency_weight(rc.chunk.timestamp)
     if _TEST_PATH_RE.search(rc.chunk.path.lower()):
         return score * _TEST_RANK_FACTOR
+    if rc.chunk.language in _PROSE_LANGUAGES:
+        return score * _PROSE_RANK_FACTOR
     return score
 
 

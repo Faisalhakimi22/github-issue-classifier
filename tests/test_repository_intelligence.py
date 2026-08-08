@@ -629,6 +629,19 @@ class TestRetrieval:
             RetrievedChunk(
                 CodeChunk(
                     repo="acme/demo",
+                    path="docs/importing.md",
+                    language="Markdown",
+                    text="# CSV imports\nUnicode errors can occur during import.",
+                    start_line=1,
+                    end_line=2,
+                    kind="section",
+                    symbol="CSV imports",
+                ),
+                0.56,
+            ),
+            RetrievedChunk(
+                CodeChunk(
+                    repo="acme/demo",
                     path="ghic/collect.py",
                     language="Python",
                     text="def read_csv(path): return path.read_text(encoding='utf-8')",
@@ -649,12 +662,13 @@ class TestRetrieval:
 
         retriever = SemanticRetriever(
             HashingEmbeddingProvider(8),
-            RepositoryIntelligenceConfig(min_similarity=0.15, top_k=2),
+            RepositoryIntelligenceConfig(min_similarity=0.15, top_k=3),
         )
         results = retriever.retrieve(CandidateStore(), "CSV import UnicodeDecodeError", "")
 
         assert [item.chunk.path for item in results] == [
             "ghic/collect.py",
+            "docs/importing.md",
             "tests/test_import.py",
         ]
 
