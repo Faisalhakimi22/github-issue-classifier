@@ -167,6 +167,7 @@ jobs:
                       return []
                   if self._has_pgvector:
                       with session(database_url) as conn:
+                          conn.run("SET ivfflat.probes = 10")
                           result = rows(conn, """
                               SELECT path, language, kind, symbol, parent_symbol,
                                      start_line, end_line, text,

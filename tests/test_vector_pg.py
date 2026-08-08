@@ -125,6 +125,22 @@ def test_regular_store_rejects_incompatible_pgvector_dimension(monkeypatch):
                    for sql in connection.statements)
 
 
+def test_pgvector_search_uses_sqrt_list_probe_count(monkeypatch):
+    connection = FakeConnection(1536, {"acme/demo": 1})
+    use_connection(monkeypatch, connection)
+    store = PostgresVectorStore("postgresql://test", "acme/demo", 1536)
+
+    assert store.search(np.zeros(1536, dtype=np.float32), top_k=5) == []
+
+    probe = "SET ivfflat.probes = 10"
+    search = next(
+        sql for sql in connection.statements
+        if "ORDER BY embedding <=> CAST(:q AS vector)" in sql
+    )
+    assert probe in connection.statements
+    assert connection.statements.index(probe) < connection.statements.index(search)
+
+
 def test_full_replace_requires_explicit_dimension_migration(monkeypatch):
     connection = FakeConnection(512, {"acme/demo": 1})
     use_connection(monkeypatch, connection)

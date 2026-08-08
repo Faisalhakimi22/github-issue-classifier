@@ -19,6 +19,8 @@ from ghic.repository_intelligence import (
     NumpyVectorStore,
     RepositoryIntelligenceConfig,
     RepositoryIntelligenceService,
+    RetrievedChunk,
+    SemanticRetriever,
     build_query,
 )
 from ghic.repository_intelligence.cache import IndexCache
@@ -608,6 +610,53 @@ class TestRetrieval:
         service.index_local_path("acme/demo", repo)
         context = service.get_context("acme/demo", "csv parser encoding", "")
         assert all(rc.score >= service.cfg.min_similarity for rc in context.chunks)
+
+    def test_prefers_implementation_without_discarding_test_evidence(self):
+        candidates = [
+            RetrievedChunk(
+                CodeChunk(
+                    repo="acme/demo",
+                    path="tests/test_import.py",
+                    language="Python",
+                    text="def test_csv_import_unicode_error(): pass",
+                    start_line=1,
+                    end_line=1,
+                    kind="function",
+                    symbol="test_csv_import_unicode_error",
+                ),
+                0.62,
+            ),
+            RetrievedChunk(
+                CodeChunk(
+                    repo="acme/demo",
+                    path="ghic/collect.py",
+                    language="Python",
+                    text="def read_csv(path): return path.read_text(encoding='utf-8')",
+                    start_line=10,
+                    end_line=11,
+                    kind="function",
+                    symbol="read_csv",
+                ),
+                0.54,
+            ),
+        ]
+
+        class CandidateStore:
+            size = len(candidates)
+
+            def search(self, query, top_k):
+                return candidates[:top_k]
+
+        retriever = SemanticRetriever(
+            HashingEmbeddingProvider(8),
+            RepositoryIntelligenceConfig(min_similarity=0.15, top_k=2),
+        )
+        results = retriever.retrieve(CandidateStore(), "CSV import UnicodeDecodeError", "")
+
+        assert [item.chunk.path for item in results] == [
+            "ghic/collect.py",
+            "tests/test_import.py",
+        ]
 
 
 # ---------------------------------------------------------------------------

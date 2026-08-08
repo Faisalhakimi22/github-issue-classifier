@@ -66,10 +66,16 @@ _CREATE_INDEXES = (
     "ON ghic_repo_chunks (repo, path)",
 )
 
+_IVFFLAT_LISTS = 100
+# pgvector's default is one probe, which searches roughly one list and can
+# return a short, unstable candidate set before application reranking. Its
+# documented starting point is sqrt(lists): 10 probes for this 100-list index.
+_IVFFLAT_PROBES = 10
+
 _CREATE_VECTOR_INDEX = (
     "CREATE INDEX IF NOT EXISTS ghic_repo_chunks_embedding_idx "
     "ON ghic_repo_chunks USING ivfflat (embedding vector_cosine_ops) "
-    "WITH (lists = 100)"
+    f"WITH (lists = {_IVFFLAT_LISTS})"
 )
 
 
@@ -424,6 +430,9 @@ class PostgresVectorStore(VectorStore):
         # are unit-normalized by the embedding provider, so this matches
         # NumpyVectorStore's dot product exactly.
         with self._session() as conn:
+            # A search connection is dedicated to this operation, so a
+            # session-scoped setting cannot leak into another request.
+            conn.run(f"SET ivfflat.probes = {_IVFFLAT_PROBES}")
             rows = conn.run(
                 "SELECT path, language, kind, symbol, parent_symbol, start_line, "
                 "       end_line, text, 1 - (embedding <=> CAST(:q AS vector)) AS score "
