@@ -67,7 +67,17 @@ jobs:
                   status = response.status
                   payload = json.load(response)
           except urllib.error.HTTPError as exc:
-              raise SystemExit(f"OpenRouter embeddings request failed with HTTP {exc.code}") from exc
+              try:
+                  error_payload = json.loads(exc.read().decode("utf-8"))
+                  error = error_payload.get("error", {})
+                  detail = error.get("message") or error.get("metadata") or ""
+              except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                  detail = ""
+              safe_detail = str(detail).replace(api_key, "***")[:500]
+              suffix = f": {safe_detail}" if safe_detail else ""
+              raise SystemExit(
+                  f"OpenRouter embeddings request failed with HTTP {exc.code}{suffix}"
+              ) from exc
 
           data = payload.get("data")
           if status != 200 or not isinstance(data, list) or len(data) != 1:
