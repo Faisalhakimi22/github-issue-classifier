@@ -1,0 +1,91 @@
+name: Embedding smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GHIC_REPO_INTEL_EMBEDDING_PROVIDER: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_PROVIDER }}
+      GHIC_REPO_INTEL_EMBEDDING_MODEL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_MODEL }}
+      GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS }}
+      GHIC_REPO_INTEL_EMBEDDING_BASE_URL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_BASE_URL }}
+      GHIC_REPO_INTEL_EMBEDDING_API_KEY: ${{ secrets.GHIC_REPO_INTEL_EMBEDDING_API_KEY }}
+
+    steps:
+      - name: Verify OpenRouter Codestral embedding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          provider = os.environ.get("GHIC_REPO_INTEL_EMBEDDING_PROVIDER", "")
+          model = os.environ.get("GHIC_REPO_INTEL_EMBEDDING_MODEL", "")
+          dimensions = int(os.environ.get("GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS", "0"))
+          base_url = os.environ.get("GHIC_REPO_INTEL_EMBEDDING_BASE_URL", "").rstrip("/")
+          api_key = os.environ.get("GHIC_REPO_INTEL_EMBEDDING_API_KEY", "")
+
+          expected_model = "mistralai/codestral-embed-2505"
+          expected_base_url = "https://openrouter.ai/api/v1"
+          if provider != "openai":
+              raise SystemExit(f"expected provider=openai, got {provider!r}")
+          if model != expected_model:
+              raise SystemExit(f"expected model={expected_model}, got {model!r}")
+          if dimensions != 512:
+              raise SystemExit(f"expected dimensions=512, got {dimensions}")
+          if base_url != expected_base_url:
+              raise SystemExit(f"expected base URL={expected_base_url}, got {base_url!r}")
+          if not api_key:
+              raise SystemExit("GHIC_REPO_INTEL_EMBEDDING_API_KEY is not configured")
+
+          body = json.dumps({
+              "model": model,
+              "input": ["Find the code that verifies a GitHub webhook signature."],
+              "dimensions": dimensions,
+          }).encode("utf-8")
+          request = urllib.request.Request(
+              f"{base_url}/embeddings",
+              data=body,
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  status = response.status
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              raise SystemExit(f"OpenRouter embeddings request failed with HTTP {exc.code}") from exc
+
+          data = payload.get("data")
+          if status != 200 or not isinstance(data, list) or len(data) != 1:
+              raise SystemExit("OpenRouter returned an unexpected embeddings response")
+          vector = data[0].get("embedding")
+          if not isinstance(vector, list):
+              raise SystemExit("OpenRouter response did not contain an embedding vector")
+          if len(vector) != dimensions:
+              raise SystemExit(
+                  f"expected a {dimensions}-dimension embedding, got {len(vector)}"
+              )
+
+          print(json.dumps({
+              "status": "ok",
+              "provider": "OpenRouter",
+              "model": model,
+              "requested_dimensions": dimensions,
+              "returned_dimensions": len(vector),
+              "response_model": payload.get("model", ""),
+          }, sort_keys=True))
+          PY
