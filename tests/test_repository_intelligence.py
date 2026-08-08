@@ -26,7 +26,7 @@ from ghic.repository_intelligence import (
 from ghic.repository_intelligence.cache import IndexCache
 from ghic.repository_intelligence.embeddings import EmbeddingError, tokenize
 from ghic.repository_intelligence.indexer import RepositoryIndexer
-from ghic.repository_intelligence.models import EMPTY_CONTEXT_NOTE
+from ghic.repository_intelligence.models import EMPTY_CONTEXT_NOTE, UNAVAILABLE_CONTEXT_NOTE
 from ghic.repository_intelligence.parser import (
     chunk_file,
     detect_metadata,
@@ -733,7 +733,7 @@ class TestFallback:
         context = service.get_context("acme/never-indexed", "anything", "")
         assert context.is_empty
         assert not context.indexed
-        assert context.note == EMPTY_CONTEXT_NOTE
+        assert context.note == UNAVAILABLE_CONTEXT_NOTE
 
     def test_unindexed_repo_queues_indexing_when_a_scheduler_exists(self, cfg):
         queued: list[str] = []

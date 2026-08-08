@@ -286,11 +286,23 @@ class RepositoryIntelligenceConfig:
     def from_env(cls) -> RepositoryIntelligenceConfig:
         """Build from GHIC_REPO_INTEL_* environment variables.
 
-        The embedding key follows the existing convention of matching the
-        provider's own variable name (OPENAI_API_KEY, like GROQ_API_KEY in
-        settings.py) so a key already set for another tool works here.
+        The dedicated GHIC key wins, then the standard OpenAI-compatible
+        provider's own variable name. An existing OpenRouter key is reused
+        only when the configured endpoint is OpenRouter, so an LLM key is
+        never sent to an unrelated embeddings host.
         """
         cache_dir = os.environ.get("GHIC_REPO_INTEL_CACHE_DIR", "")
+        embedding_base_url = os.environ.get(
+            "GHIC_REPO_INTEL_EMBEDDING_BASE_URL", cls.embedding_base_url
+        )
+        endpoint_api_key = (
+            os.environ.get("OPENROUTER_API_KEY", "")
+            if "openrouter.ai" in embedding_base_url.lower()
+            else os.environ.get("OPENAI_API_KEY", "")
+        )
+        embedding_api_key = (
+            os.environ.get("GHIC_REPO_INTEL_EMBEDDING_API_KEY") or endpoint_api_key
+        )
         return cls(
             cache_dir=Path(cache_dir) if cache_dir else utils.DATA_RAW / "repo_intel",
             max_files=_env_int("GHIC_REPO_INTEL_MAX_FILES", cls.max_files),
@@ -303,13 +315,8 @@ class RepositoryIntelligenceConfig:
             embedding_model=os.environ.get(
                 "GHIC_REPO_INTEL_EMBEDDING_MODEL", cls.embedding_model
             ),
-            embedding_api_key=(
-                os.environ.get("GHIC_REPO_INTEL_EMBEDDING_API_KEY")
-                or os.environ.get("OPENAI_API_KEY", "")
-            ),
-            embedding_base_url=os.environ.get(
-                "GHIC_REPO_INTEL_EMBEDDING_BASE_URL", cls.embedding_base_url
-            ),
+            embedding_api_key=embedding_api_key,
+            embedding_base_url=embedding_base_url,
             embedding_dimensions=_env_int(
                 "GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS", cls.embedding_dimensions
             ),

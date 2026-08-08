@@ -18,6 +18,8 @@ from ghic.repository_intelligence import (
     RepositoryIntelligenceConfig,
     RepositoryIntelligenceService,
     RepositoryState,
+    UNAVAILABLE_CONTEXT_NOTE,
+    build_embedding_provider,
 )
 from ghic.repository_intelligence.config import (
     ephemeral_filesystem,
@@ -42,6 +44,45 @@ from ghic.repository_intelligence.state import (
     MemoryStateStore,
     RepositoryRecord,
 )
+
+
+def test_openrouter_embedding_config_reuses_existing_openrouter_key(monkeypatch):
+    monkeypatch.setenv("GHIC_REPO_INTEL_EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv(
+        "GHIC_REPO_INTEL_EMBEDDING_MODEL", "mistralai/codestral-embed-2505"
+    )
+    monkeypatch.setenv("GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS", "1536")
+    monkeypatch.setenv(
+        "GHIC_REPO_INTEL_EMBEDDING_BASE_URL", "https://openrouter.ai/api/v1"
+    )
+    monkeypatch.setenv("GHIC_REPO_AUTO_INDEX", "false")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "existing-openrouter-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "key-for-a-different-endpoint")
+    monkeypatch.delenv("GHIC_REPO_INTEL_EMBEDDING_API_KEY", raising=False)
+
+    cfg = RepositoryIntelligenceConfig.from_env()
+
+    assert cfg.embedding_api_key == "existing-openrouter-key"
+    assert cfg.embedding_provider == "openai"
+    assert cfg.embedding_model == "mistralai/codestral-embed-2505"
+    assert cfg.embedding_dimensions == 1536
+    assert (
+        build_embedding_provider(cfg).metadata().signature
+        == "openai:mistralai/codestral-embed-2505:1536"
+    )
+    assert cfg.auto_index is False
+
+
+def test_openrouter_key_is_not_used_for_other_embedding_endpoints(monkeypatch):
+    monkeypatch.setenv("GHIC_REPO_INTEL_EMBEDDING_PROVIDER", "openai")
+    monkeypatch.setenv(
+        "GHIC_REPO_INTEL_EMBEDDING_BASE_URL", "https://api.openai.com/v1"
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "llm-only-key")
+    monkeypatch.delenv("GHIC_REPO_INTEL_EMBEDDING_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    assert RepositoryIntelligenceConfig.from_env().embedding_api_key == ""
 
 
 @pytest.fixture
@@ -529,11 +570,19 @@ class TestServiceLifecycle:
         new_cfg = RepositoryIntelligenceConfig(
             cache_dir=tmp_path / "old", embedding_dimensions=128, auto_index=False
         )
-        new_service = RepositoryIntelligenceService(new_cfg, state_store=state_store)
+        queued: list[str] = []
+        new_service = RepositoryIntelligenceService(
+            new_cfg,
+            state_store=state_store,
+            index_scheduler=lambda name: queued.append(name) or True,
+        )
         context = new_service.get_context("acme/demo", "handler request", "")
 
         assert context.is_empty
         assert not context.indexed
+        assert context.note == UNAVAILABLE_CONTEXT_NOTE
+        assert state_store.get("acme/demo").state == RepositoryState.READY
+        assert queued == []
 
     def test_index_repository_forces_full_rebuild_when_embedding_changes(self, repo, cfg):
         from ghic.repository_intelligence.cache import Checkout

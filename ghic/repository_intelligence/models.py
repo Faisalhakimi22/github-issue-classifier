@@ -208,7 +208,7 @@ class RepositoryContext:
     prompt gets no repository section at all and the comment says so
     plainly, rather than either side inventing filler. An unindexed repo, a
     failed index, and a repo where nothing scored above the similarity
-    floor all collapse to the same honest answer.
+    floor all produce an explicit, non-speculative answer.
     """
     repo: str
     metadata: RepositoryMetadata | None = None
@@ -260,3 +260,7 @@ class RepositoryContext:
 
 
 EMPTY_CONTEXT_NOTE = "No directly related source files were confidently identified."
+UNAVAILABLE_CONTEXT_NOTE = (
+    "Repository evidence unavailable: repository intelligence could not retrieve "
+    "indexed code. This analysis is based on the issue description only."
+)

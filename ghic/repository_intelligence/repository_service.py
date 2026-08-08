@@ -204,8 +204,11 @@ class RepositoryIntelligenceService:
     ) -> RepositoryContext:
         queued = self._request_indexing(repo, record, reason)
         logger.info("no repository index for %s (%s); queued=%s", repo, reason, queued)
+        from .models import UNAVAILABLE_CONTEXT_NOTE
+
         return RepositoryContext(
-            repo=repo, indexed=False, indexing_queued=queued, note=EMPTY_CONTEXT_NOTE,
+            repo=repo, indexed=False, indexing_queued=queued,
+            note=UNAVAILABLE_CONTEXT_NOTE,
         )
 
     def _request_indexing(

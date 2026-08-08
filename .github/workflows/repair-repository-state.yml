@@ -1,0 +1,188 @@
+name: Repair repository state
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository whose existing verified state row should be repaired."
+        required: true
+        type: string
+      expected_sha:
+        description: "Indexed commit SHA that must already be stored."
+        required: true
+        type: string
+      expected_chunks:
+        description: "Exact existing vector row count."
+        required: true
+        type: string
+      expected_provider:
+        description: "Existing embedding provider."
+        required: true
+        default: "openai"
+        type: string
+      expected_model:
+        description: "Existing embedding model."
+        required: true
+        default: "mistralai/codestral-embed-2505"
+        type: string
+      expected_dimensions:
+        description: "Exact existing vector dimension."
+        required: true
+        default: "1536"
+        type: string
+      confirm:
+        description: "Repair only after every compatibility guard passes."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      GHIC_REPAIR_REPOSITORY: ${{ inputs.repo }}
+      GHIC_REPAIR_EXPECTED_SHA: ${{ inputs.expected_sha }}
+      GHIC_REPAIR_EXPECTED_CHUNKS: ${{ inputs.expected_chunks }}
+      GHIC_REPAIR_EXPECTED_PROVIDER: ${{ inputs.expected_provider }}
+      GHIC_REPAIR_EXPECTED_MODEL: ${{ inputs.expected_model }}
+      GHIC_REPAIR_EXPECTED_DIMENSIONS: ${{ inputs.expected_dimensions }}
+      GHIC_REPAIR_CONFIRMED: ${{ inputs.confirm }}
+
+    steps:
+      - name: Checkout GHIC
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Postgres client
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Repair verified state row only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import time
+
+          from ghic._pg import session
+
+          if os.environ.get("GHIC_REPAIR_CONFIRMED", "").lower() != "true":
+              raise SystemExit("confirm must be true")
+
+          repo = os.environ["GHIC_REPAIR_REPOSITORY"]
+          expected_sha = os.environ["GHIC_REPAIR_EXPECTED_SHA"]
+          expected_chunks = int(os.environ["GHIC_REPAIR_EXPECTED_CHUNKS"])
+          expected_provider = os.environ["GHIC_REPAIR_EXPECTED_PROVIDER"]
+          expected_model = os.environ["GHIC_REPAIR_EXPECTED_MODEL"]
+          expected_dimensions = int(os.environ["GHIC_REPAIR_EXPECTED_DIMENSIONS"])
+          database_url = (
+              os.environ.get("GHIC_DATABASE_URL")
+              or os.environ.get("DATABASE_URL")
+              or os.environ.get("POSTGRES_URL")
+          )
+          if not database_url:
+              raise SystemExit("missing DATABASE_URL/GHIC_DATABASE_URL/POSTGRES_URL")
+
+
+          def vector_fingerprint(conn):
+              rows = conn.run("""
+                  SELECT count(*), count(embedding), count(embedding_json),
+                         min(vector_dims(embedding)), max(vector_dims(embedding)),
+                         min(id), max(id), sum(id),
+                         md5(string_agg(
+                             id::text || ':' || path || ':' || start_line::text || ':' || end_line::text,
+                             ',' ORDER BY id
+                         ))
+                  FROM ghic_repo_chunks
+                  WHERE repo = :repo
+              """, repo=repo)
+              return tuple(rows[0])
+
+
+          with session(database_url) as conn:
+              conn.run("BEGIN")
+              try:
+                  rows = conn.run(
+                      "SELECT state, data FROM ghic_repository_state "
+                      "WHERE repo = :repo FOR UPDATE",
+                      repo=repo,
+                  )
+                  if not rows:
+                      raise RuntimeError("repository state row does not exist")
+                  state, raw = rows[0]
+                  data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                  signature = (
+                      f"{data.get('embedding_provider', '')}:"
+                      f"{data.get('embedding_model', '')}:"
+                      f"{int(data.get('embedding_dimensions', 0) or 0)}"
+                  )
+                  expected_signature = (
+                      f"{expected_provider}:{expected_model}:{expected_dimensions}"
+                  )
+                  guards = {
+                      "state_is_failed": state == "failed" and data.get("state") == "failed",
+                      "sha_matches": data.get("indexed_commit_sha") == expected_sha,
+                      "signature_matches": signature == expected_signature,
+                      "metadata_chunk_count_matches": int(data.get("chunk_count", 0)) == expected_chunks,
+                      "vector_backend_is_postgres": data.get("vector_backend") == "postgres",
+                  }
+
+                  before = vector_fingerprint(conn)
+                  guards.update({
+                      "row_count_matches": int(before[0]) == expected_chunks,
+                      "all_rows_use_pgvector": int(before[1]) == expected_chunks,
+                      "no_json_vectors": int(before[2]) == 0,
+                      "minimum_dimension_matches": int(before[3]) == expected_dimensions,
+                      "maximum_dimension_matches": int(before[4]) == expected_dimensions,
+                  })
+                  failed = [name for name, passed in guards.items() if not passed]
+                  if failed:
+                      raise RuntimeError("state repair guards failed: " + ", ".join(failed))
+
+                  data["state"] = "ready"
+                  data["last_error"] = ""
+                  data["updated_at"] = time.time()
+                  conn.run(
+                      "UPDATE ghic_repository_state "
+                      "SET state = 'ready', data = :data, updated_at = now() "
+                      "WHERE repo = :repo",
+                      repo=repo,
+                      data=json.dumps(data),
+                  )
+
+                  after = vector_fingerprint(conn)
+                  if after != before:
+                      raise RuntimeError("vector fingerprint changed during state-only repair")
+                  conn.run("COMMIT")
+              except Exception:
+                  conn.run("ROLLBACK")
+                  raise
+
+          print(json.dumps({
+              "repo": repo,
+              "state_before": "failed",
+              "state_after": "ready",
+              "last_error_cleared": True,
+              "indexed_commit_sha": expected_sha,
+              "embedding_signature": expected_signature,
+              "chunk_count_before": before[0],
+              "chunk_count_after": after[0],
+              "vector_fingerprint_unchanged": before == after,
+              "repo_index_invoked": False,
+          }, indent=2, sort_keys=True))
+          PY

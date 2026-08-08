@@ -830,7 +830,14 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
             )
         except Exception as e:
             logger.warning("repository intelligence failed for %s#%d: %s", repo, number, e)
-            repo_context = None
+            from ..repository_intelligence.models import (
+                RepositoryContext,
+                UNAVAILABLE_CONTEXT_NOTE,
+            )
+
+            repo_context = RepositoryContext(
+                repo=repo, indexed=False, note=UNAVAILABLE_CONTEXT_NOTE,
+            )
 
     # Phase 3: engineering analysis over the evidence just retrieved.
     # Deterministic and local -- no network, no LLM call -- so it adds

@@ -236,18 +236,26 @@ def _repository_evidence_lines(repository_context: Any) -> list[str]:
     path and symbol printed here came out of the index, so it exists in the
     repository at the indexed commit by construction.
 
-    Renders nothing at all when the engine is off or the repo isn't indexed
-    (no section is better than an empty one), and renders the honest
-    "nothing found" line when the engine ran but found no confident match.
+    Renders nothing when the engine is off. When the engine was enabled but
+    could not access an index, it says that plainly without exposing internal
+    infrastructure details. A successful search with no confident match gets
+    the separate honest "nothing found" line.
     """
     if repository_context is None:
         return []
     if getattr(repository_context, "is_empty", True):
-        if not getattr(repository_context, "indexed", False):
-            return []  # engine off or repo not yet indexed -- say nothing
-        from ..repository_intelligence.models import EMPTY_CONTEXT_NOTE
+        from ..repository_intelligence.models import (
+            EMPTY_CONTEXT_NOTE,
+            UNAVAILABLE_CONTEXT_NOTE,
+        )
 
-        return ["", "---", "", "### Repository Evidence", "", f"_{EMPTY_CONTEXT_NOTE}_"]
+        default_note = (
+            EMPTY_CONTEXT_NOTE
+            if getattr(repository_context, "indexed", False)
+            else UNAVAILABLE_CONTEXT_NOTE
+        )
+        note = getattr(repository_context, "note", "") or default_note
+        return ["", "---", "", "### Repository Evidence", "", f"_{note}_"]
 
     lines = ["", "---", "", "### Repository Evidence", ""]
 

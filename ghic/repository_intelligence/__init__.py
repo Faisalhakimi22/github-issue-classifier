@@ -34,6 +34,7 @@ from .embeddings import (
 from .indexer import NumpyVectorStore, RepositoryIndexer, VectorStore
 from .models import (
     EMPTY_CONTEXT_NOTE,
+    UNAVAILABLE_CONTEXT_NOTE,
     CodeChunk,
     RepositoryContext,
     RepositoryMetadata,
@@ -81,5 +82,6 @@ __all__ = [
     "RepositoryContext",
     "RepositoryMetadata",
     "EMPTY_CONTEXT_NOTE",
+    "UNAVAILABLE_CONTEXT_NOTE",
     "build_query",
 ]

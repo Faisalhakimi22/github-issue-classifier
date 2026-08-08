@@ -1120,8 +1120,11 @@ class TestRepositoryIntelligenceIntegration:
         comment = format_llm_comment(pred, make_llm_analysis(), repository_context=None)
         assert "Repository Evidence" not in comment
 
-    def test_unindexed_repo_renders_no_section_rather_than_an_empty_one(self):
-        from ghic.repository_intelligence.models import RepositoryContext
+    def test_unavailable_repository_evidence_is_disclosed(self):
+        from ghic.repository_intelligence.models import (
+            RepositoryContext,
+            UNAVAILABLE_CONTEXT_NOTE,
+        )
 
         pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.9,
                           threshold=0.5, predicted_label=1, model_name="stub")
@@ -1129,7 +1132,13 @@ class TestRepositoryIntelligenceIntegration:
             pred, make_llm_analysis(),
             repository_context=RepositoryContext(repo="acme/widgets", indexed=False),
         )
-        assert "Repository Evidence" not in comment
+        assert "### Repository Evidence" in comment
+        assert UNAVAILABLE_CONTEXT_NOTE in comment
+        evidence = comment.split("### Repository Evidence", 1)[1].lower()
+        assert all(
+            detail not in evidence
+            for detail in ("hashing", "pgvector", "neon", "openrouter", "exception")
+        )
 
     def test_indexed_but_nothing_found_says_so_explicitly(self):
         from ghic.repository_intelligence.models import EMPTY_CONTEXT_NOTE, RepositoryContext
@@ -1180,8 +1189,8 @@ class TestRepositoryIntelligenceIntegration:
         )
         resp = post_webhook(TestClient(app), issue_opened_payload())
         assert resp.status_code == 200
-        assert gh.comments  # the comment still went out, without evidence
-        assert "Repository Evidence" not in gh.comments[0][2]
+        assert gh.comments
+        assert "Repository evidence unavailable" in gh.comments[0][2]
 
 
 class TestLLMAnalysisComment:
