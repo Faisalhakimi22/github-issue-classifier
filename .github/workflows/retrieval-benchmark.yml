@@ -1,0 +1,445 @@
+name: Retrieval benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to query, as owner/name."
+        required: true
+        type: string
+      semantic_provider:
+        description: "OpenAI-compatible semantic provider name."
+        required: false
+        default: "openai"
+        type: string
+      semantic_model:
+        description: "Semantic embedding model configured for the index."
+        required: false
+        default: "text-embedding-3-small"
+        type: string
+      semantic_dimensions:
+        description: "Semantic embedding dimensions. Use 0 for provider default."
+        required: false
+        default: "512"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  retrieval-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GHIC_REPO_INTEL_EMBEDDING_API_KEY: ${{ secrets.GHIC_REPO_INTEL_EMBEDDING_API_KEY }}
+      GHIC_REPO_INTEL_EMBEDDING_BASE_URL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_BASE_URL }}
+      GHIC_QUERY_REPOSITORY: ${{ inputs.repo }}
+      GHIC_BENCHMARK_SEMANTIC_PROVIDER: ${{ inputs.semantic_provider }}
+      GHIC_BENCHMARK_SEMANTIC_MODEL: ${{ inputs.semantic_model }}
+      GHIC_BENCHMARK_SEMANTIC_DIMENSIONS: ${{ inputs.semantic_dimensions }}
+
+    steps:
+      - name: Checkout GHIC
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install read-only retrieval dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[postgres]"
+
+      - name: Benchmark existing Postgres index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from collections import Counter
+          from typing import Any
+
+          import numpy as np
+
+          from ghic._pg import session
+          from ghic.repository_intelligence.config import RepositoryIntelligenceConfig
+          from ghic.repository_intelligence.embeddings import (
+              EmbeddingProvider,
+              HashingEmbeddingProvider,
+              build_embedding_provider,
+              tokenize,
+          )
+          from ghic.repository_intelligence.models import CodeChunk, RetrievedChunk
+          from ghic.repository_intelligence.retriever import SemanticRetriever, build_query
+          from ghic.repository_intelligence.state import RepositoryRecord
+
+          QUERIES = [
+              "webhook signature verification fails",
+              "CSV import UnicodeDecodeError",
+              "GitHub issue classification prediction",
+              "duplicate issue detection",
+              "repository indexing",
+          ]
+
+          EXPECTED_TERMS = {
+              "webhook signature verification fails": {
+                  "webhook", "signature", "hmac", "secret", "verify", "sha256",
+                  "x-hub-signature", "x_hub_signature",
+              },
+              "CSV import UnicodeDecodeError": {
+                  "csv", "import", "unicode", "unicodedecodeerror", "decode", "encoding",
+              },
+              "GitHub issue classification prediction": {
+                  "github", "issue", "classification", "classify", "prediction",
+                  "predict", "classifier", "inference", "triage",
+              },
+              "duplicate issue detection": {
+                  "duplicate", "dupdetect", "similar", "similarity", "related", "issue",
+              },
+              "repository indexing": {
+                  "repository", "repo_index", "index", "indexing", "index_repository",
+                  "repositoryindexer", "repository_intelligence", "vector",
+              },
+          }
+
+          repo = os.environ["GHIC_QUERY_REPOSITORY"]
+          database_url = (
+              os.environ.get("GHIC_DATABASE_URL")
+              or os.environ.get("DATABASE_URL")
+              or os.environ.get("POSTGRES_URL")
+          )
+          if not database_url:
+              raise SystemExit("missing DATABASE_URL/GHIC_DATABASE_URL/POSTGRES_URL")
+
+
+          def rows(conn: Any, sql: str, **params: Any) -> list[Any]:
+              return conn.run(sql, **params)
+
+
+          def scalar(conn: Any, sql: str, **params: Any) -> Any:
+              result = rows(conn, sql, **params)
+              return result[0][0] if result else None
+
+
+          def row_to_retrieved(row: Any, score: float) -> RetrievedChunk:
+              return RetrievedChunk(
+                  chunk=CodeChunk(
+                      repo=repo,
+                      path=row[0],
+                      language=row[1] or "",
+                      kind=row[2] or "module",
+                      symbol=row[3] or "",
+                      parent_symbol=row[4] or "",
+                      start_line=int(row[5] or 0),
+                      end_line=int(row[6] or 0),
+                      text=row[7],
+                  ),
+                  score=score,
+              )
+
+
+          class ReadOnlyPostgresStore:
+              def __init__(self, count: int, has_pgvector: bool, dimensions: int) -> None:
+                  self._count = count
+                  self._has_pgvector = has_pgvector and dimensions > 0
+
+              @property
+              def size(self) -> int:
+                  return self._count
+
+              def search(self, query: np.ndarray, top_k: int) -> list[RetrievedChunk]:
+                  if top_k <= 0:
+                      return []
+                  if self._has_pgvector:
+                      with session(database_url) as conn:
+                          result = rows(conn, """
+                              SELECT path, language, kind, symbol, parent_symbol,
+                                     start_line, end_line, text,
+                                     1 - (embedding <=> CAST(:q AS vector)) AS score
+                              FROM ghic_repo_chunks
+                              WHERE repo = :repo AND embedding IS NOT NULL
+                              ORDER BY embedding <=> CAST(:q AS vector)
+                              LIMIT :k
+                          """, repo=repo, q=json.dumps([float(v) for v in query]), k=top_k)
+                      return [row_to_retrieved(row, float(row[8])) for row in result]
+
+                  with session(database_url) as conn:
+                      result = rows(conn, """
+                          SELECT path, language, kind, symbol, parent_symbol,
+                                 start_line, end_line, text, embedding_json
+                          FROM ghic_repo_chunks
+                          WHERE repo = :repo AND embedding_json IS NOT NULL
+                      """, repo=repo)
+                  scored = []
+                  query_vector = np.asarray(query, dtype=np.float32)
+                  for row in result:
+                      raw = row[8]
+                      values = json.loads(raw) if isinstance(raw, str) else raw
+                      vector = np.asarray(values, dtype=np.float32)
+                      if vector.shape == query_vector.shape:
+                          scored.append((float(vector @ query_vector), row))
+                  scored.sort(key=lambda pair: -pair[0])
+                  return [row_to_retrieved(row, score) for score, row in scored[:top_k]]
+
+
+          TEST_PATH_RE = re.compile(
+              r"(^|/)(tests?|specs?|__tests__|e2e|fixtures)(/|$)"
+              r"|(^|/)(test_|spec_)"
+              r"|(_test|_spec|\.test|\.spec)\.[A-Za-z]+$",
+              re.IGNORECASE,
+          )
+          DOC_PATH_RE = re.compile(r"\.(md|mdx|rst)$", re.IGNORECASE)
+
+
+          def chunk_type(chunk: CodeChunk) -> str:
+              path = chunk.path.replace("\\", "/")
+              if DOC_PATH_RE.search(path):
+                  return "documentation"
+              if TEST_PATH_RE.search(path):
+                  return "test"
+              return "implementation"
+
+
+          def matched_terms(query: str, chunk: CodeChunk) -> list[str]:
+              query_terms = set(tokenize(query))
+              haystack = " ".join([
+                  chunk.path,
+                  chunk.kind,
+                  chunk.symbol,
+                  chunk.parent_symbol,
+                  chunk.text[:2000],
+              ])
+              chunk_terms = Counter(tokenize(haystack))
+              return sorted(
+                  (term for term in query_terms if chunk_terms.get(term)),
+                  key=lambda term: (-chunk_terms[term], term),
+              )[:12]
+
+
+          def is_relevant(query: str, chunk: CodeChunk) -> bool:
+              haystack = " ".join([
+                  chunk.path,
+                  chunk.kind,
+                  chunk.symbol,
+                  chunk.parent_symbol,
+                  chunk.text[:3000],
+              ]).lower().replace("-", "_")
+              hits = {
+                  term for term in EXPECTED_TERMS[query]
+                  if term.lower().replace("-", "_") in haystack
+              }
+              return len(hits) >= 2
+
+
+          def snippet(text: str, query: str) -> str:
+              clean = re.sub(r"\s+", " ", text).strip()
+              terms = [term for term in tokenize(query) if len(term) > 3]
+              lowered = clean.lower()
+              pos = min(
+                  [lowered.find(term.lower()) for term in terms if term.lower() in lowered]
+                  or [0]
+              )
+              start = max(0, pos - 90)
+              end = min(len(clean), pos + 260)
+              return clean[start:end]
+
+
+          def compatible(record: RepositoryRecord, embedder: EmbeddingProvider) -> bool:
+              current = embedder.metadata()
+              if record.embedding_provider != current.provider:
+                  return False
+              if record.embedding_model != current.model:
+                  return False
+              return current.dimensions <= 0 or record.embedding_dimensions == current.dimensions
+
+
+          def benchmark_provider(name: str, embedder: EmbeddingProvider | None) -> dict[str, Any]:
+              if embedder is None:
+                  return {
+                      "provider_label": name,
+                      "status": "not_configured",
+                      "reason": "semantic provider needs an API key for query embeddings",
+                      "queries": [],
+                  }
+              if not state_record:
+                  return {
+                      "provider_label": name,
+                      "status": "no_state",
+                      "reason": "repository state row is required to identify embedding metadata",
+                      "queries": [],
+                  }
+              if not compatible(state_record, embedder):
+                  return {
+                      "provider_label": name,
+                      "status": "requires_reindex",
+                      "reason": "stored vectors use a different embedding provider/model/dimension",
+                      "requested_embedding": embedder.metadata().as_dict(),
+                      "stored_embedding": {
+                          "provider": state_record.embedding_provider,
+                          "model": state_record.embedding_model,
+                          "dimensions": state_record.embedding_dimensions,
+                          "signature": state_record.embedding_signature,
+                      },
+                      "queries": [],
+                  }
+
+              dimensions = state_record.embedding_dimensions or embedder.dimensions
+              store = ReadOnlyPostgresStore(chunk_count, embedding_rows > 0, dimensions)
+              retriever = SemanticRetriever(
+                  embedder,
+                  RepositoryIntelligenceConfig(
+                      vector_provider="postgres",
+                      min_similarity=0.15,
+                      top_k=5,
+                  ),
+              )
+              query_reports = []
+              for query in QUERIES:
+                  retrieved = retriever.retrieve(store, query, "", top_k=5)
+                  results = []
+                  for rank, item in enumerate(retrieved, start=1):
+                      ctype = chunk_type(item.chunk)
+                      relevant = is_relevant(query, item.chunk)
+                      results.append({
+                          "rank": rank,
+                          "path": item.chunk.path,
+                          "chunk_kind": item.chunk.kind,
+                          "source_type": ctype,
+                          "language": item.chunk.language,
+                          "symbol": item.chunk.qualified_symbol,
+                          "start_line": item.chunk.start_line,
+                          "end_line": item.chunk.end_line,
+                          "score": round(item.score, 6),
+                          "matched_terms": matched_terms(query, item.chunk),
+                          "relevant": relevant,
+                          "relevance_note": (
+                              "matched expected issue/code concepts"
+                              if relevant else "false positive or only adjacent by heuristic"
+                          ),
+                          "snippet": snippet(item.chunk.text, query),
+                      })
+                  relevant_impl_files = {
+                      r["path"] for r in results
+                      if r["relevant"] and r["source_type"] == "implementation"
+                  }
+                  query_reports.append({
+                      "query": query,
+                      "built_query": build_query(query, ""),
+                      "passed_retrieval_floor": bool(results),
+                      "relevant_implementation_files_in_top_5": len(relevant_impl_files),
+                      "tests_in_top_5": sum(1 for r in results if r["source_type"] == "test"),
+                      "docs_in_top_5": sum(
+                          1 for r in results if r["source_type"] == "documentation"
+                      ),
+                      "top_results": results,
+                  })
+              return {
+                  "provider_label": name,
+                  "status": "queried_existing_index",
+                  "embedding": embedder.metadata().as_dict(),
+                  "queries": query_reports,
+              }
+
+
+          with session(database_url) as conn:
+              before_count = scalar(
+                  conn,
+                  "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo",
+                  repo=repo,
+              )
+              state_rows = rows(conn, """
+                  SELECT state, data, updated_at
+                  FROM ghic_repository_state
+                  WHERE repo = :repo
+              """, repo=repo)
+              embedding_rows = scalar(conn, """
+                  SELECT count(*) FROM ghic_repo_chunks
+                  WHERE repo = :repo AND embedding IS NOT NULL
+              """, repo=repo)
+
+          chunk_count = int(before_count or 0)
+          state_record = None
+          state_payload = None
+          if state_rows:
+              raw = state_rows[0][1]
+              data = json.loads(raw) if isinstance(raw, str) else raw
+              data["repo"] = data.get("repo") or repo
+              state_record = RepositoryRecord.from_dict(data)
+              state_payload = {
+                  "state": state_rows[0][0],
+                  "indexed_commit_sha": state_record.indexed_commit_sha,
+                  "chunk_count": state_record.chunk_count,
+                  "embedding_provider": state_record.embedding_provider,
+                  "embedding_model": state_record.embedding_model,
+                  "embedding_dimensions": state_record.embedding_dimensions,
+                  "embedding_signature": state_record.embedding_signature,
+                  "updated_at": state_rows[0][2].isoformat(),
+              }
+
+          hashing_dimensions = (
+              state_record.embedding_dimensions
+              if state_record and state_record.embedding_provider == "hashing"
+              else 512
+          )
+          hashing = HashingEmbeddingProvider(hashing_dimensions)
+
+          semantic = None
+          semantic_provider = os.environ.get("GHIC_BENCHMARK_SEMANTIC_PROVIDER", "openai")
+          if semantic_provider == "openai" and (
+              os.environ.get("GHIC_REPO_INTEL_EMBEDDING_API_KEY")
+              or os.environ.get("OPENAI_API_KEY")
+          ):
+              semantic_dimensions = int(os.environ.get("GHIC_BENCHMARK_SEMANTIC_DIMENSIONS") or "0")
+              semantic = build_embedding_provider(RepositoryIntelligenceConfig(
+                  embedding_provider=semantic_provider,
+                  embedding_model=os.environ.get(
+                      "GHIC_BENCHMARK_SEMANTIC_MODEL", "text-embedding-3-small"
+                  ),
+                  embedding_dimensions=semantic_dimensions,
+                  embedding_api_key=(
+                      os.environ.get("GHIC_REPO_INTEL_EMBEDDING_API_KEY")
+                      or os.environ.get("OPENAI_API_KEY", "")
+                  ),
+                  embedding_base_url=os.environ.get(
+                      "GHIC_REPO_INTEL_EMBEDDING_BASE_URL",
+                      "https://api.openai.com/v1",
+                  ),
+              ))
+
+          with session(database_url) as conn:
+              after_count = scalar(
+                  conn,
+                  "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo",
+                  repo=repo,
+              )
+
+          print(json.dumps({
+              "repo": repo,
+              "read_only": True,
+              "used_existing_postgres_index": True,
+              "invoked_git": False,
+              "invoked_repo_index": False,
+              "chunk_count_before": before_count,
+              "chunk_count_after": after_count,
+              "chunk_count_unchanged": before_count == after_count,
+              "embedding_rows": embedding_rows,
+              "state": state_payload,
+              "score_warning": (
+                  "Compare relevance and source_type, not raw scores across providers; "
+                  "scores from different embedding models are not calibrated together."
+              ),
+              "providers": [
+                  benchmark_provider("hashing-512", hashing),
+                  benchmark_provider("semantic", semantic),
+              ],
+          }, indent=2, sort_keys=True))
+          PY

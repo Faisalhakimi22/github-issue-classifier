@@ -54,6 +54,7 @@ jobs:
           from ghic.repository_intelligence.embeddings import HashingEmbeddingProvider, tokenize
           from ghic.repository_intelligence.models import CodeChunk, RetrievedChunk
           from ghic.repository_intelligence.retriever import SemanticRetriever, build_query
+          from ghic.repository_intelligence.state import RepositoryRecord
           
           QUERIES = [
               "webhook signature verification fails",
@@ -190,14 +191,34 @@ jobs:
                   WHERE repo = :repo AND embedding IS NOT NULL
               """, repo=repo)
           
+          state_record = None
+          if state_rows:
+              raw = state_rows[0][1]
+              data = json.loads(raw) if isinstance(raw, str) else raw
+              data["repo"] = data.get("repo") or repo
+              state_record = RepositoryRecord.from_dict(data)
+              if (
+                  state_record.embedding_provider == "hashing"
+                  and state_record.embedding_dimensions > 0
+              ):
+                  embedder = HashingEmbeddingProvider(state_record.embedding_dimensions)
+          
+          compatible_index = (
+              state_record is not None
+              and state_record.embedding_provider == "hashing"
+              and state_record.embedding_model == "hashing"
+              and state_record.embedding_dimensions == embedder.dimensions
+          )
+          
           store = ReadOnlyPostgresStore(before_count, embedding_rows > 0)
           retriever = SemanticRetriever(embedder, cfg)
           query_reports = []
           for query in QUERIES:
-              retrieved = retriever.retrieve(store, query, "", top_k=5)
+              retrieved = retriever.retrieve(store, query, "", top_k=5) if compatible_index else []
               query_reports.append({
                   "query": query,
                   "built_query": build_query(query, ""),
+                  "compatible_index": compatible_index,
                   "top_results": [
                       {
                           "rank": rank,
@@ -229,12 +250,15 @@ jobs:
           
           state_payload = None
           if state_rows:
-              raw = state_rows[0][1]
-              data = json.loads(raw) if isinstance(raw, str) else raw
+              data = state_record.as_dict()
               state_payload = {
                   "state": state_rows[0][0],
                   "indexed_commit_sha": data.get("indexed_commit_sha", ""),
                   "chunk_count": data.get("chunk_count", 0),
+                  "embedding_provider": data.get("embedding_provider", ""),
+                  "embedding_model": data.get("embedding_model", ""),
+                  "embedding_dimensions": data.get("embedding_dimensions", 0),
+                  "embedding_signature": data.get("embedding_signature", ""),
                   "updated_at": state_rows[0][2].isoformat(),
               }
           

@@ -270,9 +270,11 @@ class RepositoryIndexer:
                 chunks.extend(parser.chunk_file(repo, relative, text, self.cfg))
         chunks = chunks[:self.cfg.max_chunks]
 
-        store = build_vector_store(self.embedder.dimensions, expected_chunks=len(chunks))
+        vectors = None
         if chunks:
             vectors = self.embedder.embed_documents([c.embedding_text() for c in chunks])
+        store = build_vector_store(self.embedder.dimensions, expected_chunks=len(chunks))
+        if vectors is not None:
             store.add(vectors, chunks)
 
         from dataclasses import replace

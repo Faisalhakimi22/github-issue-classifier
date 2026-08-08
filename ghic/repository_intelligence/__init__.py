@@ -25,6 +25,7 @@ interface -- see `models/REPOSITORY_INTELLIGENCE_CARD.md`.
 from .config import RepositoryIntelligenceConfig
 from .embeddings import (
     EmbeddingError,
+    EmbeddingMetadata,
     EmbeddingProvider,
     HashingEmbeddingProvider,
     OpenAICompatibleEmbeddingProvider,
@@ -68,6 +69,7 @@ __all__ = [
     "RepositoryIndexer",
     "SemanticRetriever",
     "EmbeddingProvider",
+    "EmbeddingMetadata",
     "EmbeddingError",
     "HashingEmbeddingProvider",
     "OpenAICompatibleEmbeddingProvider",

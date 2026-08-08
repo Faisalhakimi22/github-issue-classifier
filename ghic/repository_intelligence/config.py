@@ -222,7 +222,7 @@ class RepositoryIntelligenceConfig:
     embedding_model: str = "text-embedding-3-small"
     embedding_api_key: str = ""
     embedding_base_url: str = "https://api.openai.com/v1"
-    embedding_dimensions: int = 512
+    embedding_dimensions: int = 512       # openai: 0 means use provider default/detect
     embedding_batch_size: int = 64
     embedding_timeout: float = 30.0
 

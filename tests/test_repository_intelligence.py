@@ -371,6 +371,28 @@ class TestEmbeddings:
         assert vectors.shape == (2, 4)
         np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, rtol=1e-5)
 
+    def test_openai_provider_detects_response_dimensions(self):
+        import httpx
+
+        from ghic.repository_intelligence.embeddings import OpenAICompatibleEmbeddingProvider
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"data": [{"embedding": [1.0, 0.0, 0.0]}]})
+
+        provider = OpenAICompatibleEmbeddingProvider(
+            api_key="k", dimensions=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        vectors = provider.embed_documents(["semantic text"])
+        assert vectors.shape == (1, 3)
+        assert provider.dimensions == 3
+        assert provider.metadata().as_dict() == {
+            "provider": "openai",
+            "model": "text-embedding-3-small",
+            "dimensions": 3,
+            "signature": "openai:text-embedding-3-small:3",
+        }
+
     def test_openai_provider_raises_embedding_error_on_4xx(self):
         import httpx
 
@@ -385,13 +407,56 @@ class TestEmbeddings:
         with pytest.raises(EmbeddingError):
             provider.embed_documents(["a"])
 
+    def test_openai_provider_raises_embedding_error_on_transient_failure(self):
+        import httpx
+
+        from ghic.repository_intelligence.embeddings import OpenAICompatibleEmbeddingProvider
+
+        provider = OpenAICompatibleEmbeddingProvider(
+            api_key="bad", dimensions=4,
+            http_client=httpx.Client(
+                transport=httpx.MockTransport(lambda r: httpx.Response(500, text="down"))
+            ),
+        )
+        with pytest.raises(EmbeddingError):
+            provider.embed_documents(["a"])
+
     def test_build_provider_falls_back_when_openai_key_missing(self, tmp_path):
         from ghic.repository_intelligence.embeddings import build_embedding_provider
 
         cfg = RepositoryIntelligenceConfig(
             cache_dir=tmp_path, embedding_provider="openai", embedding_api_key="",
         )
-        assert isinstance(build_embedding_provider(cfg), HashingEmbeddingProvider)
+        provider = build_embedding_provider(cfg)
+        assert isinstance(provider, HashingEmbeddingProvider)
+        assert provider.metadata().as_dict() == {
+            "provider": "hashing",
+            "model": "hashing",
+            "dimensions": 512,
+            "signature": "hashing:hashing:512",
+        }
+
+    def test_build_provider_selects_openai_compatible_when_key_is_present(self, tmp_path):
+        from ghic.repository_intelligence.embeddings import (
+            OpenAICompatibleEmbeddingProvider,
+            build_embedding_provider,
+        )
+
+        cfg = RepositoryIntelligenceConfig(
+            cache_dir=tmp_path,
+            embedding_provider="openai",
+            embedding_api_key="test-key",
+            embedding_model="compatible-embedder",
+            embedding_dimensions=256,
+        )
+        provider = build_embedding_provider(cfg)
+        assert isinstance(provider, OpenAICompatibleEmbeddingProvider)
+        assert provider.metadata().as_dict() == {
+            "provider": "openai",
+            "model": "compatible-embedder",
+            "dimensions": 256,
+            "signature": "openai:compatible-embedder:256",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +490,25 @@ class TestVectorStore:
         reloaded = NumpyVectorStore.load(tmp_path / "idx")
         assert reloaded.size == 1
         assert reloaded.search(np.array([1.0, 0.0], dtype=np.float32), 1)[0].chunk.path == "a.py"
+
+    def test_indexer_uses_detected_embedding_dimensions(self, repo, cfg):
+        import httpx
+
+        from ghic.repository_intelligence.embeddings import OpenAICompatibleEmbeddingProvider
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content)
+            return httpx.Response(200, json={
+                "data": [{"embedding": [1.0, 0.0, 0.0]} for _ in payload["input"]]
+            })
+
+        provider = OpenAICompatibleEmbeddingProvider(
+            api_key="k",
+            dimensions=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        store, _ = RepositoryIndexer(provider, cfg).build("acme/demo", repo)
+        assert store.dimensions == 3
 
 
 # ---------------------------------------------------------------------------

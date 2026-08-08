@@ -257,11 +257,15 @@ def health_snapshot(service: Any | None, cfg: RepositoryIntelligenceConfig | Non
 
     git_available = shutil.which("git") is not None
 
+    embedding = service.embedder.metadata()
     return {
         "enabled": True,
         "platform": platform_name(),
         "vector_provider": service.cfg.vector_provider,
-        "embedding_provider": service.embedder.name,
+        "embedding_provider": embedding.provider,
+        "embedding_model": embedding.model,
+        "embedding_dimensions": embedding.dimensions,
+        "embedding_signature": embedding.signature,
         "state_durable": service.state_store.durable if service.state_store else False,
         "queue": service.index_queue.name if service.index_queue else None,
         "queue_durable": service.index_queue.durable if service.index_queue else False,

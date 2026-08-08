@@ -88,6 +88,8 @@ class RepositoryRecord:
     indexed_commit_sha: str = ""
     index_version: int = 0
     embedding_provider: str = ""
+    embedding_model: str = ""
+    embedding_dimensions: int = 0
     vector_backend: str = ""
     chunk_count: int = 0
     file_count: int = 0
@@ -108,6 +110,17 @@ class RepositoryRecord:
     def hit_rate(self) -> float:
         return self.retrieval_hit_count / self.retrieval_count if self.retrieval_count else 0.0
 
+    @property
+    def embedding_signature(self) -> str:
+        if self.embedding_provider and self.embedding_model and self.embedding_dimensions:
+            return (
+                f"{self.embedding_provider}:"
+                f"{self.embedding_model}:"
+                f"{self.embedding_dimensions}"
+            )
+        legacy = _parse_legacy_embedding_provider(self.embedding_provider)
+        return legacy[3] if legacy else ""
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "repo": self.repo,
@@ -118,6 +131,9 @@ class RepositoryRecord:
             "indexed_commit_sha": self.indexed_commit_sha,
             "index_version": self.index_version,
             "embedding_provider": self.embedding_provider,
+            "embedding_model": self.embedding_model,
+            "embedding_dimensions": self.embedding_dimensions,
+            "embedding_signature": self.embedding_signature,
             "vector_backend": self.vector_backend,
             "chunk_count": self.chunk_count,
             "file_count": self.file_count,
@@ -139,6 +155,13 @@ class RepositoryRecord:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> RepositoryRecord:
         owner, _, name = str(raw.get("repo", "")).partition("/")
+        embedding_provider = str(raw.get("embedding_provider", "") or "")
+        embedding_model = str(raw.get("embedding_model", "") or "")
+        embedding_dimensions = int(raw.get("embedding_dimensions", 0) or 0)
+        if not (embedding_model and embedding_dimensions):
+            legacy = _parse_legacy_embedding_provider(embedding_provider)
+            if legacy:
+                embedding_provider, embedding_model, embedding_dimensions, _ = legacy
         try:
             state = RepositoryState(raw.get("state", "not_indexed"))
         except ValueError:
@@ -153,7 +176,9 @@ class RepositoryRecord:
             default_branch=raw.get("default_branch", ""),
             indexed_commit_sha=raw.get("indexed_commit_sha", ""),
             index_version=int(raw.get("index_version", 0)),
-            embedding_provider=raw.get("embedding_provider", ""),
+            embedding_provider=embedding_provider,
+            embedding_model=embedding_model,
+            embedding_dimensions=embedding_dimensions,
             vector_backend=raw.get("vector_backend", ""),
             chunk_count=int(raw.get("chunk_count", 0)),
             file_count=int(raw.get("file_count", 0)),
@@ -170,6 +195,29 @@ class RepositoryRecord:
             last_error=raw.get("last_error", ""),
             metadata_json=dict(raw.get("metadata") or {}),
         )
+
+
+def _parse_legacy_embedding_provider(value: str) -> tuple[str, str, int, str] | None:
+    """Read older state rows that stored provider/model/dim as one string."""
+    if not value:
+        return None
+    if value.startswith("hashing-"):
+        try:
+            dimensions = int(value.rsplit("-", 1)[1])
+        except (IndexError, ValueError):
+            return None
+        return "hashing", "hashing", dimensions, f"hashing:hashing:{dimensions}"
+    if value.startswith("openai:"):
+        model_and_dim = value.split(":", 1)[1]
+        model, sep, raw_dim = model_and_dim.rpartition("-")
+        if not sep:
+            return None
+        try:
+            dimensions = int(raw_dim)
+        except ValueError:
+            return None
+        return "openai", model, dimensions, f"openai:{model}:{dimensions}"
+    return None
 
 
 class RepositoryStateStore(ABC):

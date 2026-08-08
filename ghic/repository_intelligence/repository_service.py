@@ -130,6 +130,16 @@ class RepositoryIntelligenceService:
         if record is not None and not record.state.is_searchable:
             return self._schedule_and_return_empty(repo, f"state={record.state.value}", record)
 
+        if record is not None and self._embedding_changed(record):
+            logger.warning(
+                "repository index for %s uses embedding %s; current embedding is %s",
+                repo, record.embedding_signature or "(unknown)",
+                self.embedder.metadata().signature,
+            )
+            return self._schedule_and_return_empty(
+                repo, "embedding provider/model/dimension changed", record
+            )
+
         store, metadata = self._load_index(repo, record)
         if store is None:
             return self._schedule_and_return_empty(repo, "no usable index", record)
@@ -149,10 +159,20 @@ class RepositoryIntelligenceService:
         self.metrics.increment("index_cache_lookups")
 
         if self.cfg.vector_provider == "postgres":
+            if record is None:
+                # Postgres chunks without authoritative state cannot prove
+                # which embedding model produced them, so they are not safe
+                # to compare with the current query vector.
+                return None, None
             from .vector_pg import PostgresVectorStore
 
+            dimensions = (
+                record.embedding_dimensions
+                if record is not None and record.embedding_dimensions > 0
+                else self.embedder.dimensions
+            )
             store = PostgresVectorStore(
-                self.cfg.database_url, repo, self.embedder.dimensions
+                self.cfg.database_url, repo, dimensions
             )
             if not store.size:
                 return None, None
@@ -249,8 +269,7 @@ class RepositoryIntelligenceService:
 
         previous_sha = record.indexed_commit_sha if record else ""
         embedder_changed = bool(
-            record and record.embedding_provider and
-            record.embedding_provider != self.embedder.name
+            record and self._embedding_changed(record)
         )
         # Nothing changed: the cheapest possible outcome, and the common one
         # on a repo that gets many issues and few pushes.
@@ -438,11 +457,14 @@ class RepositoryIntelligenceService:
             logger.debug("could not record state %s for %s: %s", state.value, repo, e)
 
     def _mark_ready(self, repo: str, checkout: Any, metadata: RepositoryMetadata) -> None:
+        embedding = self.embedder.metadata()
         self._mark(
             repo, RepositoryState.READY,
             indexed_commit_sha=checkout.commit_sha,
             default_branch=checkout.default_branch,
-            embedding_provider=self.embedder.name,
+            embedding_provider=embedding.provider,
+            embedding_model=embedding.model,
+            embedding_dimensions=embedding.dimensions,
             vector_backend=self.cfg.vector_provider,
             chunk_count=metadata.chunk_count,
             file_count=metadata.file_count,
@@ -489,16 +511,29 @@ class RepositoryIntelligenceService:
             self.index_cache.save(repo, commit_sha, self.embedder.name, store, metadata)
             self.index_cache.set_latest(repo, commit_sha, self.embedder.name)
 
-        self._mark(
-            repo, RepositoryState.READY,
-            indexed_commit_sha=commit_sha, default_branch=default_branch,
-            embedding_provider=self.embedder.name, vector_backend=self.cfg.vector_provider,
-            chunk_count=metadata.chunk_count, file_count=metadata.file_count,
-            primary_language=metadata.primary_language, frameworks=metadata.frameworks,
-            readme_summary=metadata.readme_summary, indexed_at=time.time(),
-            metadata_json=metadata.as_dict(),
+        from types import SimpleNamespace
+
+        self._mark_ready(
+            repo,
+            SimpleNamespace(commit_sha=commit_sha, default_branch=default_branch),
+            metadata,
         )
         return metadata
+
+    def _embedding_changed(self, record: RepositoryRecord) -> bool:
+        """True when a ready index was built by a different embedding config."""
+        current = self.embedder.metadata()
+        if not (
+            record.embedding_provider
+            and record.embedding_model
+            and record.embedding_dimensions
+        ):
+            return not record.embedding_signature or record.embedding_signature != current.signature
+        if record.embedding_provider != current.provider or record.embedding_model != current.model:
+            return True
+        if current.dimensions <= 0:
+            return False
+        return record.embedding_dimensions != current.dimensions
 
     def is_indexed(self, repo: str) -> bool:
         if self.state_store is not None:

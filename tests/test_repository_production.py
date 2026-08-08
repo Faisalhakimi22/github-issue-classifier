@@ -84,8 +84,20 @@ class TestRepositoryState:
         record = RepositoryRecord(
             repo="acme/demo", owner="acme", name="demo", state=RepositoryState.READY,
             chunk_count=42, frameworks=["FastAPI"], indexed_commit_sha="abc123",
+            embedding_provider="openai", embedding_model="compatible", embedding_dimensions=256,
         )
         assert RepositoryRecord.from_dict(record.as_dict()) == record
+
+    def test_legacy_embedding_provider_is_read_as_metadata(self):
+        restored = RepositoryRecord.from_dict({
+            "repo": "acme/demo",
+            "state": "ready",
+            "embedding_provider": "hashing-512",
+        })
+        assert restored.embedding_provider == "hashing"
+        assert restored.embedding_model == "hashing"
+        assert restored.embedding_dimensions == 512
+        assert restored.embedding_signature == "hashing:hashing:512"
 
     def test_round_trip_backfills_owner_and_name_when_absent(self):
         """from_dict derives owner/name from repo, so a record written by an
@@ -491,7 +503,64 @@ class TestServiceLifecycle:
         assert record.state == RepositoryState.READY
         assert record.chunk_count > 0
         assert record.primary_language == "Python"
-        assert record.embedding_provider == service.embedder.name
+        assert record.embedding_provider == "hashing"
+        assert record.embedding_model == "hashing"
+        assert record.embedding_dimensions == service.embedder.dimensions
+        assert record.embedding_signature == service.embedder.metadata().signature
+
+    def test_embedding_metadata_persists_in_file_state_store(self, repo, tmp_path):
+        state_path = tmp_path / "state.json"
+        cfg = RepositoryIntelligenceConfig(cache_dir=tmp_path / "cache")
+        service = RepositoryIntelligenceService(cfg, state_store=FileStateStore(state_path))
+        service.index_local_path("acme/demo", repo, commit_sha="sha1")
+
+        record = FileStateStore(state_path).get("acme/demo")
+        assert record.embedding_provider == "hashing"
+        assert record.embedding_model == "hashing"
+        assert record.embedding_dimensions == 512
+        assert record.indexed_commit_sha == "sha1"
+
+    def test_incompatible_embedding_state_is_not_retrieved(self, repo, tmp_path):
+        state_store = MemoryStateStore()
+        old_cfg = RepositoryIntelligenceConfig(cache_dir=tmp_path / "old", auto_index=False)
+        old_service = RepositoryIntelligenceService(old_cfg, state_store=state_store)
+        old_service.index_local_path("acme/demo", repo, commit_sha="sha1")
+
+        new_cfg = RepositoryIntelligenceConfig(
+            cache_dir=tmp_path / "old", embedding_dimensions=128, auto_index=False
+        )
+        new_service = RepositoryIntelligenceService(new_cfg, state_store=state_store)
+        context = new_service.get_context("acme/demo", "handler request", "")
+
+        assert context.is_empty
+        assert not context.indexed
+
+    def test_index_repository_forces_full_rebuild_when_embedding_changes(self, repo, cfg):
+        from ghic.repository_intelligence.cache import Checkout
+
+        state_store = MemoryStateStore()
+        state_store.put(RepositoryRecord(
+            repo="acme/demo",
+            state=RepositoryState.READY,
+            indexed_commit_sha="sha1",
+            embedding_provider="hashing",
+            embedding_model="hashing",
+            embedding_dimensions=128,
+        ))
+        service = RepositoryIntelligenceService(cfg, state_store=state_store)
+        service.repo_cache.ensure = lambda *a, **kw: Checkout(
+            path=repo, commit_sha="sha1", default_branch="main"
+        )
+        service._index_exists = lambda *a, **kw: True
+        calls: list[bool] = []
+
+        def capture_run(*args, force: bool):
+            calls.append(force)
+            return True
+
+        service._run_index = capture_run
+        assert service.index_repository("acme/demo")
+        assert calls == [True]
 
     def test_unindexed_repo_is_queued_once_not_per_issue(self, cfg):
         calls: list[str] = []

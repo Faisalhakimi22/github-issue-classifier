@@ -145,7 +145,8 @@ def _list_indexes(
             for record in records:
                 print(
                     f"{record.repo}  {record.indexed_commit_sha[:8]}  "
-                    f"{record.embedding_provider or '(unknown)'}  {record.state.value}"
+                    f"{record.embedding_signature or '(unknown embedding)'}  "
+                    f"{record.state.value}"
                 )
         return 0
 

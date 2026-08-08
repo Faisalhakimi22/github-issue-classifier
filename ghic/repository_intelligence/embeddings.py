@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -41,6 +42,27 @@ logger = utils.get_logger(__name__)
 
 class EmbeddingError(RuntimeError):
     """Any failure to produce embeddings. Callers degrade, never crash."""
+
+
+@dataclass(frozen=True)
+class EmbeddingMetadata:
+    """Stable identity for vectors written by one embedding configuration."""
+
+    provider: str
+    model: str
+    dimensions: int
+
+    @property
+    def signature(self) -> str:
+        return f"{self.provider}:{self.model}:{self.dimensions}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "model": self.model,
+            "dimensions": self.dimensions,
+            "signature": self.signature,
+        }
 
 
 class EmbeddingProvider(ABC):
@@ -63,6 +85,23 @@ class EmbeddingProvider(ABC):
         providers or dimensions invalidates a stale index automatically
         instead of silently comparing incompatible vectors."""
         raise NotImplementedError
+
+    @property
+    def provider_id(self) -> str:
+        """Provider family, separate from model and dimensions."""
+        return self.name.split(":", 1)[0].split("-", 1)[0]
+
+    @property
+    def model_id(self) -> str:
+        """Model identity within the provider family."""
+        return self.name
+
+    def metadata(self) -> EmbeddingMetadata:
+        return EmbeddingMetadata(
+            provider=self.provider_id,
+            model=self.model_id,
+            dimensions=self.dimensions,
+        )
 
     @abstractmethod
     def embed_documents(self, texts: list[str]) -> np.ndarray:
@@ -132,6 +171,14 @@ class HashingEmbeddingProvider(EmbeddingProvider):
     def name(self) -> str:
         return f"hashing-{self._dimensions}"
 
+    @property
+    def provider_id(self) -> str:
+        return "hashing"
+
+    @property
+    def model_id(self) -> str:
+        return "hashing"
+
     def embed_documents(self, texts: list[str]) -> np.ndarray:
         matrix = np.zeros((len(texts), self._dimensions), dtype=np.float32)
         for row, text in enumerate(texts):
@@ -191,8 +238,16 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
     def name(self) -> str:
         return f"openai:{self.model}-{self._dimensions}"
 
+    @property
+    def provider_id(self) -> str:
+        return "openai"
+
+    @property
+    def model_id(self) -> str:
+        return self.model
+
     def _post(self, texts: list[str]) -> list[list[float]]:
-        import httpx
+        import requests
 
         client = self._client
         payload = {"model": self.model, "input": texts}
@@ -204,12 +259,13 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
 
         def _call() -> list[list[float]]:
             owned = client is None
-            active = httpx.Client(timeout=self.timeout) if owned else client
+            active = requests.Session() if owned else client
             try:
                 response = active.post(  # type: ignore[union-attr]
                     f"{self.base_url}/embeddings",
                     json=payload,
                     headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=self.timeout,
                 )
                 if response.status_code >= 400:
                     detail = response.text[:200]
@@ -237,7 +293,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             raise EmbeddingError(str(e)) from e
         except EmbeddingError:
             raise
-        except Exception as e:  # httpx transport errors, malformed JSON, ...
+        except Exception as e:  # transport errors, malformed JSON, ...
             raise EmbeddingError(f"embeddings request failed: {e}") from e
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:
@@ -278,7 +334,7 @@ def build_embedding_provider(cfg: RepositoryIntelligenceConfig) -> EmbeddingProv
                 "embedding_provider=openai but no API key is set; "
                 "falling back to the offline hashing provider"
             )
-            return HashingEmbeddingProvider(cfg.embedding_dimensions)
+            return HashingEmbeddingProvider(cfg.embedding_dimensions or 512)
         return OpenAICompatibleEmbeddingProvider(
             api_key=cfg.embedding_api_key,
             model=cfg.embedding_model,
@@ -287,4 +343,4 @@ def build_embedding_provider(cfg: RepositoryIntelligenceConfig) -> EmbeddingProv
             batch_size=cfg.embedding_batch_size,
             timeout=cfg.embedding_timeout,
         )
-    return HashingEmbeddingProvider(cfg.embedding_dimensions)
+    return HashingEmbeddingProvider(cfg.embedding_dimensions or 512)

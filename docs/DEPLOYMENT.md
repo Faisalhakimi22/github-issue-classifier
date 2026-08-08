@@ -419,6 +419,62 @@ The workflow also accepts `repository_dispatch` events with type
 That is the hook to trigger indexing from another service later without
 changing the worker.
 
+### Semantic embeddings
+
+The default embedding provider is still `hashing-512`: free, deterministic,
+offline, and usable without secrets. For better semantic matching, the same
+pipeline can use an OpenAI-compatible embeddings endpoint:
+
+```bash
+GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai
+GHIC_REPO_INTEL_EMBEDDING_MODEL=<embedding-model>
+GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS=<dimension>   # use 0 only when the endpoint chooses
+OPENAI_API_KEY=<secret>
+```
+
+`GHIC_REPO_INTEL_EMBEDDING_BASE_URL` can point at any endpoint that implements
+OpenAI's `/v1/embeddings` response shape. `GHIC_REPO_INTEL_EMBEDDING_API_KEY`
+also works and takes precedence over `OPENAI_API_KEY`.
+
+Embedding provider, model, dimension, and indexed commit SHA are persisted in
+repository state. If any embedding identity changes, retrieval refuses to use
+the old vectors and indexing performs a full rebuild for that repository. This
+is required: vectors from different embedding models are not comparable, even
+when raw similarity scores look plausible.
+
+To rebuild safely through GitHub Actions:
+
+1. Set repository variables:
+   `GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai`,
+   `GHIC_REPO_INTEL_EMBEDDING_MODEL=<embedding-model>`, and
+   `GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS=<dimension>`.
+2. Set a repository secret: `OPENAI_API_KEY` or
+   `GHIC_REPO_INTEL_EMBEDDING_API_KEY`.
+3. Run **Actions -> Index repositories -> Run workflow** with the target
+   repo and `force=true`.
+
+For a local or CI worker using the same Postgres database:
+
+```bash
+GHIC_USE_REPO_INTELLIGENCE=true \
+GHIC_VECTOR_PROVIDER=postgres \
+GHIC_STATE_PROVIDER=postgres \
+GHIC_INDEX_QUEUE_PROVIDER=none \
+GHIC_REPO_AUTO_INDEX=false \
+GHIC_REPO_INTEL_EMBEDDING_PROVIDER=openai \
+GHIC_REPO_INTEL_EMBEDDING_MODEL=<embedding-model> \
+GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS=<dimension> \
+OPENAI_API_KEY=<secret> \
+DATABASE_URL=<same-postgres-url> \
+python -m ghic.repo_index --repo owner/name --force
+```
+
+The `.github/workflows/retrieval-benchmark.yml` workflow is read-only. It
+reports hashing retrieval against the current index and reports semantic
+retrieval only when the stored vectors were built with the requested semantic
+provider/model/dimension. Otherwise it reports `requires_reindex` instead of
+mixing incompatible vectors.
+
 ### Rollout
 
 ```bash
