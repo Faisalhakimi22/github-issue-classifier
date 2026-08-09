@@ -336,6 +336,14 @@ def create_app(
             return _handle_issue_closed(app, payload)
         if event == "issues" and payload.get("action") in ("labeled", "unlabeled"):
             return _handle_label_event(app, payload)
+        if event in ("installation", "installation_repositories", "repository"):
+            # Keeps the dashboard's connected-repository list in step with
+            # what the installation actually grants. Bookkeeping only: it
+            # never raises, so a sync problem cannot make GitHub retry a
+            # delivery that was otherwise handled.
+            from .github_connection import handle_installation_event
+
+            return handle_installation_event(s.database_url, event, payload)
         return {"ok": True, "ignored": f"{event}/{payload.get('action')}"}
 
     @app.post("/api/predict")
