@@ -17,11 +17,22 @@ from ghic.service import github_connection
 
 
 class FakeConn:
-    """Records statements; answers the two SELECTs the module makes."""
+    """Records statements; answers the SELECTs the module makes."""
 
-    def __init__(self, *, tables_exist: bool = True, connected: bool = True):
+    def __init__(
+        self,
+        *,
+        tables_exist: bool = True,
+        connected: bool = True,
+        repositories=None,
+    ):
         self.tables_exist = tables_exist
         self.connected = connected
+        # (repo_full_name, workspace_id) rows the purge walks. Defaults to one
+        # so the content-deletion path is exercised rather than skipped.
+        self.repositories = (
+            [("acme/widgets", "ws-1")] if repositories is None else repositories
+        )
         self.statements: list[tuple[str, dict[str, Any]]] = []
 
     def run(self, sql: str, **kwargs: Any):
@@ -30,10 +41,21 @@ class FakeConn:
             return [[self.tables_exist]]
         if sql.startswith("SELECT 1 FROM ghic_github_installations"):
             return [[1]] if self.connected else []
+        if sql.startswith("SELECT repo_full_name, workspace_id"):
+            repo = kwargs.get("repo")
+            if repo is not None:
+                return [[n, w] for n, w in self.repositories if n == repo]
+            return [[n, w] for n, w in self.repositories]
         return []
 
     def writes(self) -> list[str]:
         return [s for s, _ in self.statements if s.startswith(("INSERT", "UPDATE"))]
+
+    def deletes(self):
+        return [(s, p) for s, p in self.statements if s.startswith("DELETE")]
+
+    def deleted_tables(self):
+        return [s.split()[2] for s, _ in self.deletes()]
 
 
 class FakeGitHub:
@@ -42,6 +64,16 @@ class FakeGitHub:
 
     def list_installation_repositories(self, installation_id):
         return self.repos
+
+
+class FailingPurgeConn(FakeConn):
+    """Fails the first content deletion, to prove the purge rolls back."""
+
+    def run(self, sql: str, **kwargs: Any):
+        result = super().run(sql, **kwargs)
+        if sql.startswith("DELETE FROM ghic_repo_chunks"):
+            raise RuntimeError("chunk delete failed")
+        return result
 
 
 class FailingRepositoryUpdateConn(FakeConn):
@@ -75,19 +107,93 @@ def installation_payload(action: str, installation_id: int = 100, **extra):
 
 
 class TestRevocation:
-    def test_uninstalling_the_app_revokes_the_connection(self, patched):
+    def test_uninstalling_the_app_purges_everything_it_owned(self, patched):
         conn = patched(FakeConn())
         result = github_connection.handle_installation_event(
             URL, "installation", installation_payload("deleted")
         )
         assert result["ok"] is True
-        assert result["connection_sync"] == "revoked:deleted"
-        writes = conn.writes()
-        assert any("SET revoked_at = now()" in w for w in writes)
-        # Repositories are deactivated too: an installation row marked
-        # revoked while its repositories still read active would leave the
-        # dashboard listing repositories GHIC cannot read.
-        assert any("SET active = false" in w for w in writes)
+        assert result["connection_sync"] == "purged:deleted"
+        # Uninstall withdraws the mandate to hold the content, so this is a
+        # deletion rather than the status change it used to be.
+        assert conn.deleted_tables() == [
+            "ghic_repo_chunks",
+            "ghic_repository_state",
+            "ghic_ledger",
+            "ghic_github_repositories",
+            "ghic_ledger",
+            "ghic_github_installations",
+        ]
+
+    def test_the_purge_deletes_children_before_their_parents(self, patched):
+        conn = patched(FakeConn())
+        github_connection.handle_installation_event(
+            URL, "installation", installation_payload("deleted")
+        )
+        order = conn.deleted_tables()
+        # Nothing in this schema cascades, so a parent removed first would
+        # either fail on the foreign key or strand its children.
+        assert order.index("ghic_repo_chunks") < order.index("ghic_github_repositories")
+        assert order.index("ghic_repository_state") < order.index(
+            "ghic_github_repositories"
+        )
+        assert order.index("ghic_github_repositories") < order.index(
+            "ghic_github_installations"
+        )
+
+    def test_the_purge_is_scoped_to_the_owning_workspace(self, patched):
+        conn = patched(FakeConn())
+        github_connection.handle_installation_event(
+            URL, "installation", installation_payload("deleted")
+        )
+        for sql, params in conn.deletes():
+            if "ghic_repo_chunks" in sql or "ghic_repository_state" in sql:
+                assert params["ws"] == "ws-1"
+                assert params["repo"] == "acme/widgets"
+
+    def test_a_repository_without_a_workspace_keeps_its_content(self, patched):
+        # Unattributable content is left alone: guessing an owner is how one
+        # workspace's data ends up deleted by another's uninstall.
+        conn = patched(FakeConn(repositories=[("acme/widgets", "")]))
+        github_connection.handle_installation_event(
+            URL, "installation", installation_payload("deleted")
+        )
+        assert "ghic_repo_chunks" not in conn.deleted_tables()
+        assert "ghic_github_installations" in conn.deleted_tables()
+
+    def test_the_purge_runs_in_one_transaction(self, patched):
+        conn = patched(FakeConn())
+        github_connection.handle_installation_event(
+            URL, "installation", installation_payload("deleted")
+        )
+        statements = [sql for sql, _ in conn.statements]
+        deletes = [i for i, s in enumerate(statements) if s.startswith("DELETE")]
+        assert statements.index("BEGIN") < deletes[0]
+        assert deletes[-1] < statements.index("COMMIT")
+
+    def test_uninstalling_twice_is_harmless(self, patched):
+        # GitHub redelivers, and the reset path may be run by hand. The second
+        # pass must delete nothing and still report success.
+        patched(FakeConn(repositories=[]))
+        result = github_connection.handle_installation_event(
+            URL, "installation", installation_payload("deleted")
+        )
+        assert result["ok"] is True
+        assert result["connection_sync"] == "purged:deleted"
+        assert result["deleted"]["chunks"] == 0
+        assert result["deleted"]["repositories"] == 0
+
+    def test_a_failed_purge_is_reported_as_retryable(self, patched):
+        conn = patched(FailingPurgeConn())
+        result = github_connection.handle_installation_event(
+            URL, "installation", installation_payload("deleted")
+        )
+        # Never silently "ok": the caller has to know the data is still there.
+        assert result["ok"] is False
+        assert result["connection_sync"] == "purge_failed"
+        assert result["retryable"] is True
+        assert any(sql == "ROLLBACK" for sql, _ in conn.statements)
+        assert not any(sql == "COMMIT" for sql, _ in conn.statements)
 
     def test_suspension_is_treated_as_loss_of_access(self, patched):
         conn = patched(FakeConn())
@@ -122,8 +228,8 @@ class TestRevocation:
         result = github_connection.handle_installation_event(
             URL, "installation", installation_payload("deleted")
         )
-        assert result["connection_sync"] == "revoked:deleted"
-        assert conn.writes()
+        assert result["connection_sync"] == "purged:deleted"
+        assert conn.deletes()
 
     def test_unsuspending_restores_the_connection(self, patched):
         conn = patched(FakeConn(connected=True))
@@ -227,13 +333,10 @@ class TestRepositorySelection:
         )
         assert result["connection_sync"] == "repositories"
         assert result["removed"] == 1
-        deactivations = [
-            (sql, params)
-            for sql, params in conn.statements
-            if "SET active = false" in sql
-        ]
-        assert len(deactivations) == 1
-        assert deactivations[0][1]["repo"] == "acme/widgets"
+        # Only the named repository is purged; the installation survives.
+        assert "ghic_github_installations" not in conn.deleted_tables()
+        for sql, params in conn.deletes():
+            assert params.get("repo", "acme/widgets") == "acme/widgets"
 
     def test_adding_a_repository_activates_it(self, patched):
         conn = patched(FakeConn())
@@ -270,6 +373,25 @@ class TestRepositorySelection:
             ),
         )
         assert result["connection_sync"] == "repository:deleted"
+        # A repository deleted on GitHub can never be re-verified, so its
+        # index goes with it.
+        assert "ghic_repo_chunks" in conn.deleted_tables()
+        assert "ghic_github_repositories" in conn.deleted_tables()
+        assert "ghic_github_installations" not in conn.deleted_tables()
+
+    def test_an_archived_repository_keeps_its_index(self, patched):
+        # Archiving is reversible and the code is still readable, so paying to
+        # re-embed on unarchive would be waste.
+        conn = patched(FakeConn())
+        result = github_connection.handle_installation_event(
+            URL,
+            "repository",
+            installation_payload(
+                "archived", repository={"full_name": "acme/widgets"}
+            ),
+        )
+        assert result["connection_sync"] == "repository:archived"
+        assert not conn.deletes()
         assert any("SET active = false" in w for w in conn.writes())
 
 
@@ -344,6 +466,70 @@ class TestWebhookRouting:
         assert resp.status_code == 200
         assert resp.json()["connection_sync"] == "stub"
         assert seen == {"event": "installation", "action": "deleted"}
+
+    def test_a_failed_purge_answers_500_and_frees_the_delivery_for_retry(
+        self, monkeypatch
+    ):
+        import json
+
+        from tests.test_service import SECRET, make_client, make_settings, sign
+
+        monkeypatch.setattr(
+            github_connection,
+            "handle_installation_event",
+            lambda *a, **k: {
+                "ok": False,
+                "connection_sync": "purge_failed",
+                "retryable": True,
+            },
+        )
+
+        client = make_client(make_settings())
+        payload = {"action": "deleted", "installation": {"id": 100}}
+        body = json.dumps(payload).encode()
+        headers = {
+            "X-GitHub-Event": "installation",
+            "X-Hub-Signature-256": sign(body, SECRET),
+            "X-GitHub-Delivery": "delivery-purge-1",
+            "Content-Type": "application/json",
+        }
+        resp = client.post("/webhook", content=body, headers=headers)
+
+        # A purge that failed must not be acknowledged as done.
+        assert resp.status_code == 500
+
+        store = client.app.state.idempotency
+        # The delivery is marked consumed before the handler runs, so unless
+        # the key is released the retry below would be dropped as a duplicate
+        # and the data would never be cleaned up.
+        assert store.mark_if_new("delivery-purge-1") is True
+
+    def test_a_successful_purge_still_consumes_the_delivery(self, monkeypatch):
+        import json
+
+        from tests.test_service import SECRET, make_client, make_settings, sign
+
+        monkeypatch.setattr(
+            github_connection,
+            "handle_installation_event",
+            lambda *a, **k: {"ok": True, "connection_sync": "purged:deleted"},
+        )
+
+        client = make_client(make_settings())
+        payload = {"action": "deleted", "installation": {"id": 100}}
+        body = json.dumps(payload).encode()
+        headers = {
+            "X-GitHub-Event": "installation",
+            "X-Hub-Signature-256": sign(body, SECRET),
+            "X-GitHub-Delivery": "delivery-purge-2",
+            "Content-Type": "application/json",
+        }
+        resp = client.post("/webhook", content=body, headers=headers)
+
+        assert resp.status_code == 200
+        # Released only on failure: a successful purge keeps its replay guard.
+        store = client.app.state.idempotency
+        assert store.mark_if_new("delivery-purge-2") is False
 
     def test_an_unrelated_event_is_still_ignored(self):
         import json

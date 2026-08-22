@@ -355,7 +355,22 @@ def create_app(
             # delivery that was otherwise handled.
             from .github_connection import handle_installation_event
 
-            return handle_installation_event(s.database_url, event, payload, app.state.gh)
+            result = handle_installation_event(
+                s.database_url, event, payload, app.state.gh
+            )
+            if not result.get("ok", True) and result.get("retryable"):
+                # This delivery was marked consumed before the handler ran, so
+                # GitHub's retry would be discarded as a duplicate unless the
+                # key is released first -- which would make the 500 below
+                # meaningless. Safe only because the purge is idempotent.
+                release = getattr(app.state.idempotency, "release", None)
+                if delivery_id and callable(release):
+                    release(delivery_id)
+                raise HTTPException(
+                    status_code=500,
+                    detail=str(result.get("connection_sync") or "cleanup failed"),
+                )
+            return result
         return {"ok": True, "ignored": f"{event}/{payload.get('action')}"}
 
     @app.post("/api/predict")

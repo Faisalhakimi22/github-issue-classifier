@@ -379,6 +379,162 @@ def _repo_names(payload: dict, key: str) -> list[str]:
     return names
 
 
+# Tables the backend creates lazily. A purge must not fail because indexing
+# has never run in this environment.
+_OPTIONAL_TABLES = ("ghic_repo_chunks", "ghic_repository_state", "ghic_ledger")
+
+
+def _table_present(conn: Any, table: str) -> bool:
+    rows = conn.run(
+        "SELECT to_regclass(:qualified) IS NOT NULL", qualified="public." + table
+    )
+    return bool(rows and rows[0][0])
+
+
+def _purge_repository_data(
+    conn: Any, repo: str, workspace_id: str, counts: dict[str, int]
+) -> None:
+    """Delete the content one repository owns, inside the caller's transaction.
+
+    Scoped by (workspace_id, repo) rather than repo alone. repo_full_name is
+    globally unique today, but the pair is the actual ownership key and the
+    one the foreign keys are declared on.
+    """
+    present = {t: _table_present(conn, t) for t in _OPTIONAL_TABLES}
+
+    if present["ghic_repo_chunks"]:
+        rows = conn.run(
+            "DELETE FROM ghic_repo_chunks "
+            "WHERE workspace_id = :ws AND repo = :repo RETURNING 1",
+            ws=workspace_id, repo=repo,
+        )
+        counts["chunks"] += len(rows)
+
+    if present["ghic_repository_state"]:
+        rows = conn.run(
+            "DELETE FROM ghic_repository_state "
+            "WHERE workspace_id = :ws AND repo = :repo RETURNING 1",
+            ws=workspace_id, repo=repo,
+        )
+        counts["repository_state"] += len(rows)
+
+    if present["ghic_ledger"]:
+        # workspace_id must match as well as the repository name: rows with a
+        # NULL workspace belong to no installation and are left alone.
+        rows = conn.run(
+            "DELETE FROM ghic_ledger "
+            "WHERE workspace_id = :ws AND data->>'repo' = :repo RETURNING 1",
+            ws=workspace_id, repo=repo,
+        )
+        counts["ledger"] += len(rows)
+
+
+def purge_installation(conn: Any, installation_id: int) -> dict[str, int]:
+    """Hard-delete everything owned exclusively by one GitHub installation.
+
+    Ordered children-first because nothing in this schema cascades. The
+    opening SELECT ... FOR UPDATE is the important part: authorization_lease
+    holds the same rows while a job clones and indexes, so this blocks until
+    any in-flight job finishes rather than deleting rows out from under it.
+    Once the rows are gone that lease finds nothing and every queued job
+    fails closed with "repository_not_connected" -- deleting the rows is the
+    kill switch, so no separate job cancellation is needed.
+
+    Idempotent: every statement is a DELETE ... WHERE, so running it twice
+    removes nothing the second time and still succeeds.
+    """
+    counts = {"chunks": 0, "repository_state": 0, "ledger": 0,
+              "repositories": 0, "installations": 0}
+
+    # Lock the installation before its repositories, matching the order
+    # authorization_lease takes them in, so the two cannot deadlock.
+    conn.run(
+        "SELECT 1 FROM ghic_github_installations "
+        "WHERE installation_id = :iid FOR UPDATE",
+        iid=installation_id,
+    )
+    repo_rows = conn.run(
+        "SELECT repo_full_name, workspace_id FROM ghic_github_repositories "
+        "WHERE installation_id = :iid FOR UPDATE",
+        iid=installation_id,
+    )
+
+    workspaces = set()
+    for repo_full_name, workspace_id in repo_rows:
+        if not workspace_id:
+            # Cannot attribute it; leaving it is safer than guessing.
+            logger.warning(
+                "repository %s has no workspace; skipping its content purge",
+                repo_full_name,
+            )
+            continue
+        workspaces.add(str(workspace_id))
+        _purge_repository_data(conn, str(repo_full_name), str(workspace_id), counts)
+
+    rows = conn.run(
+        "DELETE FROM ghic_github_repositories "
+        "WHERE installation_id = :iid RETURNING 1",
+        iid=installation_id,
+    )
+    counts["repositories"] += len(rows)
+
+    # Ledger rows an installation owns without naming a repository --
+    # authorization skips, for instance -- are attributed by installation id.
+    if _table_present(conn, "ghic_ledger"):
+        for workspace_id in workspaces:
+            rows = conn.run(
+                "DELETE FROM ghic_ledger "
+                "WHERE workspace_id = :ws "
+                "AND data->>'installation_id' = :iid RETURNING 1",
+                ws=workspace_id, iid=str(installation_id),
+            )
+            counts["ledger"] += len(rows)
+
+    rows = conn.run(
+        "DELETE FROM ghic_github_installations "
+        "WHERE installation_id = :iid RETURNING 1",
+        iid=installation_id,
+    )
+    counts["installations"] += len(rows)
+    return counts
+
+
+def purge_repositories(
+    conn: Any, installation_id: int, repo_full_names: list[str]
+) -> dict[str, int]:
+    """Purge named repositories without touching the installation itself.
+
+    For installation_repositories/removed and repository/deleted: the App is
+    still installed, so the installation row and every other repository it
+    owns must survive.
+    """
+    counts = {"chunks": 0, "repository_state": 0, "ledger": 0,
+              "repositories": 0, "installations": 0}
+    for name in repo_full_names:
+        rows = conn.run(
+            "SELECT repo_full_name, workspace_id FROM ghic_github_repositories "
+            "WHERE installation_id = :iid AND repo_full_name = :repo FOR UPDATE",
+            iid=installation_id, repo=name,
+        )
+        if not rows:
+            continue
+        repo_full_name, workspace_id = rows[0]
+        if not workspace_id:
+            logger.warning(
+                "repository %s has no workspace; skipping its content purge",
+                repo_full_name,
+            )
+            continue
+        _purge_repository_data(conn, str(repo_full_name), str(workspace_id), counts)
+        deleted = conn.run(
+            "DELETE FROM ghic_github_repositories "
+            "WHERE installation_id = :iid AND repo_full_name = :repo RETURNING 1",
+            iid=installation_id, repo=name,
+        )
+        counts["repositories"] += len(deleted)
+    return counts
+
+
 def handle_installation_event(
     database_url: str, event: str, payload: dict, github_client: Any = None
 ) -> dict[str, Any]:
@@ -408,11 +564,31 @@ def handle_installation_event(
             # read the repositories, and showing them as connected would be
             # wrong in exactly the same way.
             if event == "installation" and action == "deleted":
-                _mark_revoked(conn, installation_id)
+                # Uninstall is the source of truth for cleanup. GHIC can no
+                # longer read any of it, and indexed content we keep after the
+                # mandate is withdrawn is content we are holding without one.
+                try:
+                    with _transaction(conn):
+                        counts = purge_installation(conn, installation_id)
+                except Exception:
+                    logger.exception(
+                        "purge failed for installation %s", installation_id
+                    )
+                    # Surfaced rather than swallowed. A purge that fails
+                    # quietly leaves behind exactly the data uninstalling was
+                    # supposed to remove, so the caller answers non-2xx and
+                    # releases the delivery key for GitHub to retry.
+                    return {
+                        "ok": False,
+                        "connection_sync": "purge_failed",
+                        "retryable": True,
+                        "installation_id": installation_id,
+                    }
                 return {
                     "ok": True,
-                    "connection_sync": "revoked:deleted",
+                    "connection_sync": "purged:deleted",
                     "installation_id": installation_id,
+                    "deleted": counts,
                 }
 
             if event == "installation" and action == "suspend":
@@ -480,19 +656,28 @@ def handle_installation_event(
                     if authoritative_repos is None:
                         if removed:
                             with _transaction(conn):
-                                _deactivate_repos(conn, installation_id, removed)
+                                purge_repositories(conn, installation_id, removed)
                         return {
                             "ok": True,
                             "connection_sync": "reconciliation_unavailable",
                             "added": 0,
                             "removed": len(removed),
                         }
+                    # A name can appear in both lists when GitHub batches a
+                    # remove and re-add; purging those would throw away the
+                    # index of a repository that is still connected.
+                    still_present = {
+                        str(r.get("full_name") or "") for r in authoritative_repos
+                    }
+                    gone = [name for name in removed if name not in still_present]
                     with _transaction(conn):
                         _deactivate_all_repos(conn, installation_id)
                         _activate_repos(conn, installation_id, authoritative_repos)
+                        if gone:
+                            purge_repositories(conn, installation_id, gone)
                 elif removed:
                     with _transaction(conn):
-                        _deactivate_repos(conn, installation_id, removed)
+                        purge_repositories(conn, installation_id, removed)
                 return {
                     "ok": True,
                     "connection_sync": "repositories",
@@ -505,7 +690,15 @@ def handle_installation_event(
                 name = str(repo.get("full_name") or "")
                 if name:
                     with _transaction(conn):
-                        _deactivate_repos(conn, installation_id, [name])
+                        if action == "deleted":
+                            # The repository no longer exists on GitHub, so
+                            # its index can never be refreshed or verified.
+                            purge_repositories(conn, installation_id, [name])
+                        else:
+                            # Archived is reversible and the code is still
+                            # readable; deactivating keeps the index for an
+                            # unarchive instead of paying to rebuild it.
+                            _deactivate_repos(conn, installation_id, [name])
                 return {"ok": True, "connection_sync": f"repository:{action}"}
 
         return {"ok": True, "connection_sync": f"ignored:{event}/{action}"}

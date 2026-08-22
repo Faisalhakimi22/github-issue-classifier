@@ -38,6 +38,20 @@ class IdempotencyStore(Protocol):
         the caller should proceed. False means it's a duplicate -- skip."""
         ...
 
+    def release(self, key: str) -> None:
+        """Forget `key` so a redelivery is processed instead of skipped.
+
+        A delivery is marked consumed before it is handled, which is right
+        for issue events: a retry must not post a second comment. It is
+        wrong for a handler whose work must actually complete. If such a
+        handler fails, the delivery was recorded as done while nothing was
+        done, and GitHub's retry would be discarded as a duplicate.
+
+        Releasing the key on that failure path is what makes a non-2xx
+        response mean anything. Only use it for work that is safe to repeat.
+        """
+        ...
+
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS ghic_idempotency (
@@ -74,6 +88,9 @@ class PostgresIdempotencyStore:
         )
         return len(rows) > 0
 
+    def release(self, key: str) -> None:
+        self._conn.run("DELETE FROM ghic_idempotency WHERE key = :key", key=key)
+
 
 class FileIdempotencyStore:
     """Single-writer assumption, same as tracking.py's JSONL ledger backend --
@@ -99,6 +116,12 @@ class FileIdempotencyStore:
             self._path.write_text(json.dumps(sorted(self._seen)), encoding="utf-8")
             return True
 
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._seen.discard(key)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(sorted(self._seen)), encoding="utf-8")
+
 
 class _InMemoryIdempotencyStore:
     def __init__(self) -> None:
@@ -111,6 +134,10 @@ class _InMemoryIdempotencyStore:
                 return False
             self._seen.add(key)
             return True
+
+    def release(self, key: str) -> None:
+        with self._lock:
+            self._seen.discard(key)
 
 
 def build_idempotency_store(
