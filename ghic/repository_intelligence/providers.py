@@ -212,7 +212,9 @@ def build_service(
             qstash_token=qstash_token,
             callback_url=callback_url,
             qstash_region=qstash_region,
-            inline_worker=lambda repo, installation_id: service.index_repository(repo),
+            inline_worker=lambda repo, installation_id, workspace_id=None: service.index_repository(
+                repo, workspace_id=workspace_id
+            ),
         )
     except ProviderUnavailable as e:
         logger.warning("index queue unavailable (%s); auto-indexing is off", e)

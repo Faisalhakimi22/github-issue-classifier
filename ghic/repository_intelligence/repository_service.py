@@ -105,13 +105,18 @@ class RepositoryIntelligenceService:
         *,
         category: str = "",
         predicted_label: int | None = None,
+        installation_id: Any = None,
+        workspace_id: Any = None,
     ) -> RepositoryContext:
         """Retrieve repository evidence for one issue. Never raises."""
         set_repo_context(repo)
         self.metrics.increment("retrievals_total")
         try:
+            workspace_id = self._workspace_context(repo, workspace_id)
             with self.metrics.timed("retrieval"):
-                context = self._get_context(repo, title, body, category, predicted_label)
+                context = self._get_context(
+                    repo, title, body, category, predicted_label, installation_id, workspace_id
+                )
         except Exception as e:  # the contract: analysis continues regardless
             self.metrics.increment("retrieval_errors")
             logger.warning("repository intelligence unavailable for %s (%s: %s)",
@@ -123,21 +128,30 @@ class RepositoryIntelligenceService:
         if not context.is_empty:
             self.metrics.increment("retrievals_with_results")
         if self.state_store is not None and context.indexed:
-            self.state_store.record_retrieval(repo, hit=not context.is_empty)
+            self.state_store.record_retrieval(
+                repo, hit=not context.is_empty, workspace_id=workspace_id
+            )
         return context
 
     def _get_context(
         self, repo: str, title: str, body: str, category: str, predicted_label: int | None,
+        installation_id: Any = None,
+        workspace_id: Any = None,
     ) -> RepositoryContext:
         if not self.cfg.vector_search_enabled:
             return RepositoryContext(repo=repo, note=EMPTY_CONTEXT_NOTE)
 
-        record = self.state_store.get(repo) if self.state_store is not None else None
+        record = (
+            self.state_store.get(repo, workspace_id=workspace_id)
+            if self.state_store is not None else None
+        )
 
         # With a state store, lifecycle decides whether to search at all --
         # state is authoritative, never inferred from the filesystem.
         if record is not None and not record.state.is_searchable:
-            return self._schedule_and_return_empty(repo, f"state={record.state.value}", record)
+            return self._schedule_and_return_empty(
+                repo, f"state={record.state.value}", record, installation_id, workspace_id
+            )
 
         if record is not None and self._embedding_changed(record):
             logger.warning(
@@ -146,12 +160,15 @@ class RepositoryIntelligenceService:
                 self.embedder.metadata().signature,
             )
             return self._schedule_and_return_empty(
-                repo, "embedding provider/model/dimension changed", record
+                repo, "embedding provider/model/dimension changed", record,
+                installation_id, workspace_id
             )
 
-        store, metadata = self._load_index(repo, record)
+        store, metadata = self._load_index(repo, record, workspace_id)
         if store is None:
-            return self._schedule_and_return_empty(repo, "no usable index", record)
+            return self._schedule_and_return_empty(
+                repo, "no usable index", record, installation_id, workspace_id
+            )
 
         chunks = self.retriever.retrieve(
             store, title, body, category=category, predicted_label=predicted_label,
@@ -162,7 +179,7 @@ class RepositoryIntelligenceService:
         )
 
     def _load_index(
-        self, repo: str, record: RepositoryRecord | None
+        self, repo: str, record: RepositoryRecord | None, workspace_id: Any = None
     ) -> tuple[Any, RepositoryMetadata | None]:
         """Open this repo's index, whichever backend holds it."""
         self.metrics.increment("index_cache_lookups")
@@ -181,7 +198,7 @@ class RepositoryIntelligenceService:
                 else self.embedder.dimensions
             )
             store = PostgresVectorStore(
-                self.cfg.database_url, repo, dimensions
+                self.cfg.database_url, repo, dimensions, workspace_id=str(workspace_id) if workspace_id else None
             )
             if not store.size:
                 return None, None
@@ -208,8 +225,11 @@ class RepositoryIntelligenceService:
 
     def _schedule_and_return_empty(
         self, repo: str, reason: str, record: RepositoryRecord | None = None,
+        installation_id: Any = None, workspace_id: Any = None,
     ) -> RepositoryContext:
-        queued = self._request_indexing(repo, record, reason)
+        queued = self._request_indexing(
+            repo, record, reason, installation_id, workspace_id
+        )
         logger.info("no repository index for %s (%s); queued=%s", repo, reason, queued)
         return RepositoryContext(
             repo=repo, indexed=False, indexing_queued=queued,
@@ -218,6 +238,7 @@ class RepositoryIntelligenceService:
 
     def _request_indexing(
         self, repo: str, record: RepositoryRecord | None, reason: str,
+        installation_id: Any = None, workspace_id: Any = None,
     ) -> bool:
         """Queue an index job unless one is already in flight.
 
@@ -240,7 +261,13 @@ class RepositoryIntelligenceService:
         queued = False
         try:
             if self.index_queue is not None:
-                queued = self.index_queue.enqueue(repo, reason=reason)
+                queue_kwargs = {
+                    "installation_id": installation_id,
+                    "reason": reason,
+                }
+                if workspace_id is not None:
+                    queue_kwargs["workspace_id"] = workspace_id
+                queued = self.index_queue.enqueue(repo, **queue_kwargs)
             elif self.index_scheduler is not None:      # Phase 1 compatibility
                 queued = bool(self.index_scheduler(repo))
         except Exception as e:  # a queue outage must not surface here
@@ -248,18 +275,27 @@ class RepositoryIntelligenceService:
             return False
 
         if queued and self.state_store is not None:
-            self.state_store.mark(repo, RepositoryState.QUEUED)
+            self.state_store.mark(
+                repo, RepositoryState.QUEUED, workspace_id=workspace_id
+            )
         return queued
 
     # ------------------------------------------------------------------
     # Write path -- runs in the background, never inside a webhook.
     # ------------------------------------------------------------------
-    def index_repository(self, repo: str, *, token: str = "", force: bool = False) -> bool:
+    def index_repository(
+        self, repo: str, *, token: str = "", force: bool = False,
+        workspace_id: Any = None,
+    ) -> bool:
         """Clone/update, index, persist. Returns True when an index exists
         afterwards. Never raises -- the background job logs and gives up."""
         set_repo_context(repo)
+        workspace_id = self._workspace_context(repo, workspace_id)
         started = time.time()
-        record = self.state_store.get(repo) if self.state_store is not None else None
+        record = (
+            self.state_store.get(repo, workspace_id=workspace_id)
+            if self.state_store is not None else None
+        )
         # UPDATING, not INDEXING, when a usable index already exists: it
         # stays searchable while the update runs.
         in_progress = (
@@ -267,13 +303,16 @@ class RepositoryIntelligenceService:
             if record and record.state == RepositoryState.READY
             else RepositoryState.INDEXING
         )
-        self._mark(repo, in_progress)
+        self._mark(repo, in_progress, workspace_id=workspace_id)
 
         try:
             checkout = self.repo_cache.ensure(repo, token=token)
         except (RepositoryCacheError, Exception) as e:
             self.metrics.increment("index_jobs_failed")
-            self._mark(repo, RepositoryState.FAILED, error=f"clone failed: {e}")
+            self._mark(
+                repo, RepositoryState.FAILED, workspace_id=workspace_id,
+                error=f"clone failed: {e}",
+            )
             logger.warning("clone/fetch failed for %s: %s", repo, e)
             return False
 
@@ -286,22 +325,28 @@ class RepositoryIntelligenceService:
         if (
             not force and not embedder_changed
             and previous_sha == checkout.commit_sha
-            and self._index_exists(repo, checkout.commit_sha)
+            and self._index_exists(repo, checkout.commit_sha, workspace_id=workspace_id)
         ):
             self.metrics.increment("index_jobs_skipped_unchanged")
-            self._mark(repo, RepositoryState.READY, indexed_commit_sha=checkout.commit_sha)
+            self._mark(
+                repo, RepositoryState.READY, workspace_id=workspace_id,
+                indexed_commit_sha=checkout.commit_sha,
+            )
             logger.info("index for %s already current at %s", repo, checkout.commit_sha[:8])
             return True
 
         try:
             with self.metrics.timed("indexing"):
-                ok = self._run_index(
-                    repo, checkout, previous_sha,
-                    force=force or embedder_changed,
-                )
+                run_kwargs = {"force": force or embedder_changed}
+                if workspace_id is not None:
+                    run_kwargs["workspace_id"] = workspace_id
+                ok = self._run_index(repo, checkout, previous_sha, **run_kwargs)
         except Exception as e:
             self.metrics.increment("index_jobs_failed")
-            self._mark(repo, RepositoryState.FAILED, error=f"indexing failed: {e}")
+            self._mark(
+                repo, RepositoryState.FAILED, workspace_id=workspace_id,
+                error=f"indexing failed: {e}",
+            )
             logger.warning("indexing failed for %s (%s: %s)", repo, type(e).__name__, e)
             return False
 
@@ -311,7 +356,8 @@ class RepositoryIntelligenceService:
         return ok
 
     def _run_index(
-        self, repo: str, checkout: Any, previous_sha: str, *, force: bool
+        self, repo: str, checkout: Any, previous_sha: str, *, force: bool,
+        workspace_id: Any = None
     ) -> bool:
         """Full or incremental index, depending on what changed."""
         change_set = None
@@ -321,8 +367,10 @@ class RepositoryIntelligenceService:
                 self.cfg.git_timeout_seconds,
             )
             if change_set is not None and change_set.is_empty:
-                self._mark(repo, RepositoryState.READY,
-                           indexed_commit_sha=checkout.commit_sha)
+                self._mark(
+                    repo, RepositoryState.READY, workspace_id=workspace_id,
+                    indexed_commit_sha=checkout.commit_sha,
+                )
                 return True
 
         incremental = (
@@ -330,11 +378,16 @@ class RepositoryIntelligenceService:
             and should_use_incremental(change_set, self.cfg.max_incremental_files)
         )
         if incremental:
-            return self._index_incremental(repo, checkout, change_set)
+            if workspace_id is None:
+                return self._index_incremental(repo, checkout, change_set)
+            return self._index_incremental(
+                repo, checkout, change_set, workspace_id=workspace_id
+            )
+        if workspace_id is None:
+            return self._index_full(repo, checkout, allow_dimension_migration=force)
         return self._index_full(
-            repo,
-            checkout,
-            allow_dimension_migration=force,
+            repo, checkout, allow_dimension_migration=force,
+            workspace_id=str(workspace_id),
         )
 
     def _history_chunks(self, repo: str, checkout: Any) -> list[Any]:
@@ -371,6 +424,7 @@ class RepositoryIntelligenceService:
         checkout: Any,
         *,
         allow_dimension_migration: bool = False,
+        workspace_id: Any = None,
     ) -> bool:
         store, metadata = self.indexer.build(
             repo, checkout.path,
@@ -391,6 +445,7 @@ class RepositoryIntelligenceService:
                 vectors,
                 chunks,
                 allow_dimension_migration=allow_dimension_migration,
+                workspace_id=str(workspace_id) if workspace_id else None,
             )
         else:
             self.index_cache.save(
@@ -399,10 +454,12 @@ class RepositoryIntelligenceService:
             self.index_cache.set_latest(repo, checkout.commit_sha, self.embedder.name)
 
         self.metrics.increment("index_full_rebuilds")
-        self._mark_ready(repo, checkout, metadata)
+        self._mark_ready(repo, checkout, metadata, workspace_id=workspace_id)
         return True
 
-    def _index_incremental(self, repo: str, checkout: Any, change_set: Any) -> bool:
+    def _index_incremental(
+        self, repo: str, checkout: Any, change_set: Any, *, workspace_id: Any = None
+    ) -> bool:
         """Re-embed only what changed, and drop what disappeared.
 
         Postgres-only: it needs per-path deletes, which a monolithic local
@@ -412,7 +469,10 @@ class RepositoryIntelligenceService:
         from . import parser
         from .vector_pg import PostgresVectorStore
 
-        store = PostgresVectorStore(self.cfg.database_url, repo, self.embedder.dimensions)
+        store = PostgresVectorStore(
+            self.cfg.database_url, repo, self.embedder.dimensions,
+            workspace_id=str(workspace_id) if workspace_id else None,
+        )
         removed = store.delete_paths(change_set.stale_paths)
 
         chunks = []
@@ -447,7 +507,7 @@ class RepositoryIntelligenceService:
             "%d chunks removed, %d added",
             repo, len(change_set.changed), len(change_set.deleted), removed, len(chunks),
         )
-        self._mark_ready(repo, checkout, metadata)
+        self._mark_ready(repo, checkout, metadata, workspace_id=workspace_id)
         return True
 
     def _add_history(self, repo: str, checkout: Any, store: Any) -> int:
@@ -460,30 +520,73 @@ class RepositoryIntelligenceService:
         self.metrics.increment("history_chunks_indexed", len(chunks))
         return len(chunks)
 
-    def _index_exists(self, repo: str, commit_sha: str) -> bool:
+    def _index_exists(
+        self, repo: str, commit_sha: str, *, workspace_id: Any = None
+    ) -> bool:
         if self.cfg.vector_provider == "postgres":
             from .vector_pg import PostgresVectorStore
 
             return PostgresVectorStore(
-                self.cfg.database_url, repo, self.embedder.dimensions
+                self.cfg.database_url, repo, self.embedder.dimensions,
+                workspace_id=str(workspace_id) if workspace_id else None,
             ).size > 0
         return self.index_cache.has(repo, commit_sha, self.embedder.name)
 
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
-    def _mark(self, repo: str, state: RepositoryState, **fields: Any) -> None:
+    def _workspace_context(self, repo: str, workspace_id: Any = None) -> str | None:
+        """Resolve tenant context for durable Postgres operations.
+
+        Webhooks and queued jobs provide the value only after their
+        authorization gate. Direct administrative callers may omit it, in
+        which case the state backend can derive it from the authoritative
+        repository ownership row. No Postgres operation proceeds unscoped.
+        """
+        value = str(workspace_id or "").strip()
+        requires = bool(
+            self.cfg.vector_provider == "postgres"
+            or getattr(self.state_store, "requires_workspace", False)
+        )
+        if not requires:
+            return value or None
+        resolver = getattr(self.state_store, "resolve_workspace", None)
+        if resolver is not None and repo != "__list__":
+            authoritative = str(resolver(repo) or "").strip()
+            if not authoritative:
+                raise ValueError(
+                    f"active repository ownership is required for production operations: {repo}"
+                )
+            if value and value != authoritative:
+                raise ValueError(
+                    f"workspace context does not own active repository {repo}"
+                )
+            return authoritative
+        if not value:
+            raise ValueError(
+                f"workspace context is required for production repository operations: {repo}"
+            )
+        return value
+
+    def _mark(
+        self, repo: str, state: RepositoryState, *, workspace_id: Any = None,
+        **fields: Any
+    ) -> None:
         if self.state_store is None:
             return
         try:
-            self.state_store.mark(repo, state, **fields)
+            self.state_store.mark(repo, state, workspace_id=workspace_id, **fields)
         except Exception as e:  # state is observability, never the critical path
             logger.debug("could not record state %s for %s: %s", state.value, repo, e)
 
-    def _mark_ready(self, repo: str, checkout: Any, metadata: RepositoryMetadata) -> None:
+    def _mark_ready(
+        self, repo: str, checkout: Any, metadata: RepositoryMetadata,
+        *, workspace_id: Any = None,
+    ) -> None:
         embedding = self.embedder.metadata()
         self._mark(
             repo, RepositoryState.READY,
+            workspace_id=workspace_id,
             indexed_commit_sha=checkout.commit_sha,
             default_branch=checkout.default_branch,
             embedding_provider=embedding.provider,
@@ -504,9 +607,11 @@ class RepositoryIntelligenceService:
     # ------------------------------------------------------------------
     def index_local_path(
         self, repo: str, root: Path, *, commit_sha: str = "local", default_branch: str = "",
+        workspace_id: Any = None,
     ) -> RepositoryMetadata | None:
         """Index a directory already on disk (CLI, tests, monorepo
         subdirectory). Bypasses git entirely."""
+        workspace_id = self._workspace_context(repo, workspace_id)
         try:
             store, metadata = self.indexer.build(
                 repo, root, default_branch=default_branch, commit_sha=commit_sha,
@@ -533,6 +638,7 @@ class RepositoryIntelligenceService:
                 self.embedder.dimensions,
                 vectors,
                 chunks,
+                workspace_id=workspace_id,
             )
         else:
             self.index_cache.save(repo, commit_sha, self.embedder.name, store, metadata)
@@ -543,7 +649,7 @@ class RepositoryIntelligenceService:
         self._mark_ready(
             repo,
             SimpleNamespace(commit_sha=commit_sha, default_branch=default_branch),
-            metadata,
+            metadata, workspace_id=workspace_id,
         )
         return metadata
 
@@ -562,25 +668,37 @@ class RepositoryIntelligenceService:
             return False
         return record.embedding_dimensions != current.dimensions
 
-    def is_indexed(self, repo: str) -> bool:
+    def is_indexed(self, repo: str, *, workspace_id: Any = None) -> bool:
+        workspace_id = self._workspace_context(repo, workspace_id)
         if self.state_store is not None:
-            record = self.state_store.get(repo)
+            record = self.state_store.get(repo, workspace_id=workspace_id)
             if record is not None:
                 return record.state.is_searchable
         return self.index_cache.get_latest(repo) is not None
 
-    def status(self, repo: str) -> RepositoryRecord | None:
-        return self.state_store.get(repo) if self.state_store is not None else None
+    def status(self, repo: str, *, workspace_id: Any = None) -> RepositoryRecord | None:
+        workspace_id = self._workspace_context(repo, workspace_id)
+        return (
+            self.state_store.get(repo, workspace_id=workspace_id)
+            if self.state_store is not None else None
+        )
 
-    def list_repositories(self, limit: int = 100) -> list[RepositoryRecord]:
-        return self.state_store.list(limit=limit) if self.state_store is not None else []
+    def list_repositories(
+        self, limit: int = 100, *, workspace_id: Any = None
+    ) -> list[RepositoryRecord]:
+        workspace_id = self._workspace_context("__list__", workspace_id)
+        return (
+            self.state_store.list(limit=limit, workspace_id=workspace_id)
+            if self.state_store is not None else []
+        )
 
     # ------------------------------------------------------------------
     # Maintenance
     # ------------------------------------------------------------------
-    def forget(self, repo: str) -> None:
+    def forget(self, repo: str, *, workspace_id: Any = None) -> None:
         """Remove everything for one repository -- used when an App
         installation is deleted or a repo is removed."""
+        workspace_id = self._workspace_context(repo, workspace_id)
         try:
             self.index_cache.purge(repo)
             self.repo_cache.remove(repo)
@@ -588,14 +706,18 @@ class RepositoryIntelligenceService:
                 from .vector_pg import PostgresVectorStore
 
                 PostgresVectorStore(
-                    self.cfg.database_url, repo, self.embedder.dimensions
+                    self.cfg.database_url, repo, self.embedder.dimensions,
+                    workspace_id=workspace_id,
                 ).clear()
         except Exception as e:
             logger.warning("cleanup failed for %s: %s", repo, e)
         if self.state_store is not None:
-            self.state_store.delete(repo)
+            self.state_store.delete(repo, workspace_id=workspace_id)
 
-    def cleanup(self, *, stale_days: int | None = None, dry_run: bool = False) -> dict[str, Any]:
+    def cleanup(
+        self, *, stale_days: int | None = None, dry_run: bool = False,
+        workspace_id: Any = None,
+    ) -> dict[str, Any]:
         """Drop indexes for repositories nothing has touched in a while.
 
         Storage is the cost that grows silently: a repository indexed once
@@ -610,12 +732,13 @@ class RepositoryIntelligenceService:
         if self.state_store is None:
             return {"removed": [], "reason": "no state store; cleanup needs durable state"}
 
-        for record in self.state_store.list(limit=10_000):
+        workspace_id = self._workspace_context("__list__", workspace_id)
+        for record in self.state_store.list(limit=10_000, workspace_id=workspace_id):
             touched = max(record.last_accessed_at, record.indexed_at, record.updated_at)
             if record.state == RepositoryState.ARCHIVED or (touched and touched < cutoff):
                 removed.append(record.repo)
                 if not dry_run:
-                    self.forget(record.repo)
+                    self.forget(record.repo, workspace_id=workspace_id)
         if removed:
             logger.info("cleanup removed %d stale repository index(es)", len(removed))
         return {"removed": removed, "stale_days": stale_days, "dry_run": dry_run}

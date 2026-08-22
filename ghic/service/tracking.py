@@ -114,7 +114,12 @@ class PredictionTracker:
         self._replay()
 
     # -- persistence ----------------------------------------------------------
-    def _append(self, record: dict[str, Any]) -> None:
+    def _append(self, record: dict[str, Any], workspace_id: Any) -> None:
+        # Workspace ownership is event-scoped. Never read it from mutable
+        # tracker/process state because concurrent webhook requests can cross.
+        record["workspace_id"] = (
+            None if workspace_id is None else str(workspace_id)
+        )
         self._backend.append(record)
 
     def _replay(self) -> None:
@@ -171,16 +176,16 @@ class PredictionTracker:
             self.label_counts[rec["label"]] += 1
 
     def record_prediction(self, repo: str, number: int, proba: float, predicted: int,
-                          related_count: int = 0) -> None:
+                          related_count: int = 0, *, workspace_id: Any) -> None:
         rec = {"type": "prediction", "repo": repo, "number": number,
                "proba": round(proba, 4), "predicted": predicted,
                "related_count": related_count, "at": _utcnow()}
         with self._lock:
             self._note_prediction(rec)
-            self._append(rec)
+            self._append(rec, workspace_id)
 
     def record_action(self, repo: str, number: int, action: str,
-                      detail: str = "") -> None:
+                      detail: str = "", *, workspace_id: Any) -> None:
         """Audit trail: every write the bot performs on GitHub, who/what/when.
 
         `who` is implicit (the bot is the only writer); `when` is recorded at
@@ -190,9 +195,10 @@ class PredictionTracker:
                "action": action, "detail": detail, "at": _utcnow()}
         with self._lock:
             self.actions += 1
-            self._append(rec)
+            self._append(rec, workspace_id)
 
-    def record_label_event(self, repo: str, number: int, label: str, added: bool) -> None:
+    def record_label_event(self, repo: str, number: int, label: str, added: bool, *,
+                           workspace_id: Any) -> None:
         """Maintainer labeling activity, observed live.
 
         This is deliberately collected: category labels applied while an
@@ -205,10 +211,10 @@ class PredictionTracker:
                "label": label, "added": added, "at": _utcnow()}
         with self._lock:
             self._note_label_event(rec)
-            self._append(rec)
+            self._append(rec, workspace_id)
 
     def record_analysis(
-        self, repo: str, number: int, analysis: dict[str, Any]
+        self, repo: str, number: int, analysis: dict[str, Any], *, workspace_id: Any
     ) -> None:
         """Persist one successful end-to-end issue analysis.
 
@@ -225,10 +231,11 @@ class PredictionTracker:
         })
         with self._lock:
             self.analyses += 1
-            self._append(rec)
+            self._append(rec, workspace_id)
 
     def record_processing_failure(
-        self, repo: str, number: int, error: Exception, *, stage: str = "issue_analysis"
+        self, repo: str, number: int, error: Exception, *,
+        stage: str = "issue_analysis", workspace_id: Any
     ) -> None:
         """Persist a dashboard-safe failure event without a traceback."""
         rec = {
@@ -242,9 +249,32 @@ class PredictionTracker:
         }
         with self._lock:
             self.processing_failures += 1
-            self._append(rec)
+            self._append(rec, workspace_id)
 
-    def record_outcome(self, repo: str, number: int, truth: int) -> bool:
+    def record_authorization_skip(
+        self,
+        repo: str,
+        number: int,
+        installation_id: Any,
+        reason: str,
+        *,
+        event: str = "issues",
+        workspace_id: Any,
+    ) -> None:
+        """Persist safe metadata for an intentionally skipped webhook."""
+        rec = {
+            "type": "authorization_skip",
+            "repo": repo,
+            "number": number,
+            "installation_id": installation_id,
+            "event": event,
+            "reason": reason,
+            "at": _utcnow(),
+        }
+        with self._lock:
+            self._append(rec, workspace_id)
+
+    def record_outcome(self, repo: str, number: int, truth: int, *, workspace_id: Any) -> bool:
         """Returns True when the outcome matched a tracked prediction."""
         rec = {
             "type": "outcome",
@@ -257,7 +287,7 @@ class PredictionTracker:
             known = (repo, number) in self.pending
             self._note_outcome(rec)
             if known:
-                self._append(rec)
+                self._append(rec, workspace_id)
             return known
 
     # -- reporting --------------------------------------------------------------

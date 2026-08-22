@@ -26,7 +26,8 @@ _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS ghic_ledger (
     id BIGSERIAL PRIMARY KEY,
     data JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    workspace_id TEXT
 )
 """
 
@@ -59,11 +60,14 @@ class PostgresLedgerBackend:
         self._database_url = database_url
         self._conn = _connect(database_url)
         self._conn.run(_CREATE_TABLE)
+        self._conn.run("ALTER TABLE ghic_ledger ADD COLUMN IF NOT EXISTS workspace_id TEXT")
+        self._conn.run("CREATE INDEX IF NOT EXISTS ghic_ledger_workspace_created_idx ON ghic_ledger (workspace_id, created_at)")
 
     def append(self, record: dict[str, Any]) -> None:
         self._conn.run(
-            "INSERT INTO ghic_ledger (data) VALUES (:data)",
+            "INSERT INTO ghic_ledger (data, workspace_id) VALUES (:data, :workspace_id)",
             data=json.dumps(record, ensure_ascii=False),
+            workspace_id=record.get("workspace_id"),
         )
 
     def replay(self) -> Iterator[dict[str, Any]]:

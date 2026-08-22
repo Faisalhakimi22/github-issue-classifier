@@ -225,19 +225,19 @@ class RepositoryStateStore(ABC):
     -- callers treat "unknown" as "not indexed" and continue."""
 
     @abstractmethod
-    def get(self, repo: str) -> RepositoryRecord | None:
+    def get(self, repo: str, *, workspace_id: Any = None) -> RepositoryRecord | None:
         raise NotImplementedError
 
     @abstractmethod
-    def put(self, record: RepositoryRecord) -> None:
+    def put(self, record: RepositoryRecord, *, workspace_id: Any = None) -> None:
         raise NotImplementedError
 
     @abstractmethod
-    def list(self, *, limit: int = 100) -> list[RepositoryRecord]:
+    def list(self, *, limit: int = 100, workspace_id: Any = None) -> list[RepositoryRecord]:
         raise NotImplementedError
 
     @abstractmethod
-    def delete(self, repo: str) -> None:
+    def delete(self, repo: str, *, workspace_id: Any = None) -> None:
         raise NotImplementedError
 
     @property
@@ -248,24 +248,32 @@ class RepositoryStateStore(ABC):
         every cold start re-indexes."""
         return True
 
+    @property
+    def requires_workspace(self) -> bool:
+        """Whether this backend requires tenant context for every operation."""
+        return False
+
     # -- shared helpers, identical across backends -------------------------
     def mark(
-        self, repo: str, state: RepositoryState, *, error: str = "", **fields: Any
+        self, repo: str, state: RepositoryState, *, error: str = "",
+        workspace_id: Any = None, **fields: Any
     ) -> RepositoryRecord:
         """Transition `repo` to `state`, creating the record if needed."""
         owner, _, name = repo.partition("/")
-        current = self.get(repo) or RepositoryRecord(repo=repo, owner=owner, name=name)
+        current = self.get(repo, workspace_id=workspace_id) or RepositoryRecord(
+            repo=repo, owner=owner, name=name
+        )
         record = replace(
             current, state=state, last_error=error, updated_at=time.time(), **fields
         )
-        self.put(record)
+        self.put(record, workspace_id=workspace_id)
         return record
 
-    def record_retrieval(self, repo: str, *, hit: bool) -> None:
+    def record_retrieval(self, repo: str, *, hit: bool, workspace_id: Any = None) -> None:
         """Bump retrieval counters. Best-effort: a stats write must never
         interfere with serving a webhook."""
         try:
-            current = self.get(repo)
+            current = self.get(repo, workspace_id=workspace_id)
             if current is None:
                 return
             self.put(replace(
@@ -273,7 +281,7 @@ class RepositoryStateStore(ABC):
                 retrieval_count=current.retrieval_count + 1,
                 retrieval_hit_count=current.retrieval_hit_count + int(hit),
                 last_accessed_at=time.time(),
-            ))
+            ), workspace_id=workspace_id)
         except Exception as e:
             logger.debug("could not record retrieval stats for %s: %s", repo, e)
 
@@ -289,20 +297,20 @@ class MemoryStateStore(RepositoryStateStore):
     def durable(self) -> bool:
         return False
 
-    def get(self, repo: str) -> RepositoryRecord | None:
+    def get(self, repo: str, *, workspace_id: Any = None) -> RepositoryRecord | None:
         with self._lock:
             return self._records.get(repo)
 
-    def put(self, record: RepositoryRecord) -> None:
+    def put(self, record: RepositoryRecord, *, workspace_id: Any = None) -> None:
         with self._lock:
             self._records[record.repo] = record
 
-    def list(self, *, limit: int = 100) -> list[RepositoryRecord]:
+    def list(self, *, limit: int = 100, workspace_id: Any = None) -> list[RepositoryRecord]:
         with self._lock:
             records = sorted(self._records.values(), key=lambda r: -r.updated_at)
         return records[:limit]
 
-    def delete(self, repo: str) -> None:
+    def delete(self, repo: str, *, workspace_id: Any = None) -> None:
         with self._lock:
             self._records.pop(repo, None)
 
@@ -330,24 +338,24 @@ class FileStateStore(RepositoryStateStore):
         except OSError as e:
             logger.warning("could not persist repository state (%s)", e)
 
-    def get(self, repo: str) -> RepositoryRecord | None:
+    def get(self, repo: str, *, workspace_id: Any = None) -> RepositoryRecord | None:
         with self._lock:
             raw = self._read().get(repo)
         return RepositoryRecord.from_dict(raw) if raw else None
 
-    def put(self, record: RepositoryRecord) -> None:
+    def put(self, record: RepositoryRecord, *, workspace_id: Any = None) -> None:
         with self._lock:
             data = self._read()
             data[record.repo] = record.as_dict()
             self._write(data)
 
-    def list(self, *, limit: int = 100) -> list[RepositoryRecord]:
+    def list(self, *, limit: int = 100, workspace_id: Any = None) -> list[RepositoryRecord]:
         with self._lock:
             data = self._read()
         records = [RepositoryRecord.from_dict(r) for r in data.values()]
         return sorted(records, key=lambda r: -r.updated_at)[:limit]
 
-    def delete(self, repo: str) -> None:
+    def delete(self, repo: str, *, workspace_id: Any = None) -> None:
         with self._lock:
             data = self._read()
             if data.pop(repo, None) is not None:
@@ -357,6 +365,7 @@ class FileStateStore(RepositoryStateStore):
 _CREATE_STATE_TABLE = """
 CREATE TABLE IF NOT EXISTS ghic_repository_state (
     repo TEXT PRIMARY KEY,
+    workspace_id TEXT,
     state TEXT NOT NULL,
     data JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -385,15 +394,49 @@ class PostgresStateStore(RepositoryStateStore):
 
         return session(self.database_url)
 
+    @property
+    def requires_workspace(self) -> bool:
+        return True
+
+    @staticmethod
+    def _require_workspace(workspace_id: Any) -> str:
+        value = str(workspace_id or "").strip()
+        if not value:
+            raise ValueError("Postgres repository state requires workspace_id")
+        return value
+
+    def resolve_workspace(self, repo: str) -> str | None:
+        """Resolve a repository's active tenant from authoritative ownership."""
+        with self._session() as conn:
+            rows = conn.run(
+                "SELECT r.workspace_id FROM ghic_github_repositories r "
+                "JOIN ghic_github_installations i "
+                "  ON i.installation_id = r.installation_id "
+                " AND i.workspace_id = r.workspace_id "
+                "WHERE r.repo_full_name = :repo "
+                "  AND r.active = true "
+                "  AND i.connection_status = 'connected' "
+                "  AND i.revoked_at IS NULL",
+                repo=repo,
+            )
+        if len(rows) != 1:
+            return None
+        return str(rows[0][0] or "") or None
+
     def _ensure_table(self) -> None:
         with self._session() as conn:
             conn.run(_CREATE_STATE_TABLE)
+            conn.run("ALTER TABLE ghic_repository_state ADD COLUMN IF NOT EXISTS workspace_id TEXT")
+            conn.run("CREATE INDEX IF NOT EXISTS ghic_repository_state_workspace_repo_idx ON ghic_repository_state (workspace_id, repo)")
 
-    def get(self, repo: str) -> RepositoryRecord | None:
+    def get(self, repo: str, *, workspace_id: Any = None) -> RepositoryRecord | None:
+        workspace_id = self._require_workspace(workspace_id)
         try:
             with self._session() as conn:
                 rows = conn.run(
-                    "SELECT data FROM ghic_repository_state WHERE repo = :repo", repo=repo
+                    "SELECT data FROM ghic_repository_state "
+                    "WHERE repo = :repo AND workspace_id = :workspace_id",
+                    repo=repo, workspace_id=workspace_id,
                 )
         except Exception as e:
             logger.warning("repository state read failed for %s: %s", repo, e)
@@ -405,26 +448,31 @@ class PostgresStateStore(RepositoryStateStore):
             raw = json.loads(raw)
         return RepositoryRecord.from_dict(raw)
 
-    def put(self, record: RepositoryRecord) -> None:
+    def put(self, record: RepositoryRecord, *, workspace_id: Any = None) -> None:
+        workspace_id = self._require_workspace(workspace_id)
         try:
             with self._session() as conn:
                 conn.run(
-                    "INSERT INTO ghic_repository_state (repo, state, data, updated_at) "
-                    "VALUES (:repo, :state, :data, now()) "
+                    "INSERT INTO ghic_repository_state (repo, workspace_id, state, data, updated_at) "
+                    "VALUES (:repo, :workspace_id, :state, :data, now()) "
                     "ON CONFLICT (repo) DO UPDATE SET "
+                    "workspace_id = EXCLUDED.workspace_id, "
                     "state = EXCLUDED.state, data = EXCLUDED.data, updated_at = now()",
-                    repo=record.repo, state=record.state.value,
+                    repo=record.repo, workspace_id=workspace_id, state=record.state.value,
                     data=json.dumps(record.as_dict()),
                 )
         except Exception as e:
             logger.warning("repository state write failed for %s: %s", record.repo, e)
 
-    def list(self, *, limit: int = 100) -> list[RepositoryRecord]:
+    def list(self, *, limit: int = 100, workspace_id: Any = None) -> list[RepositoryRecord]:
+        workspace_id = self._require_workspace(workspace_id)
         try:
             with self._session() as conn:
                 rows = conn.run(
                     "SELECT data FROM ghic_repository_state "
-                    "ORDER BY updated_at DESC LIMIT :limit", limit=limit,
+                    "WHERE workspace_id = :workspace_id "
+                    "ORDER BY updated_at DESC LIMIT :limit",
+                    workspace_id=workspace_id, limit=limit,
                 )
         except Exception as e:
             logger.warning("repository state list failed: %s", e)
@@ -436,10 +484,15 @@ class PostgresStateStore(RepositoryStateStore):
             out.append(RepositoryRecord.from_dict(raw))
         return out
 
-    def delete(self, repo: str) -> None:
+    def delete(self, repo: str, *, workspace_id: Any = None) -> None:
+        workspace_id = self._require_workspace(workspace_id)
         try:
             with self._session() as conn:
-                conn.run("DELETE FROM ghic_repository_state WHERE repo = :repo", repo=repo)
+                conn.run(
+                    "DELETE FROM ghic_repository_state "
+                    "WHERE repo = :repo AND workspace_id = :workspace_id",
+                    repo=repo, workspace_id=workspace_id,
+                )
         except Exception as e:
             logger.warning("repository state delete failed for %s: %s", repo, e)
 

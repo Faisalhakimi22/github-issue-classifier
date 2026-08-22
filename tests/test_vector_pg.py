@@ -119,7 +119,7 @@ def test_regular_store_rejects_incompatible_pgvector_dimension(monkeypatch):
     use_connection(monkeypatch, connection)
 
     with pytest.raises(EmbeddingDimensionMismatchError, match=r"vector\(512\)"):
-        PostgresVectorStore("postgresql://test", "acme/demo", 1536)
+        PostgresVectorStore("postgresql://test", "acme/demo", 1536, workspace_id="ws-a")
 
     assert not any("embedding_json" in sql and sql.startswith("INSERT")
                    for sql in connection.statements)
@@ -128,7 +128,7 @@ def test_regular_store_rejects_incompatible_pgvector_dimension(monkeypatch):
 def test_pgvector_search_uses_sqrt_list_probe_count(monkeypatch):
     connection = FakeConnection(1536, {"acme/demo": 1})
     use_connection(monkeypatch, connection)
-    store = PostgresVectorStore("postgresql://test", "acme/demo", 1536)
+    store = PostgresVectorStore("postgresql://test", "acme/demo", 1536, workspace_id="ws-a")
 
     assert store.search(np.zeros(1536, dtype=np.float32), top_k=5) == []
 
@@ -152,6 +152,7 @@ def test_full_replace_requires_explicit_dimension_migration(monkeypatch):
             1536,
             np.zeros((1, 1536), dtype=np.float32),
             [chunk()],
+            workspace_id="ws-a",
         )
 
     assert "BEGIN" not in connection.statements
@@ -168,6 +169,7 @@ def test_dimension_migration_refuses_other_repository_rows(monkeypatch):
             1536,
             np.zeros((1, 1536), dtype=np.float32),
             [chunk()],
+            workspace_id="ws-a",
             allow_dimension_migration=True,
         )
 
@@ -188,6 +190,7 @@ def test_dimension_migration_refuses_mixed_storage(monkeypatch):
             1536,
             np.zeros((1, 1536), dtype=np.float32),
             [chunk()],
+            workspace_id="ws-a",
             allow_dimension_migration=True,
         )
 
@@ -206,6 +209,7 @@ def test_forced_full_replace_atomically_migrates_512_to_1536(monkeypatch):
         1536,
         np.zeros((1, 1536), dtype=np.float32),
         [chunk()],
+        workspace_id="ws-a",
         allow_dimension_migration=True,
     )
 
@@ -235,6 +239,7 @@ def test_failed_migration_insert_rolls_back_old_schema_and_rows(monkeypatch):
             1536,
             np.zeros((1, 1536), dtype=np.float32),
             [chunk()],
+            workspace_id="ws-a",
             allow_dimension_migration=True,
         )
 
@@ -258,6 +263,7 @@ def test_json_fallback_still_replaces_repository_without_pgvector(monkeypatch):
         1536,
         np.zeros((1, 1536), dtype=np.float32),
         [chunk()],
+        workspace_id="ws-a",
     )
 
     assert store._pgvector is False

@@ -70,6 +70,40 @@ class GitHubAppClient:
         self._tokens[installation_id] = (data["token"], time.time() + 55 * 60)
         return data["token"]
 
+    def verify_installation(self, installation_id: int) -> dict[str, Any]:
+        """Verify the current installation belongs to this App and is active."""
+        resp = self._session.get(
+            f"{self.base_url}/app/installations/{installation_id}",
+            headers={
+                "Authorization": f"Bearer {self._app_jwt()}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=self.timeout,
+        )
+        if resp.status_code == 404:
+            return {"status": "unknown"}
+        resp.raise_for_status()
+        data = resp.json()
+        if str(data.get("app_id")) != str(self.app_id):
+            return {"status": "app_mismatch"}
+        if data.get("suspended_at"):
+            return {"status": "suspended"}
+        return {"status": "active"}
+
+    def list_installation_repositories(self, installation_id: int) -> list[dict[str, Any]]:
+        """Return authoritative repository membership for an installation."""
+        resp = self._session.get(
+            f"{self.base_url}/installation/repositories",
+            headers={
+                "Authorization": f"Bearer {self.installation_token(installation_id)}",
+                "Accept": "application/vnd.github+json",
+            },
+            params={"per_page": 100},
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return list(resp.json().get("repositories") or [])
+
     def _request(
         self,
         method: str,

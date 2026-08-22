@@ -71,6 +71,8 @@ def create_app(
     idempotency: Any = None,
     repo_intelligence: Any = None,
     automation_service: Any = None,
+    authorization_gate: Any = None,
+    authorization_lease: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
     `category_predictor` / `effort_predictor` / `assignment_recommender` /
@@ -200,6 +202,16 @@ def create_app(
     # repo full name -> installation id, populated from webhook payloads so
     # a queued indexing job can authenticate a private clone.
     app.state.repo_installations = {}
+    if authorization_gate is None:
+        from .github_connection import authorize_issue
+
+        authorization_gate = authorize_issue
+    if authorization_lease is None:
+        from .github_connection import authorization_lease as default_authorization_lease
+
+        authorization_lease = default_authorization_lease
+    app.state.authorization_gate = authorization_gate
+    app.state.authorization_lease = authorization_lease
     # Phase 4 automation. Constructed only when at least one capability
     # flag is set; holds no GitHub client by design (see ghic/automation/).
     if automation_service is None:
@@ -221,6 +233,13 @@ def create_app(
                 raise HTTPException(status_code=401, detail="invalid token")
         elif not s.allow_unsigned:
             raise HTTPException(status_code=503, detail="webhook secret not configured")
+
+    def _legacy_repository_route_disabled() -> None:
+        """Disable pre-Hub shared-token routes that lack tenant auth."""
+        raise HTTPException(
+            status_code=503,
+            detail="legacy repository endpoint disabled; use the authenticated Hub API",
+        )
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
@@ -250,6 +269,7 @@ def create_app(
         summaries.
         """
         _require_token(request)
+        _legacy_repository_route_disabled()
         service = app.state.repo_intelligence
         if service is None:
             return {"enabled": False, "repositories": []}
@@ -274,24 +294,16 @@ def create_app(
 
     @app.get("/stats")
     def stats(request: Request) -> dict[str, Any]:
-        """What has this deploy actually predicted? Token-gated (repo names)."""
+        """Process-level observability; never expose tenant or repository data."""
         _require_token(request)
-        t = app.state.totals
         return {
-            "scored": t["scored"],
-            "rescored_after_edit": t["rescored"],
-            "predicted_actionable": t["positive"],
-            "positive_rate": round(t["positive"] / t["scored"], 4) if t["scored"] else None,
-            "mean_proba": round(t["proba_sum"] / t["scored"], 4) if t["scored"] else None,
+            "scope": "process",
             "dry_run": app.state.settings.dry_run,
-            "online_evaluation": app.state.tracker.summary(),
             "latency_ms": {
                 path: _percentiles(samples)
                 for path, samples in app.state.latencies.items()
             },
             "errors_5xx": app.state.errors["count"],
-            "analytics": app.state.tracker.analytics(),
-            "recent": list(app.state.recent)[-20:],
         }
 
     @app.get("/dashboard")
@@ -343,7 +355,7 @@ def create_app(
             # delivery that was otherwise handled.
             from .github_connection import handle_installation_event
 
-            return handle_installation_event(s.database_url, event, payload)
+            return handle_installation_event(s.database_url, event, payload, app.state.gh)
         return {"ok": True, "ignored": f"{event}/{payload.get('action')}"}
 
     @app.post("/api/predict")
@@ -407,6 +419,7 @@ def create_app(
         comment, or open a pull request.
         """
         _require_token(request)
+        _legacy_repository_route_disabled()
         service = app.state.repo_intelligence
         automation = app.state.automation
         if service is None or automation is None:
@@ -451,6 +464,7 @@ def create_app(
         `fmt=markdown` for GitHub/email, `fmt=text` for Slack/Teams.
         """
         _require_token(request)
+        _legacy_repository_route_disabled()
         service = app.state.repo_intelligence
         if service is None:
             raise HTTPException(status_code=503, detail="repository intelligence not enabled")
@@ -475,6 +489,7 @@ def create_app(
     def automation_repository_analytics(request: Request, repo: str) -> dict[str, Any]:
         """Structured analytics behind the dashboard widgets (Feature 11)."""
         _require_token(request)
+        _legacy_repository_route_disabled()
         service = app.state.repo_intelligence
         if service is None:
             raise HTTPException(status_code=503, detail="repository intelligence not enabled")
@@ -536,21 +551,46 @@ def create_app(
 
         set_correlation_id(str(payload.get("correlation_id") or ""))
 
-        # The queue payload may predate this repo being seen, so fall back
-        # to the most recent installation id observed for it.
-        installation_id = (
-            payload.get("installation_id") or app.state.repo_installations.get(repo)
-        )
-        token = ""
-        if app.state.gh is not None and installation_id:
-            try:
-                token = app.state.gh.installation_token(int(installation_id))
-            except Exception as e:
-                # A public repo still clones without a token, so this is a
-                # degradation (private repos fail later), not a hard stop.
-                logger.warning("could not mint installation token for %s: %s", repo, e)
+        # A durable job must carry the installation identity that authorized
+        # it. Process-local observations are intentionally not a fallback.
+        installation_id = payload.get("installation_id")
+        decision = _authorize_index_job(app, installation_id, repo)
+        if not decision["authorized"]:
+            return {
+                "ok": True,
+                "repo": repo,
+                "indexed": False,
+                "skipped": True,
+                "authorization": "rejected",
+                "reason": decision["reason"],
+            }
+        # Keep the authoritative rows locked for the whole token/clone/index
+        # operation. A disconnect or revoke therefore cannot race this job
+        # after the check and before repository contents are read.
+        with app.state.authorization_lease(
+            s.database_url, installation_id, repo
+        ) as lease:
+            if not lease["authorized"]:
+                return {
+                    "ok": True,
+                    "repo": repo,
+                    "indexed": False,
+                    "skipped": True,
+                    "authorization": "rejected",
+                    "reason": lease["reason"],
+                }
+            token = ""
+            if app.state.gh is not None and installation_id:
+                try:
+                    token = app.state.gh.installation_token(int(installation_id))
+                except Exception as e:
+                    # A public repo still clones without a token, so this is a
+                    # degradation (private repos fail later), not a hard stop.
+                    logger.warning("could not mint installation token for %s: %s", repo, e)
 
-        indexed = app.state.repo_intelligence.index_repository(repo, token=token)
+            indexed = app.state.repo_intelligence.index_repository(
+                repo, token=token, workspace_id=lease.get("workspace_id")
+            )
         return {"ok": True, "repo": repo, "indexed": indexed}
 
     return app
@@ -669,6 +709,10 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
 
     if not repo or not number:
         raise HTTPException(status_code=422, detail="malformed issues payload")
+
+    decision = _authorize_issue(app, payload, repo, number)
+    if not decision["authorized"]:
+        return _authorization_skip_response(decision)
     if _is_bot(author):
         return {"ok": True, "ignored": f"bot author {author}"}
 
@@ -687,10 +731,12 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
             # rather than silently dropping the issue.
             logger.warning("qstash publish failed (%s); processing synchronously instead", e)
 
-    return _process_issue_job(app, payload)
+    return _process_issue_job(app, payload, authorization=decision)
 
 
-def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
+def _process_issue_job(
+    app: FastAPI, payload: dict[str, Any], authorization: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Run one issue job and persist its complete, sanitized lifecycle."""
     import time as _time
 
@@ -698,22 +744,79 @@ def _process_issue_job(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
     issue = payload.get("issue") or {}
     repo = (payload.get("repository") or {}).get("full_name", "")
     number = int(issue.get("number", 0))
+    decision = authorization or _authorize_issue(app, payload, repo, number)
+    if not decision["authorized"]:
+        return _authorization_skip_response(decision)
+    payload["_workspace_id"] = decision.get("workspace_id")
     try:
         result = _process_issue_job_impl(app, payload)
     except Exception as error:
         try:
-            app.state.tracker.record_processing_failure(repo, number, error)
+            app.state.tracker.record_processing_failure(
+                repo, number, error, workspace_id=payload.get("_workspace_id")
+            )
         except Exception as ledger_error:
             logger.warning("could not persist processing failure: %s", ledger_error)
         raise
 
     duration_ms = (_time.perf_counter() - started) * 1000
+    if result.get("authorization") == "rejected":
+        return result
     app.state.tracker.record_analysis(
         repo,
         number,
         _dashboard_analysis_record(payload, result, duration_ms),
+        workspace_id=payload.get("_workspace_id"),
     )
     return result
+
+
+def _authorize_issue(
+    app: FastAPI, payload: dict[str, Any], repo: str, number: int
+) -> dict[str, Any]:
+    installation_id = (payload.get("installation") or {}).get("id")
+    decision = app.state.authorization_gate(
+        app.state.settings.database_url,
+        installation_id,
+        repo,
+        app.state.gh,
+    )
+    workspace_id = decision.get("workspace_id")
+    if workspace_id:
+        payload["_workspace_id"] = workspace_id
+    if decision.get("authorized"):
+        return decision
+    try:
+        app.state.tracker.record_authorization_skip(
+            repo,
+            number,
+            installation_id,
+            str(decision.get("reason") or "authorization_rejected"),
+            workspace_id=workspace_id,
+        )
+    except Exception as error:
+        logger.warning("could not persist authorization skip: %s", error)
+    return decision
+
+
+def _authorize_index_job(app: FastAPI, installation_id: Any, repo: str) -> dict[str, Any]:
+    if installation_id is None:
+        return {"authorized": False, "reason": "unknown_installation"}
+    return app.state.authorization_gate(
+        app.state.settings.database_url,
+        installation_id,
+        repo,
+        app.state.gh,
+    )
+
+
+def _authorization_skip_response(decision: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "skipped": True,
+        "authorization": "rejected",
+        "reason": str(decision.get("reason") or "authorization_rejected"),
+    }
 
 
 def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]:
@@ -768,8 +871,10 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
     totals["scored"] += 1
     totals["positive"] += pred.predicted_label
     totals["proba_sum"] += pred.proba
-    app.state.tracker.record_prediction(repo, number, pred.proba, pred.predicted_label,
-                                        related_count=len(related))
+    app.state.tracker.record_prediction(
+        repo, number, pred.proba, pred.predicted_label,
+        related_count=len(related), workspace_id=payload.get("_workspace_id"),
+    )
     app.state.recent.append({
         "repo": repo,
         "issue": number,
@@ -857,6 +962,8 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
                 issue.get("body") or "",
                 category=(category or {}).get("predicted", "") if category else "",
                 predicted_label=pred.predicted_label,
+                installation_id=installation_id,
+                workspace_id=payload.get("_workspace_id"),
             )
             logger.info(
                 "repository context for %s#%d: indexed=%s files=%d",
@@ -957,30 +1064,44 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
 
     actions: list[str] = []
     if not s.dry_run and gh is not None and installation_id:
-        if s.post_comment:
-            if llm_analysis is not None:
-                comment = format_llm_comment(
-                    pred, llm_analysis, related, disagreement=disagreement,
-                    repository_context=repo_context,
-                    engineering_analysis=engineering_analysis,
-                    automation=automation,
+        with app.state.authorization_lease(
+            s.database_url, installation_id, repo
+        ) as final_decision:
+            if not final_decision["authorized"]:
+                app.state.tracker.record_authorization_skip(
+                    repo,
+                    number,
+                    installation_id,
+                    str(final_decision.get("reason") or "authorization_rejected"),
+                    workspace_id=final_decision.get("workspace_id"),
                 )
-            else:
-                comment = format_comment(
-                    pred, related, category, repository_context=repo_context,
-                )
-                if info_request:
-                    comment += "\n\n---\n\n" + info_request["draft"]
-            gh.post_comment(repo, number, comment, installation_id)
-            actions.append("comment")
-        if s.apply_label and pred.predicted_label == 1:
-            gh.add_labels(repo, number, [s.label_name], installation_id)
-            actions.append("label")
-        if s.project_id and pred.predicted_label == 1 and issue.get("node_id"):
-            gh.add_issue_to_project(s.project_id, issue["node_id"], installation_id)
-            actions.append("project")
+                return _authorization_skip_response(final_decision)
+            if s.post_comment:
+                if llm_analysis is not None:
+                    comment = format_llm_comment(
+                        pred, llm_analysis, related, disagreement=disagreement,
+                        repository_context=repo_context,
+                        engineering_analysis=engineering_analysis,
+                        automation=automation,
+                    )
+                else:
+                    comment = format_comment(
+                        pred, related, category, repository_context=repo_context,
+                    )
+                    if info_request:
+                        comment += "\n\n---\n\n" + info_request["draft"]
+                gh.post_comment(repo, number, comment, installation_id)
+                actions.append("comment")
+            if s.apply_label and pred.predicted_label == 1:
+                gh.add_labels(repo, number, [s.label_name], installation_id)
+                actions.append("label")
+            if s.project_id and pred.predicted_label == 1 and issue.get("node_id"):
+                gh.add_issue_to_project(s.project_id, issue["node_id"], installation_id)
+                actions.append("project")
     for action in actions:
-        app.state.tracker.record_action(repo, number, action)
+        app.state.tracker.record_action(
+            repo, number, action, workspace_id=payload.get("_workspace_id")
+        )
 
     return {"ok": True, "prediction": pred.as_dict(), "category": category,
             "estimated_resolution": effort,   # API-only by design; see EFFORT_CARD.md
@@ -1128,6 +1249,9 @@ def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
 
     if not repo or not number:
         raise HTTPException(status_code=422, detail="malformed issues payload")
+    decision = _authorize_issue(app, payload, repo, number)
+    if not decision["authorized"]:
+        return _authorization_skip_response(decision)
     if _is_bot(author):
         return {"ok": True, "ignored": f"bot author {author}"}
     if issue.get("state") == "closed":
@@ -1151,7 +1275,10 @@ def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         explain=False,
     )
     app.state.totals["rescored"] += 1
-    app.state.tracker.record_prediction(repo, number, pred.proba, pred.predicted_label)
+    app.state.tracker.record_prediction(
+        repo, number, pred.proba, pred.predicted_label,
+        workspace_id=decision.get("workspace_id"),
+    )
     logger.info("rescored %s#%d after edit: P(bug)=%.3f", repo, number, pred.proba)
     return {"ok": True, "rescored": True, "prediction": pred.as_dict()}
 
@@ -1166,8 +1293,13 @@ def _handle_label_event(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any]
     label = ((payload.get("label") or {}).get("name")) or ""
     if not repo or not number or not label:
         return {"ok": True, "ignored": "label event without label/repo/number"}
+    decision = _authorize_issue(app, payload, repo, number)
+    if not decision["authorized"]:
+        return _authorization_skip_response(decision)
     added = payload.get("action") == "labeled"
-    app.state.tracker.record_label_event(repo, number, label, added)
+    app.state.tracker.record_label_event(
+        repo, number, label, added, workspace_id=decision.get("workspace_id")
+    )
     return {"ok": True, "recorded": ("+" if added else "-") + label}
 
 
@@ -1180,6 +1312,9 @@ def _handle_issue_closed(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     number = int(issue.get("number", 0))
     if not repo or not number:
         raise HTTPException(status_code=422, detail="malformed issues payload")
+    decision = _authorize_issue(app, payload, repo, number)
+    if not decision["authorized"]:
+        return _authorization_skip_response(decision)
 
     # Rebuild the training-time issue dict from the close payload and apply
     # the SAME labeling rules used to build the dataset. REST/webhook payloads
@@ -1201,7 +1336,9 @@ def _handle_issue_closed(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
     if result.label is None:
         return {"ok": True, "ignored": f"outcome dropped by rule {result.rule}"}
 
-    matched = app.state.tracker.record_outcome(repo, number, result.label)
+    matched = app.state.tracker.record_outcome(
+        repo, number, result.label, workspace_id=decision.get("workspace_id")
+    )
     logger.info(
         "outcome %s#%d: truth=%d (rule %s)%s",
         repo, number, result.label, result.rule,

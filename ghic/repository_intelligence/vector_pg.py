@@ -45,6 +45,7 @@ _CREATE_CHUNKS_TABLE = """
 CREATE TABLE IF NOT EXISTS ghic_repo_chunks (
     id BIGSERIAL PRIMARY KEY,
     repo TEXT NOT NULL,
+    workspace_id TEXT,
     path TEXT NOT NULL,
     language TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL DEFAULT '',
@@ -95,11 +96,14 @@ class PostgresVectorStore(VectorStore):
     repositories without their indexes interfering.
     """
 
-    def __init__(self, database_url: str, repo: str, dimensions: int) -> None:
+    def __init__(self, database_url: str, repo: str, dimensions: int, workspace_id: str | None = None) -> None:
         if not database_url:
             raise ValueError("database_url is required")
+        if not str(workspace_id or "").strip():
+            raise ValueError("Postgres vector operations require workspace_id")
         self.database_url = database_url
         self.repo = repo
+        self.workspace_id = str(workspace_id)
         self.dimensions = dimensions
         self._pgvector = False
         self._pending: list[tuple[np.ndarray, CodeChunk]] = []
@@ -114,6 +118,7 @@ class PostgresVectorStore(VectorStore):
     def _ensure_schema(self) -> None:
         with self._session() as conn:
             conn.run(_CREATE_CHUNKS_TABLE)
+            conn.run("ALTER TABLE ghic_repo_chunks ADD COLUMN IF NOT EXISTS workspace_id TEXT")
             for statement in _CREATE_INDEXES:
                 conn.run(statement)
             self._pgvector = self._try_enable_pgvector(conn)
@@ -198,6 +203,7 @@ class PostgresVectorStore(VectorStore):
         chunks: list[CodeChunk],
         *,
         allow_dimension_migration: bool = False,
+        workspace_id: str | None = None,
     ) -> PostgresVectorStore:
         """Atomically replace one repository, migrating vector width only when forced.
 
@@ -207,8 +213,11 @@ class PostgresVectorStore(VectorStore):
         old rows/schema are restored by Postgres if any insert fails.
         """
         store = cls.__new__(cls)
+        if not str(workspace_id or "").strip():
+            raise ValueError("Postgres vector operations require workspace_id")
         store.database_url = database_url
         store.repo = repo
+        store.workspace_id = str(workspace_id)
         store.dimensions = dimensions
         store._pgvector = False
         store._pending = []
@@ -312,7 +321,11 @@ class PostgresVectorStore(VectorStore):
                 self._validate_dimension_migration(conn, current_dimensions)
                 conn.run("DROP INDEX IF EXISTS ghic_repo_chunks_embedding_idx")
 
-            conn.run("DELETE FROM ghic_repo_chunks WHERE repo = :repo", repo=self.repo)
+            conn.run(
+                "DELETE FROM ghic_repo_chunks "
+                "WHERE repo = :repo AND workspace_id = :workspace_id",
+                repo=self.repo, workspace_id=self.workspace_id,
+            )
             if migrating:
                 conn.run("ALTER TABLE ghic_repo_chunks DROP COLUMN embedding")
                 conn.run(
@@ -333,7 +346,11 @@ class PostgresVectorStore(VectorStore):
     ) -> None:
         conn.run("BEGIN")
         try:
-            conn.run("DELETE FROM ghic_repo_chunks WHERE repo = :repo", repo=self.repo)
+            conn.run(
+                "DELETE FROM ghic_repo_chunks "
+                "WHERE repo = :repo AND workspace_id = :workspace_id",
+                repo=self.repo, workspace_id=self.workspace_id,
+            )
             self._insert_json_rows(conn, vectors, chunks)
             conn.run("COMMIT")
         except Exception:
@@ -361,7 +378,9 @@ class PostgresVectorStore(VectorStore):
         try:
             with self._session() as conn:
                 rows = conn.run(
-                    "SELECT count(*) FROM ghic_repo_chunks WHERE repo = :repo", repo=self.repo
+                    "SELECT count(*) FROM ghic_repo_chunks "
+                    "WHERE repo = :repo AND workspace_id = :workspace_id",
+                    repo=self.repo, workspace_id=self.workspace_id,
                 )
             return int(rows[0][0])
         except Exception as e:
@@ -386,11 +405,11 @@ class PostgresVectorStore(VectorStore):
         for vector, chunk in zip(vectors, chunks):
             conn.run(
                 "INSERT INTO ghic_repo_chunks "
-                "(repo, path, language, kind, symbol, parent_symbol, "
+                "(repo, workspace_id, path, language, kind, symbol, parent_symbol, "
                 " start_line, end_line, text, embedding) "
-                "VALUES (:repo, :path, :language, :kind, :symbol, :parent, "
+                "VALUES (:repo, :workspace_id, :path, :language, :kind, :symbol, :parent, "
                 ":start, :end, :text, CAST(:embedding AS vector))",
-                repo=chunk.repo or self.repo, path=chunk.path,
+                repo=chunk.repo or self.repo, workspace_id=self.workspace_id, path=chunk.path,
                 language=chunk.language, kind=chunk.kind, symbol=chunk.symbol,
                 parent=chunk.parent_symbol, start=chunk.start_line,
                 end=chunk.end_line, text=chunk.text,
@@ -403,11 +422,11 @@ class PostgresVectorStore(VectorStore):
         for vector, chunk in zip(vectors, chunks):
             conn.run(
                 "INSERT INTO ghic_repo_chunks "
-                "(repo, path, language, kind, symbol, parent_symbol, "
+                "(repo, workspace_id, path, language, kind, symbol, parent_symbol, "
                 " start_line, end_line, text, embedding_json) "
-                "VALUES (:repo, :path, :language, :kind, :symbol, :parent, "
+                "VALUES (:repo, :workspace_id, :path, :language, :kind, :symbol, :parent, "
                 ":start, :end, :text, :embedding)",
-                repo=chunk.repo or self.repo, path=chunk.path,
+                repo=chunk.repo or self.repo, workspace_id=self.workspace_id, path=chunk.path,
                 language=chunk.language, kind=chunk.kind, symbol=chunk.symbol,
                 parent=chunk.parent_symbol, start=chunk.start_line,
                 end=chunk.end_line, text=chunk.text,
@@ -437,10 +456,10 @@ class PostgresVectorStore(VectorStore):
                 "SELECT path, language, kind, symbol, parent_symbol, start_line, "
                 "       end_line, text, 1 - (embedding <=> CAST(:q AS vector)) AS score "
                 "FROM ghic_repo_chunks "
-                "WHERE repo = :repo AND embedding IS NOT NULL "
+                "WHERE repo = :repo AND workspace_id = :workspace_id AND embedding IS NOT NULL "
                 "ORDER BY embedding <=> CAST(:q AS vector) "
                 "LIMIT :k",
-                q=json.dumps([float(v) for v in query]), repo=self.repo, k=top_k,
+                q=json.dumps([float(v) for v in query]), repo=self.repo, workspace_id=self.workspace_id, k=top_k,
             )
         return [self._row_to_retrieved(row, float(row[8])) for row in rows]
 
@@ -449,8 +468,8 @@ class PostgresVectorStore(VectorStore):
             rows = conn.run(
                 "SELECT path, language, kind, symbol, parent_symbol, start_line, "
                 "       end_line, text, embedding_json "
-                "FROM ghic_repo_chunks WHERE repo = :repo AND embedding_json IS NOT NULL",
-                repo=self.repo,
+                "FROM ghic_repo_chunks WHERE repo = :repo AND workspace_id = :workspace_id AND embedding_json IS NOT NULL",
+                repo=self.repo, workspace_id=self.workspace_id,
             )
         if not rows:
             return []
@@ -487,9 +506,9 @@ class PostgresVectorStore(VectorStore):
         with self._session() as conn:
             for path in paths:
                 rows = conn.run(
-                    "DELETE FROM ghic_repo_chunks WHERE repo = :repo AND path = :path "
+                "DELETE FROM ghic_repo_chunks WHERE repo = :repo AND workspace_id = :workspace_id AND path = :path "
                     "RETURNING id",
-                    repo=self.repo, path=path,
+                    repo=self.repo, workspace_id=self.workspace_id, path=path,
                 )
                 removed += len(rows or [])
         return removed
@@ -497,14 +516,17 @@ class PostgresVectorStore(VectorStore):
     def clear(self) -> int:
         with self._session() as conn:
             rows = conn.run(
-                "DELETE FROM ghic_repo_chunks WHERE repo = :repo RETURNING id", repo=self.repo
+                "DELETE FROM ghic_repo_chunks WHERE repo = :repo AND workspace_id = :workspace_id RETURNING id",
+                repo=self.repo, workspace_id=self.workspace_id,
             )
         return len(rows or [])
 
     def indexed_paths(self) -> set[str]:
         with self._session() as conn:
             rows = conn.run(
-                "SELECT DISTINCT path FROM ghic_repo_chunks WHERE repo = :repo", repo=self.repo
+                "SELECT DISTINCT path FROM ghic_repo_chunks "
+                "WHERE repo = :repo AND workspace_id = :workspace_id",
+                repo=self.repo, workspace_id=self.workspace_id,
             )
         return {row[0] for row in rows}
 

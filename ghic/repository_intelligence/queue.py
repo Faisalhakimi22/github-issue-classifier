@@ -30,6 +30,7 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from inspect import Parameter, signature
 from typing import Any
 
 from .. import utils
@@ -47,7 +48,10 @@ class IndexQueue(ABC):
     """
 
     @abstractmethod
-    def enqueue(self, repo: str, *, installation_id: Any = None, reason: str = "") -> bool:
+    def enqueue(
+        self, repo: str, *, installation_id: Any = None, reason: str = "",
+        workspace_id: Any = None,
+    ) -> bool:
         raise NotImplementedError
 
     @property
@@ -86,7 +90,10 @@ class QStashIndexQueue(IndexQueue):
         self.region = region
         self.metrics = metrics or METRICS
 
-    def enqueue(self, repo: str, *, installation_id: Any = None, reason: str = "") -> bool:
+    def enqueue(
+        self, repo: str, *, installation_id: Any = None, reason: str = "",
+        workspace_id: Any = None,
+    ) -> bool:
         from ..service.qstash import publish
 
         try:
@@ -95,6 +102,9 @@ class QStashIndexQueue(IndexQueue):
                 payload={
                     "repo": repo,
                     "installation_id": installation_id,
+                    # Diagnostic only. The worker derives the authoritative
+                    # workspace from installation/repository PostgreSQL state.
+                    "workspace_id": workspace_id,
                     "reason": reason,
                     # Carried so the worker's logs join up with the webhook
                     # that triggered it -- the two run minutes and a process
@@ -117,13 +127,22 @@ class InlineIndexQueue(IndexQueue):
 
     def __init__(
         self,
-        worker: Callable[[str, Any], Any],
+        worker: Callable[..., Any],
         *,
         max_concurrent: int = 1,
         metrics: RepositoryIntelligenceMetrics | None = None,
     ) -> None:
         self.worker = worker
         self.metrics = metrics or METRICS
+        try:
+            parameters = signature(worker).parameters.values()
+            self._worker_accepts_workspace = any(
+                parameter.kind == Parameter.VAR_POSITIONAL
+                or parameter.kind == Parameter.VAR_KEYWORD
+                for parameter in parameters
+            ) or len(signature(worker).parameters) >= 3
+        except (TypeError, ValueError):
+            self._worker_accepts_workspace = True
         # A semaphore, not a pool: indexing is IO- and CPU-heavy, and two
         # concurrent clones of a large repository on a laptop is already
         # more than enough.
@@ -139,10 +158,18 @@ class InlineIndexQueue(IndexQueue):
         with self._lock:
             return self._active
 
-    def enqueue(self, repo: str, *, installation_id: Any = None, reason: str = "") -> bool:
+    def enqueue(
+        self, repo: str, *, installation_id: Any = None, reason: str = "",
+        workspace_id: Any = None,
+    ) -> bool:
         def run() -> None:
             try:
-                self.worker(repo, installation_id)
+                if self._worker_accepts_workspace:
+                    self.worker(repo, installation_id, workspace_id)
+                else:
+                    # Preserve the small two-argument development adapter
+                    # contract used by existing local callers.
+                    self.worker(repo, installation_id)
             except Exception as e:
                 self.metrics.increment("index_jobs_failed")
                 logger.warning("inline index job failed for %s: %s", repo, e)
@@ -170,7 +197,10 @@ class NullIndexQueue(IndexQueue):
     repositories never become READY.
     """
 
-    def enqueue(self, repo: str, *, installation_id: Any = None, reason: str = "") -> bool:
+    def enqueue(
+        self, repo: str, *, installation_id: Any = None, reason: str = "",
+        workspace_id: Any = None,
+    ) -> bool:
         logger.info(
             "background indexing is disabled; %s will not be indexed automatically "
             "(run: python -m ghic.repo_index --repo %s)", repo, repo,

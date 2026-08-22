@@ -51,35 +51,42 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.list:
-        return _list_indexes(service, cfg, as_json=args.json)
+        try:
+            return _list_indexes(service, cfg, as_json=args.json)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 1
 
     if not args.repo:
         parser.error("--repo is required unless --list is given")
 
-    if args.purge:
-        removed = service.index_cache.purge(args.repo)
-        service.repo_cache.remove(args.repo)
-        print(f"removed {removed} index(es) and the clone for {args.repo}")
-        return 0
+    try:
+        if args.purge:
+            service.forget(args.repo)
+            print(f"removed the index and clone for {args.repo}")
+            return 0
 
-    if args.query:
-        return _query(service, args.repo, args.query, args.top_k, as_json=args.json)
+        if args.query:
+            return _query(service, args.repo, args.query, args.top_k, as_json=args.json)
 
-    if args.path:
-        from pathlib import Path
+        if args.path:
+            from pathlib import Path
 
-        metadata = service.index_local_path(args.repo, Path(args.path).resolve())
-        ok = metadata is not None
-    else:
-        ok = service.index_repository(args.repo, token=args.token, force=args.force)
-        metadata = None
-        if ok:
-            metadata = _metadata_from_state(service, args.repo)
-            if metadata is None:
-                loaded = service.index_cache.get_latest(args.repo)
-                if loaded:
-                    pair = service.index_cache.load(args.repo, *loaded)
-                    metadata = pair[1] if pair else None
+            metadata = service.index_local_path(args.repo, Path(args.path).resolve())
+            ok = metadata is not None
+        else:
+            ok = service.index_repository(args.repo, token=args.token, force=args.force)
+            metadata = None
+            if ok:
+                metadata = _metadata_from_state(service, args.repo)
+                if metadata is None:
+                    loaded = service.index_cache.get_latest(args.repo)
+                    if loaded:
+                        pair = service.index_cache.load(args.repo, *loaded)
+                        metadata = pair[1] if pair else None
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
     if not ok:
         print(f"indexing failed for {args.repo} (see logs)", file=sys.stderr)

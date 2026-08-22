@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +19,35 @@ import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from ghic.service.app import create_app, verify_signature  # noqa: E402
+from ghic.service.app import create_app as _create_app, verify_signature  # noqa: E402
 from ghic.service.inference import Prediction, format_comment, format_llm_comment  # noqa: E402
 from ghic.service.settings import ServiceSettings  # noqa: E402
 
 SECRET = "test-secret"
+
+
+def _allow_authorization(database_url, installation_id, repo_full_name, github_client):
+    """Existing service tests exercise processing, not PostgreSQL wiring."""
+    return {
+        "authorized": True,
+        "installation_id": int(installation_id),
+        "repo": repo_full_name,
+    }
+
+
+@contextmanager
+def _allow_authorization_lease(database_url, installation_id, repo_full_name):
+    yield {
+        "authorized": True,
+        "installation_id": int(installation_id),
+        "repo": repo_full_name,
+    }
+
+
+def create_app(*args, **kwargs):
+    kwargs.setdefault("authorization_gate", _allow_authorization)
+    kwargs.setdefault("authorization_lease", _allow_authorization_lease)
+    return _create_app(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +246,120 @@ class TestIdempotency:
         assert first.status_code == 200
         assert second.status_code == 200
         assert second.json().get("duplicate") is not True
+
+
+class TestIssueAuthorizationOrdering:
+    def test_default_app_wiring_runs_the_authorization_gate_before_processing(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def reject(_database_url, _installation_id, _repo, _github):
+            calls.append("authorize")
+            return {"authorized": False, "reason": "unclaimed_installation"}
+
+        monkeypatch.setattr("ghic.service.github_connection.authorize_issue", reject)
+        predictor = StubPredictor()
+        gh = StubGitHub()
+        app = _create_app(
+            make_settings(dry_run=False, post_comment=True),
+            predictor=predictor,
+            gh_client=gh,
+        )
+        response = post_webhook(TestClient(app), issue_opened_payload())
+
+        assert response.status_code == 200
+        assert calls == ["authorize"]
+        assert predictor.calls == []
+        assert gh.comments == []
+
+    def test_rejected_webhook_skips_all_expensive_and_write_dependencies(self):
+        predictor = StubPredictor()
+        gh = StubGitHub()
+        llm = StubLLMService(analysis=make_llm_analysis())
+        repo_intelligence = StubRepoIntelligence(make_repo_context())
+        backend = _FakeLedgerBackend()
+
+        def reject(_database_url, _installation_id, _repo, _github):
+            return {"authorized": False, "reason": "revoked_installation"}
+
+        app = _create_app(
+            make_settings(dry_run=False, post_comment=True, apply_label=True),
+            predictor=predictor,
+            gh_client=gh,
+            llm_service=llm,
+            repo_intelligence=repo_intelligence,
+            authorization_gate=reject,
+        )
+        from ghic.service.tracking import PredictionTracker
+
+        app.state.tracker = PredictionTracker(backend=backend)
+        response = post_webhook(TestClient(app), issue_opened_payload())
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "skipped": True,
+            "authorization": "rejected",
+            "reason": "revoked_installation",
+        }
+        assert predictor.calls == []
+        assert llm.calls == []
+        assert repo_intelligence.calls == []
+        assert gh.comments == []
+        assert gh.labels == []
+        assert backend.records[0]["type"] == "authorization_skip"
+        assert set(backend.records[0]) == {
+            "type", "repo", "number", "installation_id", "event", "reason", "at",
+            "workspace_id",
+        }
+
+    def test_authorization_revoked_during_processing_blocks_github_writes(self):
+        predictor = StubPredictor()
+        gh = StubGitHub()
+        llm = StubLLMService(analysis=make_llm_analysis())
+        repo_intelligence = StubRepoIntelligence(make_repo_context())
+
+        @contextmanager
+        def reject_at_write(_database_url, _installation_id, _repo):
+            yield {"authorized": False, "reason": "repository_removed"}
+
+        app = _create_app(
+            make_settings(dry_run=False, post_comment=True, apply_label=True),
+            predictor=predictor,
+            gh_client=gh,
+            llm_service=llm,
+            repo_intelligence=repo_intelligence,
+            authorization_gate=_allow_authorization,
+            authorization_lease=reject_at_write,
+        )
+        response = post_webhook(TestClient(app), issue_opened_payload())
+
+        assert response.status_code == 200
+        assert response.json()["authorization"] == "rejected"
+        assert predictor.calls, "the test must reach the final write boundary"
+        assert llm.calls, "the test must reach the final write boundary"
+        assert repo_intelligence.calls, "the test must reach the final write boundary"
+        assert gh.comments == []
+        assert gh.labels == []
+
+    def test_valid_authorization_preserves_processing_and_duplicate_delivery_is_safe(self):
+        predictor = StubPredictor()
+        gh = StubGitHub()
+        app = create_app(
+            make_settings(dry_run=False, post_comment=True),
+            predictor=predictor,
+            gh_client=gh,
+        )
+        client = TestClient(app)
+        first = post_webhook_with_delivery(client, issue_opened_payload(), "auth-delivery")
+        second = post_webhook_with_delivery(client, issue_opened_payload(), "auth-delivery")
+
+        assert first.status_code == 200
+        assert first.json().get("prediction")
+        assert second.json() == {"ok": True, "duplicate": True}
+        assert len(predictor.calls) == 1
+        assert len(gh.comments) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -530,17 +669,18 @@ class TestStats:
         client = make_client(make_settings())
         assert client.get("/stats").status_code == 401
 
-    def test_stats_accumulates_predictions(self):
+    def test_stats_is_process_only_and_contains_no_tenant_activity(self):
         client = make_client(make_settings())
         for n in (1, 2, 3):
             post_webhook(client, issue_opened_payload(number=n))
         resp = client.get("/stats", headers={"X-GHIC-Token": SECRET})
         data = resp.json()
-        assert data["scored"] == 3
-        assert data["predicted_actionable"] == 3          # stub proba 0.9 >= 0.5
-        assert data["positive_rate"] == 1.0
-        assert len(data["recent"]) == 3
-        assert data["recent"][-1]["issue"] == 3
+        assert data["scope"] == "process"
+        assert set(data) == {"scope", "dry_run", "latency_ms", "errors_5xx"}
+        assert "acme/widgets" not in json.dumps(data)
+        assert "recent" not in data
+        assert "analytics" not in data
+        assert "online_evaluation" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -605,13 +745,13 @@ class TestOnlineEvaluation:
         from ghic.service.tracking import PredictionTracker
 
         t = PredictionTracker(ledger_path=tmp_path / "ledger.jsonl")
-        t.record_prediction("a/b", 1, 0.9, 1)   # predicted bug, truth bug -> tp
-        t.record_prediction("a/b", 2, 0.8, 1)   # predicted bug, truth non  -> fp
-        t.record_prediction("a/b", 3, 0.1, 0)   # predicted non, truth bug  -> fn
-        assert t.record_outcome("a/b", 1, 1)
-        assert t.record_outcome("a/b", 2, 0)
-        assert t.record_outcome("a/b", 3, 1)
-        assert not t.record_outcome("a/b", 99, 0)   # never scored
+        t.record_prediction("a/b", 1, 0.9, 1, workspace_id="test-workspace")   # predicted bug, truth bug -> tp
+        t.record_prediction("a/b", 2, 0.8, 1, workspace_id="test-workspace")   # predicted bug, truth non  -> fp
+        t.record_prediction("a/b", 3, 0.1, 0, workspace_id="test-workspace")   # predicted non, truth bug  -> fn
+        assert t.record_outcome("a/b", 1, 1, workspace_id="test-workspace")
+        assert t.record_outcome("a/b", 2, 0, workspace_id="test-workspace")
+        assert t.record_outcome("a/b", 3, 1, workspace_id="test-workspace")
+        assert not t.record_outcome("a/b", 99, 0, workspace_id="test-workspace")   # never scored
         s = t.summary()
         assert s["confusion"] == {"tp": 1, "fp": 1, "fn": 1, "tn": 0}
         assert s["live_precision"] == 0.5
@@ -622,14 +762,14 @@ class TestOnlineEvaluation:
 
         ledger = tmp_path / "ledger.jsonl"
         t1 = PredictionTracker(ledger_path=ledger)
-        t1.record_prediction("a/b", 1, 0.9, 1)
-        t1.record_outcome("a/b", 1, 1)
-        t1.record_prediction("a/b", 2, 0.7, 1)      # still awaiting outcome
+        t1.record_prediction("a/b", 1, 0.9, 1, workspace_id="test-workspace")
+        t1.record_outcome("a/b", 1, 1, workspace_id="test-workspace")
+        t1.record_prediction("a/b", 2, 0.7, 1, workspace_id="test-workspace")      # still awaiting outcome
 
         t2 = PredictionTracker(ledger_path=ledger)  # simulated restart
         assert t2.summary()["confusion"]["tp"] == 1
         assert t2.summary()["awaiting_outcome"] == 1
-        assert t2.record_outcome("a/b", 2, 0)
+        assert t2.record_outcome("a/b", 2, 0, workspace_id="test-workspace")
         assert t2.summary()["confusion"]["fp"] == 1
 
     def test_closed_event_grades_earlier_prediction(self):
@@ -640,8 +780,7 @@ class TestOnlineEvaluation:
         data = resp.json()
         assert data["outcome"] == 0                # NOT_PLANNED -> non-actionable
         assert data["matched_prediction"] is True
-        stats = client.get("/stats", headers={"X-GHIC-Token": SECRET}).json()
-        assert stats["online_evaluation"]["confusion"]["fp"] == 1
+        assert client.app.state.tracker.summary()["confusion"]["fp"] == 1
 
     def test_closed_event_bug_label_completed_is_class1(self):
         client = make_client(make_settings())
@@ -649,8 +788,7 @@ class TestOnlineEvaluation:
         resp = post_webhook(client, issue_closed_payload(
             number=8, labels=["bug"], state_reason="completed"))
         assert resp.json()["outcome"] == 1
-        stats = client.get("/stats", headers={"X-GHIC-Token": SECRET}).json()
-        assert stats["online_evaluation"]["confusion"]["tp"] == 1
+        assert client.app.state.tracker.summary()["confusion"]["tp"] == 1
 
     def test_closed_question_labeled_issue_is_ignored(self):
         client = make_client(make_settings())
@@ -681,9 +819,9 @@ class TestLedgerBackend:
 
         backend = _FakeLedgerBackend()
         t1 = PredictionTracker(backend=backend)
-        t1.record_prediction("a/b", 1, 0.9, 1)
-        t1.record_outcome("a/b", 1, 1)
-        t1.record_prediction("a/b", 2, 0.7, 1)
+        t1.record_prediction("a/b", 1, 0.9, 1, workspace_id="test-workspace")
+        t1.record_outcome("a/b", 1, 1, workspace_id="test-workspace")
+        t1.record_prediction("a/b", 2, 0.7, 1, workspace_id="test-workspace")
         assert len(backend.records) == 3
 
         t2 = PredictionTracker(backend=backend)  # same backend, fresh instance
@@ -695,8 +833,8 @@ class TestLedgerBackend:
 
         backend = _FakeLedgerBackend()
         t1 = PredictionTracker(backend=backend)
-        t1.record_analysis("a/b", 7, {"title": "CSV import fails", "duration_ms": 12.5})
-        t1.record_processing_failure("a/b", 8, RuntimeError("provider unavailable\ntrace"))
+        t1.record_analysis("a/b", 7, {"title": "CSV import fails", "duration_ms": 12.5}, workspace_id="test-workspace")
+        t1.record_processing_failure("a/b", 8, RuntimeError("provider unavailable\ntrace"), workspace_id="test-workspace")
 
         assert backend.records[0]["type"] == "analysis"
         assert backend.records[0]["repo"] == "a/b"
@@ -723,7 +861,7 @@ class TestLedgerBackend:
         monkeypatch.setattr(pg_ledger, "PostgresLedgerBackend", _FakePostgresBackend)
         ledger = tmp_path / "ledger.jsonl"
         t = tracking.PredictionTracker(ledger_path=ledger, database_url="postgres://fake/db")
-        t.record_prediction("a/b", 1, 0.9, 1)
+        t.record_prediction("a/b", 1, 0.9, 1, workspace_id="test-workspace")
         assert isinstance(t._backend, _FakePostgresBackend)
         assert not ledger.exists()  # nothing written to the file backend
 
@@ -732,7 +870,7 @@ class TestLedgerBackend:
 
         t = PredictionTracker()
         assert isinstance(t._backend, _NullBackend)
-        t.record_prediction("a/b", 1, 0.9, 1)  # must not raise
+        t.record_prediction("a/b", 1, 0.9, 1, workspace_id="test-workspace")  # must not raise
         assert t.summary()["awaiting_outcome"] == 1
 
     def test_settings_database_url_env_precedence(self, monkeypatch):
@@ -893,7 +1031,7 @@ class TestLabelEvents:
 
         ledger = tmp_path / "ledger.jsonl"
         t = PredictionTracker(ledger_path=ledger)
-        t.record_label_event("acme/widgets", 1, "*duplicate", True)
+        t.record_label_event("acme/widgets", 1, "*duplicate", True, workspace_id="test-workspace")
         t2 = PredictionTracker(ledger_path=ledger)
         assert t2.label_events == 1
         assert t2.summary()["label_events_observed"] == 1
@@ -928,7 +1066,7 @@ class TestProjectsV2:
 # Dashboard analytics: the six facets, from real ledger data
 # ---------------------------------------------------------------------------
 class TestDashboardAnalytics:
-    def _client_with_activity(self) -> TestClient:
+    def _app_with_activity(self):
         app = create_app(make_settings(suggest_related=True),
                          predictor=StubPredictor(proba=0.9),
                          dup_index=StubDupIndex())
@@ -941,11 +1079,11 @@ class TestDashboardAnalytics:
         label_event["action"] = "labeled"
         label_event["label"] = {"name": "comp:editor"}
         post_webhook(client, label_event)
-        return client
+        return app
 
     def test_all_six_facets_report_real_numbers(self):
-        client = self._client_with_activity()
-        a = client.get("/stats", headers={"X-GHIC-Token": SECRET}).json()["analytics"]
+        app = self._app_with_activity()
+        a = app.state.tracker.analytics()
         # 1. issue trends: both predictions land on today's date bucket
         assert sum(a["issue_trends"]["predictions_per_day"].values()) == 2
         # 2. duplicate rate: exactly one prediction had candidates
@@ -968,9 +1106,9 @@ class TestDashboardAnalytics:
 
         ledger = tmp_path / "ledger.jsonl"
         t1 = PredictionTracker(ledger_path=ledger)
-        t1.record_prediction("a/b", 1, 0.85, 1, related_count=2)
-        t1.record_label_event("a/b", 1, "*duplicate", True)
-        t1.record_outcome("a/b", 1, 1)
+        t1.record_prediction("a/b", 1, 0.85, 1, related_count=2, workspace_id="test-workspace")
+        t1.record_label_event("a/b", 1, "*duplicate", True, workspace_id="test-workspace")
+        t1.record_outcome("a/b", 1, 1, workspace_id="test-workspace")
 
         t2 = PredictionTracker(ledger_path=ledger)
         a = t2.analytics()
@@ -1792,3 +1930,29 @@ class TestInferenceSmoke:
         assert 0.0 <= pred.proba <= 1.0
         assert pred.predicted_label in (0, 1)
         assert pred.top_features  # explanation produced
+
+
+class TestLegacyRepositoryRoutes:
+    def test_shared_token_repository_routes_are_disabled_before_data_access(self):
+        client = make_client(make_settings())
+        headers = {"X-GHIC-Token": SECRET}
+
+        assert client.get("/repositories", headers=headers).status_code == 503
+        assert client.get(
+            "/automation/weekly-digest?repo=workspace-b/private", headers=headers
+        ).status_code == 503
+        assert client.get(
+            "/automation/repository-analytics?repo=workspace-b/private", headers=headers
+        ).status_code == 503
+        assert client.post(
+            "/automation/analyze",
+            headers=headers,
+            json={"repo": "workspace-b/private", "title": "issue"},
+        ).status_code == 503
+
+    def test_disabled_legacy_route_rejects_invalid_token_first(self):
+        client = make_client(make_settings())
+        response = client.get(
+            "/repositories", headers={"X-GHIC-Token": "wrong-token"}
+        )
+        assert response.status_code == 401

@@ -36,6 +36,22 @@ class FakeConn:
         return [s for s, _ in self.statements if s.startswith(("INSERT", "UPDATE"))]
 
 
+class FakeGitHub:
+    def __init__(self, repos=None):
+        self.repos = repos or [{"id": 1, "full_name": "acme/widgets", "private": False}]
+
+    def list_installation_repositories(self, installation_id):
+        return self.repos
+
+
+class FailingRepositoryUpdateConn(FakeConn):
+    def run(self, sql: str, **kwargs: Any):
+        result = super().run(sql, **kwargs)
+        if sql.startswith("UPDATE ghic_github_repositories"):
+            raise RuntimeError("repository update failed")
+        return result
+
+
 @pytest.fixture
 def patched(monkeypatch):
     """Install a fake `session` and hand back the connection it yields."""
@@ -78,8 +94,26 @@ class TestRevocation:
         result = github_connection.handle_installation_event(
             URL, "installation", installation_payload("suspend")
         )
-        assert result["connection_sync"] == "revoked:suspend"
-        assert any("SET active = false" in w for w in conn.writes())
+        assert result["connection_sync"] == "suspended"
+        installation_update = next(
+            w for w in conn.writes() if "connection_status = 'suspended'" in w
+        )
+        repository_update = next(w for w in conn.writes() if "SET active = false" in w)
+        assert "connection_status = 'connected'" in installation_update
+        assert "revoked_at IS NULL" in installation_update
+        assert "connection_status = 'suspended'" in repository_update
+        statements = [sql for sql, _ in conn.statements]
+        assert statements.index("BEGIN") < statements.index(installation_update)
+        assert statements.index(repository_update) < statements.index("COMMIT")
+
+    def test_lifecycle_write_failure_rolls_back_the_transition(self, patched):
+        conn = patched(FailingRepositoryUpdateConn())
+        result = github_connection.handle_installation_event(
+            URL, "installation", installation_payload("suspend")
+        )
+        assert result["connection_sync"] == "error"
+        assert any(sql == "ROLLBACK" for sql, _ in conn.statements)
+        assert not any(sql == "COMMIT" for sql, _ in conn.statements)
 
     def test_revocation_applies_even_to_an_unclaimed_installation(self, patched):
         # Losing access is true regardless of whether a user ever claimed
@@ -92,7 +126,7 @@ class TestRevocation:
         assert conn.writes()
 
     def test_unsuspending_restores_the_connection(self, patched):
-        conn = patched(FakeConn(connected=False))
+        conn = patched(FakeConn(connected=True))
         result = github_connection.handle_installation_event(
             URL,
             "installation",
@@ -100,11 +134,32 @@ class TestRevocation:
                 "unsuspend",
                 repositories=[{"id": 1, "full_name": "acme/widgets", "private": False}],
             ),
+            FakeGitHub(),
         )
         assert result["connection_sync"] == "unsuspended"
         writes = conn.writes()
         assert any("SET revoked_at = NULL" in w for w in writes)
         assert any(w.startswith("INSERT INTO ghic_github_repositories") for w in writes)
+        statements = [sql for sql, _ in conn.statements]
+        begin = statements.index("BEGIN")
+        commit = statements.index("COMMIT")
+        restore = next(
+            index for index, sql in enumerate(statements)
+            if "SET revoked_at = NULL" in sql
+        )
+        insert = next(
+            index for index, sql in enumerate(statements)
+            if sql.startswith("INSERT INTO ghic_github_repositories")
+        )
+        assert begin < restore < insert < commit
+
+    def test_unsuspend_cannot_restore_a_non_suspended_connection(self, patched):
+        conn = patched(FakeConn(connected=False))
+        result = github_connection.handle_installation_event(
+            URL, "installation", installation_payload("unsuspend"), FakeGitHub()
+        )
+        assert result["connection_sync"] == "ignored_unsuspend"
+        assert conn.writes() == []
 
 
 class TestUnclaimedInstallations:
@@ -122,6 +177,25 @@ class TestUnclaimedInstallations:
             ),
         )
         assert result["connection_sync"] == "not_connected"
+        assert conn.writes() == []
+
+    def test_unknown_lifecycle_state_is_not_treated_as_connected(self, patched):
+        conn = patched(FakeConn(connected=False))
+        result = github_connection.handle_installation_event(
+            URL,
+            "installation_repositories",
+            installation_payload(
+                "removed",
+                repositories_removed=[{"id": 1, "full_name": "acme/widgets"}],
+            ),
+        )
+        assert result["connection_sync"] == "not_connected"
+        connected_query = next(
+            sql for sql, _ in conn.statements
+            if sql.startswith("SELECT 1 FROM ghic_github_installations")
+        )
+        assert "connection_status = 'connected'" in connected_query
+        assert "COALESCE" not in connected_query
         assert conn.writes() == []
 
     def test_repository_additions_to_an_unclaimed_installation_are_ignored(
@@ -172,6 +246,9 @@ class TestRepositorySelection:
                     {"id": 2, "full_name": "acme/other", "private": True}
                 ],
             ),
+            FakeGitHub([
+                {"id": 2, "full_name": "acme/other", "private": True}
+            ]),
         )
         assert result["added"] == 1
         insert = next(
@@ -242,7 +319,7 @@ class TestWebhookRouting:
 
         seen: dict[str, Any] = {}
 
-        def fake_handler(database_url, event, payload):
+        def fake_handler(database_url, event, payload, github_client=None):
             seen["event"] = event
             seen["action"] = payload.get("action")
             return {"ok": True, "connection_sync": "stub"}
