@@ -113,6 +113,32 @@ def _payload(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _replay_authorization(
+    database_url: str,
+    installation_id: Any,
+    repo_full_name: str,
+    github_client: Any = None,
+) -> dict[str, Any]:
+    """Stand in for the production authorization gate during replay.
+
+    Production answers this from PostgreSQL: an issue is analysed only if a
+    signed-in user claimed the installation and the repository is connected.
+    A replay has no database and no installation, so the real gate rejects
+    every issue with connection_state_unavailable, the webhook returns
+    `skipped` instead of a prediction, and the backtest scores nothing.
+
+    Injecting the decision keeps that check exactly as it is in production --
+    this is the same seam create_app already exposes for the GitHub client --
+    while letting the replay exercise what it exists to measure: feature
+    engineering, the model, and the decision path.
+    """
+    return {
+        "authorized": True,
+        "reason": "replay",
+        "workspace_id": "backtest-workspace",
+    }
+
+
 def replay(model_path: Path, limit_per_repo: int | None = None) -> list[dict[str, Any]]:
     """Send every test-split issue through the service; return scored records."""
     from fastapi.testclient import TestClient
@@ -134,7 +160,14 @@ def replay(model_path: Path, limit_per_repo: int | None = None) -> list[dict[str
     )
     gh = ReplayGitHub(train._load_release_dates())
     predictor = IssuePredictor(model_path, settings.threshold)
-    client = TestClient(create_app(settings, predictor=predictor, gh_client=gh))
+    client = TestClient(
+        create_app(
+            settings,
+            predictor=predictor,
+            gh_client=gh,
+            authorization_gate=_replay_authorization,
+        )
+    )
 
     records: list[dict[str, Any]] = []
     started = time.time()
@@ -166,6 +199,16 @@ def replay(model_path: Path, limit_per_repo: int | None = None) -> list[dict[str
         if i % 200 == 0:
             logger.info("  %d/%d (%.0fs elapsed)", i, len(rows), time.time() - started)
     logger.info("replay done: %d scored, %.0fs", len(records), time.time() - started)
+    if not records:
+        # Previously this returned empty and calibrate() died deep inside
+        # sklearn with "Found empty input array", which says nothing about
+        # the cause. Every issue being skipped is a harness fault worth
+        # naming: it is what happened when the authorization gate landed and
+        # nobody re-ran this.
+        raise SystemExit(
+            "replay scored 0 issues — every webhook was skipped rather than "
+            "predicted. Check the authorization gate and the payload shape."
+        )
     return records
 
 
@@ -204,11 +247,18 @@ def calibrate(records: list[dict[str, Any]]) -> dict[str, Any]:
         p_val = np.array([r["proba"] for r in val])
 
         t = best_threshold(y_cal, p_cal)
+        at_default = evaluate.compute_metrics(y_val, p_val, 0.5).as_dict()
+        at_recommended = evaluate.compute_metrics(y_val, p_val, t).as_dict()
         out["repos"][repo] = {
             "n": len(rows),
             "recommended_threshold": t,
-            "val_at_default": evaluate.compute_metrics(y_val, p_val, 0.5).as_dict(),
-            "val_at_recommended": evaluate.compute_metrics(y_val, p_val, t).as_dict(),
+            "val_at_default": at_default,
+            "val_at_recommended": at_recommended,
+            # Tuning on one half and verifying on the other is only worth the
+            # trouble if the verification can veto. A threshold that wins on
+            # the earlier half and loses on the later one overfit the earlier
+            # half, and shipping it makes the repo worse.
+            "improves_on_default": at_recommended["f1"] > at_default["f1"],
         }
 
     out["overall"] = {
@@ -229,18 +279,29 @@ def format_report(result: dict[str, Any]) -> str:
     lines.append("\nPer-repo calibration (tuned on earlier half, verified on later half):")
     lines.append(f"{'repository':30s} {'n':>5} {'thr':>5} {'F1@0.5':>8} {'F1@thr':>8} {'rec@thr':>8}")
     lines.append("-" * 76)
-    env_parts = []
+    env_parts: list[str] = []
+    rejected: list[str] = []
     for repo, r in result["repos"].items():
         d, v = r["val_at_default"], r["val_at_recommended"]
         lines.append(
             f"{repo:30s} {r['n']:5d} {r['recommended_threshold']:5.2f} "
             f"{d['f1']:8.3f} {v['f1']:8.3f} {v['recall']:8.3f}"
         )
-        env_parts.append(f"{repo}={r['recommended_threshold']}")
+        if r.get("improves_on_default"):
+            env_parts.append(f"{repo}={r['recommended_threshold']}")
+        else:
+            rejected.append(repo)
+    if rejected:
+        lines.append("")
+        lines.append(
+            "Not recommended (tuned threshold did not beat 0.5 on the held-out "
+            "half): " + ", ".join(rejected)
+        )
     lines += [
         "",
         "Deploy with:",
-        f"  GHIC_REPO_THRESHOLDS={','.join(env_parts)}",
+        f"  GHIC_REPO_THRESHOLDS={','.join(env_parts)}" if env_parts
+        else "  (no per-repo threshold beat the global default)",
         "",
         "Notes: numbers here are the SERVICE's behavior (single-issue feature",
         "degradations included), so they are the deployment truth — expect them",

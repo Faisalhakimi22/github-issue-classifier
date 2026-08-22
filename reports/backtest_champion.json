@@ -34,7 +34,8 @@
         "fn": 2,
         "tp": 6,
         "brier": 0.070012154
-      }
+      },
+      "improves_on_default": false
     },
     "microsoft/vscode": {
       "n": 820,
@@ -70,7 +71,8 @@
         "fn": 20,
         "tp": 21,
         "brier": 0.08042554890243901
-      }
+      },
+      "improves_on_default": true
     },
     "tensorflow/tensorflow": {
       "n": 228,
@@ -106,7 +108,8 @@
         "fn": 12,
         "tp": 38,
         "brier": 0.12787990140350877
-      }
+      },
+      "improves_on_default": false
     }
   },
   "overall": {

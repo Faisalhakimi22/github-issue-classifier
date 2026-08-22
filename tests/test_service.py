@@ -655,6 +655,18 @@ class TestThresholds:
         assert s.threshold_for("acme/widgets") == 0.3
         assert s.threshold_for("other/repo") == 0.5
 
+    def test_healthz_does_not_publish_repository_names(self):
+        # /healthz is unauthenticated. The keys of repo_thresholds are
+        # repository names, so publishing the mapping would disclose which
+        # repositories a deployment is configured for -- private ones included.
+        client = make_client(
+            make_settings(repo_thresholds={"acme/private-widgets": 0.3})
+        )
+        body = client.get("/healthz").json()
+        assert body["repo_thresholds_configured"] == 1
+        assert "repo_thresholds" not in body
+        assert "acme/private-widgets" not in client.get("/healthz").text
+
     def test_handler_passes_repo_threshold_to_predictor(self):
         predictor = StubPredictor()
         client = make_client(
@@ -706,19 +718,43 @@ class TestCalibration:
 
         assert best_threshold(np.array([1, 1, 1]), np.array([0.9, 0.8, 0.7])) == 0.5
 
-    def test_calibrate_reports_per_repo_and_env_line(self):
+    def test_calibrate_recommends_a_threshold_that_beats_the_default(self):
         from ghic.backtest import calibrate, format_report
 
+        # Positives sit at 0.3, so the global 0.5 predicts nothing positive and
+        # scores F1 0. A lower threshold separates them perfectly, in both the
+        # tuning half and the verification half.
+        records = [
+            {"repo": "a/b", "number": i, "created_at": f"2024-01-{i:02d}",
+             "y_true": i % 2, "proba": 0.3 if i % 2 else 0.1}
+            for i in range(1, 21)
+        ]
+        result = calibrate(records)
+        assert "a/b" in result["repos"]
+        assert result["overall"]["at_default"]["n"] == 20
+        assert result["repos"]["a/b"]["improves_on_default"] is True
+        report = format_report(result)
+        assert "GHIC_REPO_THRESHOLDS=a/b=" in report
+
+    def test_a_threshold_that_loses_on_the_held_out_half_is_not_recommended(self):
+        from ghic.backtest import calibrate, format_report
+
+        # Perfectly separable at the default, so no tuned threshold can beat
+        # it. Tuning on one half and verifying on the other is only worth the
+        # trouble if the verification is allowed to veto; the deploy line used
+        # to emit every tuned threshold regardless, which recommended making a
+        # repository measurably worse.
         records = [
             {"repo": "a/b", "number": i, "created_at": f"2024-01-{i:02d}",
              "y_true": i % 2, "proba": 0.8 if i % 2 else 0.1}
             for i in range(1, 21)
         ]
         result = calibrate(records)
-        assert "a/b" in result["repos"]
-        assert result["overall"]["at_default"]["n"] == 20
+        assert result["repos"]["a/b"]["improves_on_default"] is False
         report = format_report(result)
-        assert "GHIC_REPO_THRESHOLDS=a/b=" in report
+        assert "GHIC_REPO_THRESHOLDS=a/b=" not in report
+        assert "Not recommended" in report
+        assert "no per-repo threshold beat the global default" in report
 
 
 # ---------------------------------------------------------------------------

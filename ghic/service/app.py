@@ -248,7 +248,13 @@ def create_app(
             "version": __version__,
             "model": app.state.predictor.model_name,
             "threshold": app.state.settings.threshold,
-            "repo_thresholds": app.state.settings.repo_thresholds,
+            # Count, not the mapping. /healthz is unauthenticated -- it exists
+            # for load balancers -- and the keys of this dict are repository
+            # names. Empty until now, so nothing leaked; the moment a per-repo
+            # threshold is configured the repository it belongs to would be
+            # readable by anyone, including for a private repo. Operators set
+            # these through GHIC_REPO_THRESHOLDS and already know the values.
+            "repo_thresholds_configured": len(app.state.settings.repo_thresholds),
             "dry_run": app.state.settings.dry_run,
         }
         if app.state.settings.use_repo_intelligence:
@@ -1433,7 +1439,7 @@ async function load() {
     document.getElementById('p95').textContent = wh.p95 ?? 'n/a';
     document.getElementById('model').textContent =
       health.model + ' · threshold ' + health.threshold + ' · dry_run ' + health.dry_run +
-      ' · per-repo thresholds ' + JSON.stringify(health.repo_thresholds);
+      ' · per-repo thresholds ' + (health.repo_thresholds_configured ?? 0);
     document.getElementById('online').textContent =
       'resolved ' + (oe.resolved ?? 0) + ' · awaiting outcome ' + (oe.awaiting_outcome ?? 0) +
       ' · confusion ' + JSON.stringify(oe.confusion) + ' · audited GitHub writes ' +
