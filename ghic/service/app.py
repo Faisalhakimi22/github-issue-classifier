@@ -1104,6 +1104,7 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
                         repository_context=repo_context,
                         engineering_analysis=engineering_analysis,
                         automation=automation,
+                        score_is_calibrated=s.score_is_calibrated_for(repo),
                     )
                 else:
                     comment = format_comment(

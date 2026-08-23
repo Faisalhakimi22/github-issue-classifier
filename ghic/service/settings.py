@@ -47,6 +47,11 @@ def parse_repo_thresholds(raw: str) -> dict[str, float]:
     return out
 
 
+def parse_repo_list(raw: str) -> set[str]:
+    """Parse GHIC_CALIBRATED_REPOS: "owner/repo,other/repo"."""
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
 @dataclass(frozen=True)
 class ServiceSettings:
     # Model
@@ -55,6 +60,15 @@ class ServiceSettings:
     # Per-repo overrides — the research showed one global cutoff is wrong for
     # repos with different score distributions. Calibrate with ghic.backtest.
     repo_thresholds: dict = field(default_factory=dict)
+    # Repositories the statistical score is meaningful for.
+    #
+    # The classifier learned from a fixed set of large repositories. Asked
+    # about anything else it still returns a confident-looking percentage,
+    # derived from author metadata and text patterns that mean something
+    # different outside the population it was fitted on. Empty by default:
+    # a deployment claims calibration explicitly, rather than the product
+    # assuming it and publishing a number it cannot support.
+    calibrated_repos: frozenset = field(default_factory=frozenset)
 
     # Webhook security
     webhook_secret: str = ""
@@ -204,6 +218,19 @@ class ServiceSettings:
     def threshold_for(self, repo_full_name: str) -> float:
         return self.repo_thresholds.get(repo_full_name, self.threshold)
 
+    def score_is_calibrated_for(self, repo_full_name: str) -> bool:
+        """Whether the statistical score means anything for this repository.
+
+        A per-repo threshold counts on its own: one only exists because
+        ghic.backtest measured that repository's held-out issues and the
+        result beat the global default, which is the evidence this question
+        is asking about.
+        """
+        name = str(repo_full_name or "").strip()
+        if not name:
+            return False
+        return name in self.calibrated_repos or name in self.repo_thresholds
+
     def validate(self) -> None:
         if not self.model_path.exists():
             raise FileNotFoundError(
@@ -271,6 +298,9 @@ def load_settings() -> ServiceSettings:
         model_path=Path(os.environ.get("GHIC_MODEL_PATH") or default_model_path()),
         threshold=_env_float("GHIC_THRESHOLD", 0.5),
         repo_thresholds=parse_repo_thresholds(os.environ.get("GHIC_REPO_THRESHOLDS", "")),
+        calibrated_repos=frozenset(
+            parse_repo_list(os.environ.get("GHIC_CALIBRATED_REPOS", ""))
+        ),
         webhook_secret=os.environ.get("GHIC_WEBHOOK_SECRET", ""),
         allow_unsigned=_env_bool("GHIC_ALLOW_UNSIGNED", False),
         app_id=os.environ.get("GHIC_APP_ID", ""),

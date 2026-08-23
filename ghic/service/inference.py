@@ -323,6 +323,7 @@ def format_llm_comment(
     repository_context: Any = None,
     engineering_analysis: Any = None,
     automation: Any = None,
+    score_is_calibrated: bool = True,
 ) -> str:
     """Polished, first-party-feeling markdown comment built from an LLM
     IssueAnalysis on top of the ML prediction. `analysis` is a
@@ -363,7 +364,15 @@ def format_llm_comment(
     """
     from ..llm.models import LOW_CONFIDENCE_THRESHOLD
 
-    if disagreement:
+    # An uncalibrated repository gets the same treatment as a disagreement:
+    # the maintainer is told a decision is theirs to make, rather than handed
+    # a verdict the model is not entitled to. The classifier learned from a
+    # fixed set of large repositories, and on anything else its output is a
+    # confident-looking number about a population it never saw. Leading with
+    # "Likely not actionable" there is not a hedge, it is a claim -- and one
+    # wrong call on a real bug teaches maintainers to discount the whole
+    # comment, including the parts that are sound.
+    if disagreement or not score_is_calibrated:
         verdict = "Needs maintainer review"
     elif pred.predicted_label == 1:
         verdict = "Likely actionable"
@@ -377,7 +386,7 @@ def format_llm_comment(
 
     lines = [headline, "", analysis.summary, ""]
 
-    if disagreement:
+    if disagreement and score_is_calibrated:
         lines += [
             "> ⚠️ The statistical score and the AI review disagree here. Worth a "
             "direct look before triaging on the score alone.",
@@ -413,7 +422,13 @@ def format_llm_comment(
     detail: list[str] = [
         "| | |",
         "|---|---|",
-        f"| Statistical risk score | {pred.proba:.0%} (from historical issue patterns) |",
+        (
+            f"| Statistical risk score | {pred.proba:.0%} (from historical issue patterns) |"
+            if score_is_calibrated
+            else "| Statistical risk score | Not shown — this repository is outside "
+            "the set the classifier was calibrated on, so the score would not "
+            "mean what it appears to mean. The review above is unaffected. |"
+        ),
         f"| Severity | {analysis.severity.title()} |",
         f"| Overall risk | {analysis.risk_level.title()} |",
         "",
