@@ -101,6 +101,18 @@ class ServiceSettings:
     # this as DATABASE_URL or POSTGRES_URL automatically.
     database_url: str = ""
 
+    # Data retention, in days, for the prediction ledger. The privacy policy
+    # and the marketing site both promise 90; this is where that promise is
+    # kept -- see ghic/service/retention.py. Zero disables the sweep, which
+    # is correct for a local run with no database but is not a supported
+    # production configuration.
+    retention_days: int = 90
+    # Shared secret for the scheduled retention call. Vercel Cron sends
+    # `Authorization: Bearer $CRON_SECRET`; without one configured the
+    # endpoint refuses rather than running unauthenticated, because a
+    # deletion sweep is not something to leave open.
+    cron_secret: str = ""
+
     # Surface likely-duplicate prior issues (requires models/dup_index.joblib,
     # built by `python -m ghic.dupdetect --build-index`).
     suggest_related: bool = True
@@ -320,6 +332,8 @@ def load_settings() -> ServiceSettings:
             or os.environ.get("POSTGRES_URL")
             or ""
         ),
+        retention_days=int(_env_float("GHIC_RETENTION_DAYS", 90.0)),
+        cron_secret=os.environ.get("CRON_SECRET", ""),
         suggest_related=_env_bool("GHIC_SUGGEST_RELATED", True),
         related_min_similarity=_env_float("GHIC_RELATED_MIN_SIM", 0.55),
         draft_missing_info=_env_bool("GHIC_DRAFT_MISSING_INFO", False),

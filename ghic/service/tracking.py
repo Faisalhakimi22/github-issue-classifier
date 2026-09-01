@@ -274,6 +274,40 @@ class PredictionTracker:
         with self._lock:
             self._append(rec, workspace_id)
 
+    def record_quota_skip(
+        self,
+        repo: str,
+        number: int,
+        reason: str,
+        *,
+        plan: str,
+        period: str,
+        used: int,
+        limit: Any,
+        workspace_id: Any,
+    ) -> None:
+        """Persist an analysis refused by the plan's usage limit.
+
+        Kept distinct from `authorization_skip`. Both end in "GHIC did not
+        analyse this", but one means "you are not entitled to this
+        repository" and the other means "you are, and you have used the
+        month up" -- and only the second has an answer the customer can act
+        on. Collapsing them would make the dashboard say the wrong thing.
+        """
+        rec = {
+            "type": "quota_skip",
+            "repo": repo,
+            "number": number,
+            "reason": reason,
+            "plan": plan,
+            "period": period,
+            "used": used,
+            "limit": limit,
+            "at": _utcnow(),
+        }
+        with self._lock:
+            self._append(rec, workspace_id)
+
     def record_outcome(self, repo: str, number: int, truth: int, *, workspace_id: Any) -> bool:
         """Returns True when the outcome matched a tracked prediction."""
         rec = {

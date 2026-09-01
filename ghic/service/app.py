@@ -73,6 +73,7 @@ def create_app(
     automation_service: Any = None,
     authorization_gate: Any = None,
     authorization_lease: Any = None,
+    usage_meter: Any = None,
 ) -> FastAPI:
     """Build the app. `predictor` / `gh_client` / `dup_index` /
     `category_predictor` / `effort_predictor` / `assignment_recommender` /
@@ -212,6 +213,13 @@ def create_app(
         authorization_lease = default_authorization_lease
     app.state.authorization_gate = authorization_gate
     app.state.authorization_lease = authorization_lease
+    # Plan usage accounting. Separate from the authorization gate on purpose:
+    # authorization answers "is this repository yours?" and fails closed,
+    # usage answers "have you used the month up?" and fails open. Injectable
+    # so tests can meter without a database.
+    if usage_meter is None:
+        from . import usage as usage_meter  # noqa: PLC0415 -- optional dependency
+    app.state.usage = usage_meter
     # Phase 4 automation. Constructed only when at least one capability
     # flag is set; holds no GitHub client by design (see ghic/automation/).
     if automation_service is None:
@@ -398,6 +406,37 @@ def create_app(
             created_at=data.get("created_at") or _utcnow_iso(),
         )
         return pred.as_dict()
+
+    @app.get("/internal/retention")
+    def retention_sweep(request: Request) -> dict[str, Any]:
+        """Delete prediction records past the retention window.
+
+        The privacy policy says 90 days. This is the thing that makes that
+        true -- see ghic/service/retention.py for what is in scope and what
+        deliberately is not.
+
+        Authenticated by `CRON_SECRET`, the header Vercel Cron sends. With
+        no secret configured the endpoint refuses: an unauthenticated
+        deletion sweep reachable from the internet is worse than a retention
+        promise that is late.
+        """
+        s: ServiceSettings = app.state.settings
+        if not s.cron_secret:
+            raise HTTPException(status_code=503, detail="retention not configured")
+        provided = request.headers.get("Authorization", "")
+        expected = f"Bearer {s.cron_secret}"
+        if not hmac.compare_digest(provided, expected):
+            raise HTTPException(status_code=401, detail="invalid cron credentials")
+        if s.retention_days <= 0:
+            return {"ok": True, "skipped": "retention disabled", "deleted": {}}
+
+        from .retention import sweep
+
+        try:
+            return sweep(s.database_url, s.retention_days)
+        except Exception as error:
+            logger.exception("retention sweep failed")
+            raise HTTPException(status_code=500, detail="retention sweep failed") from error
 
     @app.post("/internal/process-issue")
     async def process_issue_callback(request: Request) -> dict[str, Any]:
@@ -741,6 +780,16 @@ def _handle_issue_opened(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         from .qstash import QStashError, publish
 
         s: ServiceSettings = app.state.settings
+        # Cheap read before spending a queue message on work the callback
+        # will refuse anyway. Not the enforcement point -- `reserve()` in
+        # the job is, and it is the one that serializes. This only avoids
+        # paying QStash to deliver a refusal.
+        if not app.state.usage.has_capacity(s.database_url, payload.get("_workspace_id")):
+            quota = app.state.usage.reserve(
+                s.database_url, payload.get("_workspace_id"), repo, number,
+            )
+            if not quota.allowed:
+                return _quota_skip_response(app, payload, repo, number, quota)
         try:
             message_id = publish(
                 f"{s.public_base_url}/internal/process-issue", payload, s.qstash_token,
@@ -769,9 +818,35 @@ def _process_issue_job(
     if not decision["authorized"]:
         return _authorization_skip_response(decision)
     payload["_workspace_id"] = decision.get("workspace_id")
+
+    # The quota is spent here, above every expensive thing this job does:
+    # the GitHub enrichment calls, the model, the retrieval index, and the
+    # LLM. A gate placed after any of them would be a gate that still pays
+    # the bill it exists to stop.
+    quota = app.state.usage.reserve(
+        app.state.settings.database_url,
+        payload.get("_workspace_id"),
+        repo,
+        number,
+    )
+    if not quota.allowed:
+        return _quota_skip_response(app, payload, repo, number, quota)
+
     try:
         result = _process_issue_job_impl(app, payload)
     except Exception as error:
+        # The slot goes back. An analysis that errored is not something to
+        # bill for, and the reservation was taken before there was any way
+        # to know whether the work would land.
+        if quota.reserved:
+            app.state.usage.release(
+                app.state.settings.database_url,
+                payload.get("_workspace_id"),
+                quota.period,
+                repo,
+                number,
+                reason=type(error).__name__,
+            )
         try:
             app.state.tracker.record_processing_failure(
                 repo, number, error, workspace_id=payload.get("_workspace_id")
@@ -782,6 +857,17 @@ def _process_issue_job(
 
     duration_ms = (_time.perf_counter() - started) * 1000
     if result.get("authorization") == "rejected":
+        # The final lease check revoked access mid-job, so nothing was
+        # delivered. Same rule as a failure: no delivery, no charge.
+        if quota.reserved:
+            app.state.usage.release(
+                app.state.settings.database_url,
+                payload.get("_workspace_id"),
+                quota.period,
+                repo,
+                number,
+                reason=str(result.get("reason") or "authorization_rejected"),
+            )
         return result
     app.state.tracker.record_analysis(
         repo,
@@ -828,6 +914,72 @@ def _authorize_index_job(app: FastAPI, installation_id: Any, repo: str) -> dict[
         installation_id,
         repo,
         app.state.gh,
+    )
+
+
+def _quota_skip_response(
+    app: FastAPI, payload: dict[str, Any], repo: str, number: int, quota: Any
+) -> dict[str, Any]:
+    """Record a refused analysis, and say so once per period.
+
+    Once, not every time. A workspace that blows through its limit on the
+    first of the month would otherwise get a bot comment on every issue for
+    the rest of it, which is the behaviour that gets an App uninstalled. The
+    maintainer needs to learn why GHIC went quiet exactly once; the rest of
+    the story belongs in the dashboard.
+    """
+    workspace_id = payload.get("_workspace_id")
+    try:
+        app.state.tracker.record_quota_skip(
+            repo,
+            number,
+            quota.reason,
+            plan=quota.plan.plan,
+            period=quota.period,
+            used=quota.used,
+            limit=quota.limit,
+            workspace_id=workspace_id,
+        )
+    except Exception as error:
+        logger.warning("could not persist quota skip: %s", error)
+
+    s: ServiceSettings = app.state.settings
+    notified = False
+    if quota.first_refusal and s.post_comment and not s.dry_run and app.state.gh:
+        installation_id = (payload.get("installation") or {}).get("id")
+        try:
+            app.state.gh.post_comment(
+                repo, number, _quota_comment(quota), installation_id,
+            )
+            notified = True
+        except Exception as error:  # a notice failing must not raise
+            logger.warning("could not post quota notice: %s", error)
+
+    logger.info(
+        "quota exhausted for workspace %s (%s): %d/%s in %s",
+        workspace_id, quota.plan.plan, quota.used, quota.limit, quota.period,
+    )
+    return {
+        "ok": True,
+        "skipped": True,
+        "quota": "exhausted",
+        "reason": quota.reason,
+        "plan": quota.plan.plan,
+        "period": quota.period,
+        "used": quota.used,
+        "limit": quota.limit,
+        "notified": notified,
+    }
+
+
+def _quota_comment(quota: Any) -> str:
+    return (
+        f"**GHIC has paused analysis for this workspace.**\n\n"
+        f"The **{quota.plan.plan}** plan includes {quota.limit} issue analyses "
+        f"per month, and {quota.used} have been used in {quota.period}.\n\n"
+        "New issues are not being analysed until the limit resets or the plan "
+        "is upgraded. Nothing has been lost — analysis resumes automatically.\n\n"
+        "_This notice is posted once per period, not on every issue._"
     )
 
 
@@ -1278,6 +1430,29 @@ def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         return {"ok": True, "ignored": f"bot author {author}"}
     if issue.get("state") == "closed":
         return {"ok": True, "ignored": "edit on closed issue"}
+
+    # A re-score does not take a new slot. The customer already paid for
+    # this issue when it was opened, and charging again because a month
+    # boundary happened to fall between the open and the edit would bill
+    # twice for one issue. But a workspace with nothing left does not get
+    # free model runs either, so an exhausted workspace skips the re-score.
+    usage = app.state.usage.usage_summary(s.database_url, decision.get("workspace_id"))
+    exhausted = (
+        usage.get("enforced")
+        and usage.get("limit") is not None
+        and int(usage.get("used") or 0) >= int(usage["limit"])
+    )
+    if exhausted:
+        app.state.usage.record(
+            s.database_url,
+            decision.get("workspace_id"),
+            usage["period"],
+            repo,
+            number,
+            "skipped",
+            "issue_quota_exhausted",
+        )
+        return {"ok": True, "skipped": True, "quota": "exhausted", "rescored": False}
 
     author_created_at, author_public_repos, author_followers, latest_release = _enrich(
         s, gh, author, repo, installation_id

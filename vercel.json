@@ -5,5 +5,11 @@
       "maxDuration": 10,
       "excludeFiles": "{tests/**,notebook/**,reports/**,data/**,docs/**,_archive/**}"
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/internal/retention",
+      "schedule": "0 3 * * *"
+    }
+  ]
 }
