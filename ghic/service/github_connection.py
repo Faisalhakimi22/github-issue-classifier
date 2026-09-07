@@ -27,6 +27,7 @@ the event is acknowledged.
 """
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import contextmanager
 from typing import Any
@@ -383,6 +384,58 @@ def _repo_names(payload: dict, key: str) -> list[str]:
 # has never run in this environment.
 _OPTIONAL_TABLES = ("ghic_repo_chunks", "ghic_repository_state", "ghic_ledger")
 
+#: Every purge reports every record type, including the ones it removed
+#: nothing of. A missing key and a zero read the same way to a person and
+#: differently to a query, and "did this cleanup touch the ledger" has to be
+#: answerable without knowing which keys that version happened to emit.
+_PURGE_COUNT_KEYS = ("chunks", "repository_state", "ledger", "repositories",
+                     "installations")
+
+#: The audit table lives in the Hub's migrations (v8). The backend records
+#: into it when it is there and carries on when it is not -- a cleanup must
+#: never fail because an audit table has not been created yet.
+_PURGE_AUDIT_TABLE = "ghic_purge_events"
+
+
+def _empty_purge_counts() -> dict[str, int]:
+    return {key: 0 for key in _PURGE_COUNT_KEYS}
+
+
+def _record_purge(
+    conn: Any,
+    reason: str,
+    counts: dict[str, int],
+    *,
+    installation_id: int | None = None,
+    workspace_id: str | None = None,
+    repo: str | None = None,
+) -> None:
+    """Leave a durable record that a cleanup happened, and what it removed.
+
+    Written on the caller's connection, so it commits in the same
+    transaction as the deletions it describes: an audit row that can survive
+    while the purge rolls back -- or vanish while the purge commits -- would
+    be worse than none at all.
+
+    The row outlives its subject by design. It names an installation this
+    same operation deletes, so there is no foreign key to hold.
+    """
+    if not _table_present(conn, _PURGE_AUDIT_TABLE):
+        return
+    full = _empty_purge_counts()
+    full.update({k: int(v) for k, v in counts.items() if k in full})
+    conn.run(
+        "INSERT INTO ghic_purge_events "
+        "(reason, installation_id, workspace_id, repo, counts, total) "
+        "VALUES (:reason, :iid, :ws, :repo, CAST(:counts AS JSONB), :total)",
+        reason=reason,
+        iid=installation_id,
+        ws=workspace_id,
+        repo=repo,
+        counts=json.dumps(full, ensure_ascii=False),
+        total=sum(full.values()),
+    )
+
 
 def _table_present(conn: Any, table: str) -> bool:
     rows = conn.run(
@@ -443,8 +496,7 @@ def purge_installation(conn: Any, installation_id: int) -> dict[str, int]:
     Idempotent: every statement is a DELETE ... WHERE, so running it twice
     removes nothing the second time and still succeeds.
     """
-    counts = {"chunks": 0, "repository_state": 0, "ledger": 0,
-              "repositories": 0, "installations": 0}
+    counts = _empty_purge_counts()
 
     # Lock the installation before its repositories, matching the order
     # authorization_lease takes them in, so the two cannot deadlock.
@@ -496,6 +548,16 @@ def purge_installation(conn: Any, installation_id: int) -> dict[str, int]:
         iid=installation_id,
     )
     counts["installations"] += len(rows)
+    # One row for the whole uninstall. The workspace is recorded only when
+    # the installation belonged to exactly one; naming an arbitrary member
+    # of several would be worse than leaving it open.
+    _record_purge(
+        conn,
+        "installation_removed",
+        counts,
+        installation_id=installation_id,
+        workspace_id=next(iter(workspaces)) if len(workspaces) == 1 else None,
+    )
     return counts
 
 
@@ -508,8 +570,7 @@ def purge_repositories(
     still installed, so the installation row and every other repository it
     owns must survive.
     """
-    counts = {"chunks": 0, "repository_state": 0, "ledger": 0,
-              "repositories": 0, "installations": 0}
+    counts = _empty_purge_counts()
     for name in repo_full_names:
         rows = conn.run(
             "SELECT repo_full_name, workspace_id FROM ghic_github_repositories "
@@ -525,6 +586,7 @@ def purge_repositories(
                 repo_full_name,
             )
             continue
+        before = dict(counts)
         _purge_repository_data(conn, str(repo_full_name), str(workspace_id), counts)
         deleted = conn.run(
             "DELETE FROM ghic_github_repositories "
@@ -532,6 +594,18 @@ def purge_repositories(
             iid=installation_id, repo=name,
         )
         counts["repositories"] += len(deleted)
+        # One row per repository rather than one per call: the repo column
+        # is only meaningful if it names a single repository, and a
+        # disconnect of three is three separate things a customer may ask
+        # about later.
+        _record_purge(
+            conn,
+            "repository_disconnected",
+            {k: counts[k] - before.get(k, 0) for k in counts},
+            installation_id=installation_id,
+            workspace_id=str(workspace_id),
+            repo=str(repo_full_name),
+        )
     return counts
 
 

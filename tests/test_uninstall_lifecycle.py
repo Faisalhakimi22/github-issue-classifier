@@ -29,6 +29,7 @@ class TinyDB:
             "ghic_ledger": [],
             "ghic_users": [],
             "ghic_workspaces": [],
+            "ghic_purge_events": [],
         }
         self.depth = 0
         self.committed = False
@@ -115,11 +116,26 @@ class TinyDB:
                 lambda r: r["workspace_id"] == kw["ws"]
                 and str(r["data"].get("installation_id")) == kw["iid"])
         if flat.startswith("DELETE FROM ghic_github_repositories"):
-            return self._delete("ghic_github_repositories",
-                                lambda r: r["installation_id"] == kw["iid"])
+            repo = kw.get("repo")
+            return self._delete(
+                "ghic_github_repositories",
+                lambda r: r["installation_id"] == kw["iid"]
+                and (repo is None or r["repo_full_name"] == repo))
         if flat.startswith("DELETE FROM ghic_github_installations"):
             return self._delete("ghic_github_installations",
                                 lambda r: r["installation_id"] == kw["iid"])
+        if flat.startswith("INSERT INTO ghic_purge_events"):
+            import json as _json
+
+            self.tables["ghic_purge_events"].append({
+                "reason": kw["reason"],
+                "installation_id": kw["iid"],
+                "workspace_id": kw["ws"],
+                "repo": kw["repo"],
+                "counts": _json.loads(kw["counts"]),
+                "total": kw["total"],
+            })
+            return []
         return []
 
     def _delete(self, table, predicate):
@@ -268,3 +284,133 @@ class TestPartialRemoval:
         assert db.count("ghic_repo_chunks", repo="acme/keeper") == 3
         # The App is still installed.
         assert db.count("ghic_github_installations", installation_id=100) == 1
+
+
+class TestPurgeAudit:
+    """The cleanup leaves a record of itself.
+
+    Reconstructing the September uninstall took reading a sequence counter
+    to discover 39 rows had ever existed. The deletion is correct and stays
+    correct; what was missing was any durable statement that it happened.
+    """
+
+    def test_an_uninstall_records_what_it_removed(self, db):
+        db.install(100, "ws-a", ["acme/widgets"])
+        db.add_activity("acme/widgets", "ws-a")
+        uninstall()
+
+        events = db.tables["ghic_purge_events"]
+        assert len(events) == 1
+        event = events[0]
+        assert event["reason"] == "installation_removed"
+        assert event["installation_id"] == 100
+        assert event["workspace_id"] == "ws-a"
+        assert event["counts"] == {
+            "chunks": 3, "repository_state": 1, "ledger": 2,
+            "repositories": 1, "installations": 1,
+        }
+        assert event["total"] == 8
+
+    def test_every_record_type_is_reported_including_the_zeros(self, db):
+        # An installation with no activity still says so for each type. A
+        # missing key and a zero read alike to a person and differently to a
+        # query, and "did this touch the ledger" must be answerable without
+        # knowing which keys that version emitted.
+        db.install(100, "ws-a", ["acme/widgets"])
+        uninstall()
+
+        counts = db.tables["ghic_purge_events"][0]["counts"]
+        assert set(counts) == {
+            "chunks", "repository_state", "ledger", "repositories",
+            "installations",
+        }
+        assert counts["chunks"] == 0
+        assert counts["ledger"] == 0
+        assert counts["installations"] == 1
+
+    def test_a_repository_disconnect_is_audited_too(self, db):
+        # A disconnect deletes analysis records just as an uninstall does,
+        # so it is just as much worth a record.
+        db.install(100, "ws-a", ["acme/widgets", "acme/gadgets"])
+        db.add_activity("acme/widgets", "ws-a", chunks=2, ledger=4)
+        db.add_activity("acme/gadgets", "ws-a", chunks=1, ledger=1)
+
+        github_connection.handle_installation_event(
+            URL, "installation_repositories",
+            {
+                "action": "removed",
+                "installation": {"id": 100},
+                "repositories_removed": [{"full_name": "acme/widgets"}],
+            },
+        )
+
+        events = db.tables["ghic_purge_events"]
+        assert len(events) == 1
+        assert events[0]["reason"] == "repository_disconnected"
+        assert events[0]["repo"] == "acme/widgets"
+        assert events[0]["counts"]["ledger"] == 4
+        # The repository that stayed connected keeps its records.
+        assert db.count("ghic_ledger", workspace_id="ws-a") == 1
+
+    def test_each_disconnected_repository_gets_its_own_row(self, db):
+        # One row per repository, because the repo column only means
+        # something if it names a single one.
+        db.install(100, "ws-a", ["acme/one", "acme/two"])
+        db.add_activity("acme/one", "ws-a", chunks=1, ledger=1)
+        db.add_activity("acme/two", "ws-a", chunks=1, ledger=2)
+
+        github_connection.handle_installation_event(
+            URL, "installation_repositories",
+            {
+                "action": "removed",
+                "installation": {"id": 100},
+                "repositories_removed": [
+                    {"full_name": "acme/one"}, {"full_name": "acme/two"},
+                ],
+            },
+        )
+
+        events = db.tables["ghic_purge_events"]
+        assert len(events) == 2
+        by_repo = {e["repo"]: e for e in events}
+        # Per-repository counts, not a running total.
+        assert by_repo["acme/one"]["counts"]["ledger"] == 1
+        assert by_repo["acme/two"]["counts"]["ledger"] == 2
+
+    def test_a_purge_that_removes_nothing_still_says_so(self, db):
+        # Uninstalling something that was never installed is a real event
+        # worth recording: it is the difference between "nothing to clean"
+        # and "the cleanup never ran".
+        uninstall()
+        events = db.tables["ghic_purge_events"]
+        assert len(events) == 1
+        assert events[0]["total"] == 0
+
+    def test_the_audit_never_blocks_the_cleanup(self, monkeypatch, db):
+        # A backend deployed ahead of the Hub migration has no audit table.
+        # The uninstall must still complete.
+        monkeypatch.setattr(
+            github_connection, "_table_present",
+            lambda conn, table: table != "ghic_purge_events",
+        )
+        db.install(100, "ws-a", ["acme/widgets"])
+        db.add_activity("acme/widgets", "ws-a")
+
+        result = uninstall()
+
+        assert result["ok"] is True
+        assert db.tables["ghic_purge_events"] == []
+        assert db.tables["ghic_github_installations"] == []
+
+    def test_usage_records_are_never_touched_by_a_purge(self, db):
+        # The whole point of the investigation: work already delivered is
+        # not refunded because a repository was disconnected afterwards.
+        db.tables["ghic_usage_events"] = [
+            {"workspace_id": "ws-a", "outcome": "counted"},
+        ]
+        db.install(100, "ws-a", ["acme/widgets"])
+        db.add_activity("acme/widgets", "ws-a")
+        uninstall()
+        assert db.tables["ghic_usage_events"] == [
+            {"workspace_id": "ws-a", "outcome": "counted"},
+        ]
