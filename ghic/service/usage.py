@@ -10,10 +10,10 @@ customer charged for one thing and served another. The Hub's reader is
 What this module adds beyond reading a number is the accounting, and the
 accounting has one rule that shapes everything else: **a quota is spent
 before the work runs, not after.** Checking first and recording afterwards
-leaves a window in which two concurrent deliveries both see 499 of 500 used
-and both proceed, and leaves a crash between the work and the record as a
-free analysis. So an analysis reserves its slot, and gives the slot back if
-the work fails.
+leaves a window in which two concurrent deliveries both see one remaining
+slot and both proceed, and leaves a crash between the work and the record as
+a free analysis. So an analysis reserves its slot, and gives the slot back
+if the work fails.
 
 Not billing for failures is the reason `release()` exists. It mirrors the
 idempotency store's `release()` for the same reason: something was marked
@@ -59,8 +59,8 @@ class Plan:
     a coercion in either direction turns the most expensive plan into the
     most restrictive one -- so the None has to survive into every reader.
 
-    `enforced` is False when the limits could not be read at all. See
-    `plan_for_workspace` for why that is a permissive state.
+    `enforced` is False only when the plan could not be read. Enforcement
+    paths reject that state; read-only UI may still explain the outage.
     """
 
     plan: str = "unknown"
@@ -104,15 +104,11 @@ class UsageDecision:
         }
 
 
-#: The state a deployment is in when the plan tables cannot be read.
-#:
-#: Fail **open**, deliberately. A quota is a commercial limit, not a security
-#: boundary. Refusing every analysis because a migration has not reached this
-#: deployment turns a billing feature into an outage, and the fault would be
-#: ours rather than the customer's. The checks that *are* security --
-#: `authorize_issue`, installation ownership, workspace scoping -- keep
-#: failing closed as they always have, and none of them run through here.
-UNMETERED = Plan()
+UNAVAILABLE = Plan(plan="unavailable")
+
+
+class UsageUnavailableError(RuntimeError):
+    """The workspace plan cannot be established authoritatively."""
 
 
 def _sqlstate(error: Exception) -> str:
@@ -163,27 +159,26 @@ _PLAN_SQL = (
 def _read_plan(conn: Any, workspace_id: str) -> Plan:
     rows = conn.run(_PLAN_SQL, workspace_id=workspace_id)
     if not rows:
-        # A workspace with no plan row is a workspace this deployment cannot
-        # price. Guessing "starter" would refuse work the customer may have
-        # paid for, so it is unmetered until someone says otherwise.
-        return UNMETERED
+        raise UsageUnavailableError("workspace has no valid plan")
     return _plan_from_row(rows[0])
 
 
 def plan_for_workspace(database_url: str, workspace_id: Any) -> Plan:
-    """The plan a workspace is on. Never raises; unreadable means unmetered."""
+    """Return the authoritative plan, or fail instead of granting free work."""
     identifier = str(workspace_id or "").strip()
     if not identifier or not database_url:
-        return UNMETERED
+        raise UsageUnavailableError("usage requires database and workspace context")
     try:
         with session(database_url) as conn:
             return _read_plan(conn, identifier)
     except Exception as error:
+        if isinstance(error, UsageUnavailableError):
+            raise
         if _sqlstate(error) == UNDEFINED_TABLE:
-            logger.info("plan tables absent; running unmetered")
+            logger.error("plan tables are unavailable")
         else:
             logger.warning("plan lookup failed for %s: %s", identifier, error)
-        return UNMETERED
+        raise UsageUnavailableError("workspace plan is unavailable") from error
 
 
 def _count(conn: Any, workspace_id: str, period: str, outcome: str) -> int:
@@ -249,7 +244,7 @@ def reserve(
     except (TypeError, ValueError):
         number = 0
     if not identifier or not database_url or not repo_name or number <= 0:
-        return UsageDecision(True, "unmetered", UNMETERED, period_key())
+        return UsageDecision(False, "usage_unavailable", UNAVAILABLE, period_key())
 
     try:
         with session(database_url) as conn:
@@ -257,13 +252,10 @@ def reserve(
             try:
                 plan = _read_plan(conn, identifier)
                 period = period_key(plan.period, now)
-                if not plan.enforced or plan.unlimited_issues:
+                if plan.unlimited_issues:
                     conn.run("COMMIT")
                     return UsageDecision(
-                        True,
-                        "unlimited" if plan.enforced else "unmetered",
-                        plan,
-                        period,
+                        True, "unlimited", plan, period,
                     )
 
                 conn.run(
@@ -322,10 +314,10 @@ def reserve(
                 raise
     except Exception as error:
         if _sqlstate(error) == UNDEFINED_TABLE:
-            logger.info("usage tables absent; running unmetered")
+            logger.error("usage tables are unavailable")
         else:
             logger.warning("usage reservation failed for %s: %s", identifier, error)
-        return UsageDecision(True, "unmetered", UNMETERED, period_key())
+        return UsageDecision(False, "usage_unavailable", UNAVAILABLE, period_key())
 
 
 def release(
@@ -418,9 +410,12 @@ def has_capacity(
     that the callback will refuse, and re-scoring an edit whose workspace is
     already out of quota.
 
-    Unreadable means yes, for the same reason `UNMETERED` is permissive.
+    Unreadable means no. This remains only an optimization; `reserve()` is the
+    serialized enforcement point.
     """
     summary = usage_summary(database_url, workspace_id, now)
+    if not summary.get("available"):
+        return False
     limit = summary.get("limit")
     if not summary.get("enforced") or limit is None:
         return True
@@ -437,12 +432,13 @@ def usage_summary(
     """
     identifier = str(workspace_id or "").strip()
     empty = {
-        "plan": UNMETERED.plan,
+        "plan": UNAVAILABLE.plan,
         "period": period_key(),
         "used": 0,
         "limit": None,
         "remaining": None,
         "enforced": False,
+        "available": False,
         "outcomes": {},
     }
     if not identifier or not database_url:
@@ -468,6 +464,7 @@ def usage_summary(
                 "limit": limit,
                 "remaining": None if limit is None else max(0, limit - used),
                 "enforced": plan.enforced,
+                "available": True,
                 "outcomes": outcomes,
             }
     except Exception as error:

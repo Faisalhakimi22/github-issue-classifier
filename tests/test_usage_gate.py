@@ -48,7 +48,11 @@ class FakeMeter:
 
     def reserve(self, database_url, workspace_id, repo, issue_number, now=None):
         self.reserved.append((workspace_id, repo, issue_number))
-        if not self.enforced or self.limit is None:
+        if not self.enforced:
+            return usage.UsageDecision(
+                False, "usage_unavailable", usage.UNAVAILABLE, "2026-08"
+            )
+        if self.limit is None:
             return usage.UsageDecision(True, "unmetered", self._plan(), "2026-08")
         if self.used >= self.limit:
             first = not self.first_refusal_used
@@ -82,6 +86,7 @@ class FakeMeter:
             "limit": self.limit,
             "remaining": None if self.limit is None else max(0, self.limit - self.used),
             "enforced": self.enforced,
+            "available": True,
             "outcomes": {},
         }
 
@@ -178,9 +183,9 @@ def test_the_workspace_charged_is_the_one_authorization_decided():
     assert meter.reserved == [("ws-1", "acme/widgets", 42)]
 
 
-def test_an_unmetered_deployment_analyses_as_before():
+def test_an_unlimited_enterprise_plan_analyses_as_before():
     predictor = StubPredictor()
-    meter = FakeMeter(enforced=False)
+    meter = FakeMeter(limit=None, plan="enterprise", enforced=True)
     client = build(meter, predictor=predictor)
 
     assert post_webhook(client, issue_opened_payload()).status_code == 200
@@ -233,7 +238,7 @@ def test_a_revoked_lease_mid_job_gives_the_slot_back():
 # ---------------------------------------------------------------------------
 # The refusal notice
 # ---------------------------------------------------------------------------
-def test_the_first_refusal_of_a_period_is_announced_once():
+def test_a_quota_refusal_never_writes_to_github():
     gh = StubGitHub()
     meter = FakeMeter(limit=1, used=1)
     client = build(meter, gh=gh, dry_run=False, post_comment=True)
@@ -241,12 +246,9 @@ def test_the_first_refusal_of_a_period_is_announced_once():
     first = post_webhook(client, issue_opened_payload(number=1))
     second = post_webhook(client, issue_opened_payload(number=2))
 
-    assert first.json()["notified"] is True
-    # A workspace that exhausts its plan on the first of the month must not
-    # get a bot comment on every issue for the rest of it.
+    assert first.json()["notified"] is False
     assert second.json()["notified"] is False
-    assert len(gh.comments) == 1
-    assert "paused analysis" in gh.comments[0][2]
+    assert gh.comments == []
 
 
 def test_a_dry_run_deployment_announces_nothing():
@@ -258,10 +260,10 @@ def test_a_dry_run_deployment_announces_nothing():
     assert gh.comments == []
 
 
-def test_a_notice_that_fails_to_post_does_not_fail_the_delivery():
+def test_quota_refusal_does_not_call_the_github_client():
     class FailingGitHub(StubGitHub):
         def post_comment(self, *args, **kwargs):
-            raise RuntimeError("github down")
+            pytest.fail("quota refusal must not perform a GitHub write")
 
     meter = FakeMeter(limit=1, used=1)
     client = build(meter, gh=FailingGitHub(), dry_run=False, post_comment=True)
@@ -269,6 +271,28 @@ def test_a_notice_that_fails_to_post_does_not_fail_the_delivery():
     response = post_webhook(client, issue_opened_payload())
     assert response.status_code == 200
     assert response.json()["notified"] is False
+
+
+def test_usage_outage_stops_processing_without_a_github_write():
+    class UnavailableMeter(FakeMeter):
+        def reserve(self, database_url, workspace_id, repo, issue_number, now=None):
+            return usage.UsageDecision(
+                False,
+                "usage_unavailable",
+                usage.UNAVAILABLE,
+                "2026-08-27",
+            )
+
+    predictor = StubPredictor()
+    gh = StubGitHub()
+    response = post_webhook(
+        build(UnavailableMeter(), predictor=predictor, gh=gh),
+        issue_opened_payload(),
+    )
+
+    assert response.json()["quota"] == "unavailable"
+    assert predictor.calls == []
+    assert gh.comments == []
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +329,34 @@ def test_an_exhausted_workspace_does_not_get_free_rescores():
     assert response.json()["quota"] == "exhausted"
     assert predictor.calls == []
     assert meter.recorded[0][4] == "skipped"
+
+
+def test_usage_outage_stops_an_edited_issue_before_prediction_or_github_write():
+    class UnavailableMeter(FakeMeter):
+        def usage_summary(self, database_url, workspace_id, now=None):
+            return {
+                "available": False,
+                "enforced": False,
+                "plan": "unavailable",
+                "period": "",
+                "used": 0,
+                "limit": None,
+                "remaining": None,
+                "outcomes": {},
+            }
+
+    predictor = StubPredictor()
+    gh = StubGitHub()
+    response = post_webhook(
+        build(UnavailableMeter(), predictor=predictor, gh=gh),
+        edited_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["quota"] == "unavailable"
+    assert response.json()["rescored"] is False
+    assert predictor.calls == []
+    assert gh.comments == []
 
 
 # ---------------------------------------------------------------------------

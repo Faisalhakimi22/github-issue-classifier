@@ -20,7 +20,7 @@ class FakeUsageDatabase:
 
     def __init__(self, plans=None, workspaces=None):
         self.plans = plans if plans is not None else {
-            "starter": (1, 500, "month"),
+            "starter": (1, 50, "day"),
             "pro": (10, 10000, "month"),
             "enterprise": (None, None, "month"),
         }
@@ -146,7 +146,7 @@ def test_a_naive_datetime_is_read_as_utc_rather_than_guessed():
 # ---------------------------------------------------------------------------
 def test_a_plan_is_read_as_written(db):
     plan = usage.plan_for_workspace("postgres://test", "ws-1")
-    assert (plan.plan, plan.max_issues_per_period, plan.enforced) == ("starter", 500, True)
+    assert (plan.plan, plan.max_issues_per_period, plan.period) == ("starter", 50, "day")
 
 
 def test_unlimited_is_none_and_not_zero(db):
@@ -159,22 +159,23 @@ def test_unlimited_is_none_and_not_zero(db):
     assert plan.enforced is True
 
 
-def test_an_unknown_workspace_is_unmetered(db):
-    plan = usage.plan_for_workspace("postgres://test", "ws-missing")
-    assert plan.enforced is False
+def test_an_unknown_workspace_fails_closed(db):
+    with pytest.raises(usage.UsageUnavailableError):
+        usage.plan_for_workspace("postgres://test", "ws-missing")
 
 
-def test_absent_plan_tables_fail_open(db):
+def test_absent_plan_tables_fail_closed(db):
     db.fail_with = undefined_table()
-    plan = usage.plan_for_workspace("postgres://test", "ws-1")
-    assert plan.enforced is False
-    assert plan.max_issues_per_period is None
+    with pytest.raises(usage.UsageUnavailableError):
+        usage.plan_for_workspace("postgres://test", "ws-1")
 
 
 def test_a_blank_workspace_is_not_looked_up(monkeypatch):
     monkeypatch.setattr(usage, "session", pytest.fail)
-    assert usage.plan_for_workspace("postgres://test", "").enforced is False
-    assert usage.plan_for_workspace("", "ws-1").enforced is False
+    with pytest.raises(usage.UsageUnavailableError):
+        usage.plan_for_workspace("postgres://test", "")
+    with pytest.raises(usage.UsageUnavailableError):
+        usage.plan_for_workspace("", "ws-1")
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +247,12 @@ def test_an_unlimited_plan_never_writes_a_counted_row(db):
     assert db.events == []
 
 
-def test_reservation_falls_open_when_the_tables_are_absent(db):
+def test_reservation_fails_closed_when_the_tables_are_absent(db):
     db.fail_with = undefined_table()
     decision = usage.reserve("postgres://test", "ws-1", "a/b", 1)
-    assert decision.allowed is True
+    assert decision.allowed is False
     assert decision.reserved is False
-    assert decision.plan.enforced is False
+    assert decision.reason == "usage_unavailable"
 
 
 def test_a_failed_transaction_is_rolled_back(db):
@@ -275,7 +276,8 @@ def test_a_failed_transaction_is_rolled_back(db):
         decision = usage.reserve("postgres://test", "ws-1", "a/b", 1)
     finally:
         module.session = original
-    assert decision.allowed is True  # fails open
+    assert decision.allowed is False
+    assert decision.reason == "usage_unavailable"
     assert exploding.rolled_back == 1
     assert exploding.committed == 0
 
@@ -288,7 +290,7 @@ def test_releasing_gives_the_slot_back_and_leaves_a_trace(db):
     # The period comes from the same clock reserve() used. A literal here
     # passes for a month and then deletes nothing on the 1st.
     assert usage.release(
-        "postgres://test", "ws-1", usage.period_key(), "acme/widgets", 7,
+        "postgres://test", "ws-1", usage.period_key("day"), "acme/widgets", 7,
         reason="TimeoutError",
     ) is True
     assert db.counted() == []
@@ -302,7 +304,7 @@ def test_releasing_gives_the_slot_back_and_leaves_a_trace(db):
 def test_a_released_slot_can_be_taken_again(db):
     db.plans["starter"] = (1, 1, "month")
     usage.reserve("postgres://test", "ws-1", "a/b", 1)
-    period = usage.period_key()
+    period = usage.period_key("month")
     usage.release("postgres://test", "ws-1", period, "a/b", 1)
     assert usage.reserve("postgres://test", "ws-1", "a/b", 2).allowed is True
 
@@ -337,13 +339,13 @@ def test_record_writes_an_audit_row(db):
 # ---------------------------------------------------------------------------
 def test_the_summary_separates_the_four_outcomes(db):
     usage.reserve("postgres://test", "ws-1", "a/b", 1)
-    period = usage.period_key()
+    period = usage.period_key("day")
     usage.record("postgres://test", "ws-1", period, "a/b", 2, usage.FAILED, "boom")
     usage.record("postgres://test", "ws-1", period, "a/b", 3, usage.SKIPPED, "bot")
     summary = usage.usage_summary("postgres://test", "ws-1")
     assert summary["used"] == 1
-    assert summary["limit"] == 500
-    assert summary["remaining"] == 499
+    assert summary["limit"] == 50
+    assert summary["remaining"] == 49
     assert summary["outcomes"] == {"counted": 1, "failed": 1, "skipped": 1}
 
 
@@ -361,6 +363,6 @@ def test_an_unlimited_plan_has_no_remaining(db):
     assert summary["remaining"] is None
 
 
-def test_has_capacity_is_permissive_when_unreadable(db):
+def test_has_capacity_fails_closed_when_unreadable(db):
     db.fail_with = undefined_table()
-    assert usage.has_capacity("postgres://test", "ws-1") is True
+    assert usage.has_capacity("postgres://test", "ws-1") is False

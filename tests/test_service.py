@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from ghic.service.app import create_app as _create_app, verify_signature  # noqa: E402
 from ghic.service.inference import Prediction, format_comment, format_llm_comment  # noqa: E402
 from ghic.service.settings import ServiceSettings  # noqa: E402
+from ghic.service.usage import Plan, UsageDecision  # noqa: E402
 
 SECRET = "test-secret"
 
@@ -32,6 +33,7 @@ def _allow_authorization(database_url, installation_id, repo_full_name, github_c
         "authorized": True,
         "installation_id": int(installation_id),
         "repo": repo_full_name,
+        "workspace_id": "test-workspace",
     }
 
 
@@ -41,12 +43,36 @@ def _allow_authorization_lease(database_url, installation_id, repo_full_name):
         "authorized": True,
         "installation_id": int(installation_id),
         "repo": repo_full_name,
+        "workspace_id": "test-workspace",
     }
+
+
+class StubUsageMeter:
+    """An explicit valid plan for processing tests without a database.
+
+    Production plan failures and quota ordering use the real reader or their
+    own metered fixture in test_usage_limits and test_usage_gate.
+    """
+
+    def reserve(self, database_url, workspace_id, repo, issue_number):
+        assert workspace_id
+        return UsageDecision(
+            True, "unlimited", Plan(plan="enterprise", enforced=True), "2026-09"
+        )
+
+    def has_capacity(self, database_url, workspace_id):
+        assert workspace_id
+        return True
+
+    def usage_summary(self, database_url, workspace_id):
+        assert workspace_id
+        return {"available": True, "enforced": True, "used": 0, "limit": None}
 
 
 def create_app(*args, **kwargs):
     kwargs.setdefault("authorization_gate", _allow_authorization)
     kwargs.setdefault("authorization_lease", _allow_authorization_lease)
+    kwargs.setdefault("usage_meter", StubUsageMeter())
     return _create_app(*args, **kwargs)
 
 
@@ -332,6 +358,7 @@ class TestIssueAuthorizationOrdering:
             repo_intelligence=repo_intelligence,
             authorization_gate=_allow_authorization,
             authorization_lease=reject_at_write,
+            usage_meter=StubUsageMeter(),
         )
         response = post_webhook(TestClient(app), issue_opened_payload())
 
@@ -693,6 +720,45 @@ class TestStats:
         assert "recent" not in data
         assert "analytics" not in data
         assert "online_evaluation" not in data
+
+    def test_unmatched_paths_do_not_expose_repository_identifiers(self):
+        app = _create_app(
+            make_settings(), predictor=StubPredictor(), gh_client=StubGitHub()
+        )
+        client = TestClient(app)
+        for n in range(8):
+            assert client.get(
+                f"/repositories/private-workspace-{n}/issues/93487621"
+            ).status_code == 404
+        response = client.get("/stats", headers={"X-GHIC-Token": SECRET})
+        assert response.status_code == 200
+        data = response.json()
+        assert set(data["latency_ms"]) == {"__unmatched__"}
+        assert data["latency_ms"]["__unmatched__"]["n"] == 8
+        assert "private-workspace" not in json.dumps(data)
+        assert "93487621" not in json.dumps(data)
+        assert app.state.predictor.calls == []
+
+    def test_parameterized_routes_report_only_the_route_template(self):
+        app = _create_app(
+            make_settings(), predictor=StubPredictor(), gh_client=StubGitHub()
+        )
+
+        @app.get("/observability-fixture/{repo}/{number}")
+        def fixture_route(repo: str, number: int):
+            return {"ok": True}
+
+        client = TestClient(app)
+        response = client.get(
+            "/observability-fixture/private-repository/93487621?workspace_id=private-workspace"
+        )
+        assert response.status_code == 200
+        data = client.get("/stats", headers={"X-GHIC-Token": SECRET}).json()
+        assert set(data["latency_ms"]) == {"/observability-fixture/{repo}/{number}"}
+        assert "private-repository" not in json.dumps(data)
+        assert "private-workspace" not in json.dumps(data)
+        assert "93487621" not in json.dumps(data)
+        assert app.state.predictor.calls == []
 
 
 # ---------------------------------------------------------------------------

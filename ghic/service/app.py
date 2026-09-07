@@ -111,7 +111,8 @@ def create_app(
             app.state.errors["count"] += 1
             raise
         elapsed_ms = (_time.perf_counter() - started) * 1000
-        path = request.url.path
+        # Route templates exclude tenant identifiers and bound 404 cardinality.
+        path = getattr(request.scope.get("route"), "path", None) or "__unmatched__"
         app.state.latencies.setdefault(path, deque(maxlen=1000)).append(elapsed_ms)
         if response.status_code >= 500:
             app.state.errors["count"] += 1
@@ -214,9 +215,10 @@ def create_app(
     app.state.authorization_gate = authorization_gate
     app.state.authorization_lease = authorization_lease
     # Plan usage accounting. Separate from the authorization gate on purpose:
-    # authorization answers "is this repository yours?" and fails closed,
-    # usage answers "have you used the month up?" and fails open. Injectable
-    # so tests can meter without a database.
+    # authorization answers "is this repository yours?" and usage answers
+    # "does this workspace have capacity?" Both fail closed when their
+    # authoritative database state is unavailable. Injectable so tests can
+    # meter without a database.
     if usage_meter is None:
         from . import usage as usage_meter  # noqa: PLC0415 -- optional dependency
     app.state.usage = usage_meter
@@ -920,14 +922,7 @@ def _authorize_index_job(app: FastAPI, installation_id: Any, repo: str) -> dict[
 def _quota_skip_response(
     app: FastAPI, payload: dict[str, Any], repo: str, number: int, quota: Any
 ) -> dict[str, Any]:
-    """Record a refused analysis, and say so once per period.
-
-    Once, not every time. A workspace that blows through its limit on the
-    first of the month would otherwise get a bot comment on every issue for
-    the rest of it, which is the behaviour that gets an App uninstalled. The
-    maintainer needs to learn why GHIC went quiet exactly once; the rest of
-    the story belongs in the dashboard.
-    """
+    """Record a refused analysis without performing a GitHub mutation."""
     workspace_id = payload.get("_workspace_id")
     try:
         app.state.tracker.record_quota_skip(
@@ -943,44 +938,22 @@ def _quota_skip_response(
     except Exception as error:
         logger.warning("could not persist quota skip: %s", error)
 
-    s: ServiceSettings = app.state.settings
-    notified = False
-    if quota.first_refusal and s.post_comment and not s.dry_run and app.state.gh:
-        installation_id = (payload.get("installation") or {}).get("id")
-        try:
-            app.state.gh.post_comment(
-                repo, number, _quota_comment(quota), installation_id,
-            )
-            notified = True
-        except Exception as error:  # a notice failing must not raise
-            logger.warning("could not post quota notice: %s", error)
-
+    status = "unavailable" if quota.reason == "usage_unavailable" else "exhausted"
     logger.info(
-        "quota exhausted for workspace %s (%s): %d/%s in %s",
-        workspace_id, quota.plan.plan, quota.used, quota.limit, quota.period,
+        "usage %s for workspace %s (%s): %d/%s in %s",
+        status, workspace_id, quota.plan.plan, quota.used, quota.limit, quota.period,
     )
     return {
         "ok": True,
         "skipped": True,
-        "quota": "exhausted",
+        "quota": status,
         "reason": quota.reason,
         "plan": quota.plan.plan,
         "period": quota.period,
         "used": quota.used,
         "limit": quota.limit,
-        "notified": notified,
+        "notified": False,
     }
-
-
-def _quota_comment(quota: Any) -> str:
-    return (
-        f"**GHIC has paused analysis for this workspace.**\n\n"
-        f"The **{quota.plan.plan}** plan includes {quota.limit} issue analyses "
-        f"per month, and {quota.used} have been used in {quota.period}.\n\n"
-        "New issues are not being analysed until the limit resets or the plan "
-        "is upgraded. Nothing has been lost — analysis resumes automatically.\n\n"
-        "_This notice is posted once per period, not on every issue._"
-    )
 
 
 def _authorization_skip_response(decision: dict[str, Any]) -> dict[str, Any]:
@@ -1432,11 +1405,19 @@ def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         return {"ok": True, "ignored": "edit on closed issue"}
 
     # A re-score does not take a new slot. The customer already paid for
-    # this issue when it was opened, and charging again because a month
+    # this issue when it was opened, and charging again because a period
     # boundary happened to fall between the open and the edit would bill
     # twice for one issue. But a workspace with nothing left does not get
     # free model runs either, so an exhausted workspace skips the re-score.
     usage = app.state.usage.usage_summary(s.database_url, decision.get("workspace_id"))
+    if not usage.get("available", True):
+        return {
+            "ok": True,
+            "skipped": True,
+            "quota": "unavailable",
+            "reason": "usage_unavailable",
+            "rescored": False,
+        }
     exhausted = (
         usage.get("enforced")
         and usage.get("limit") is not None
