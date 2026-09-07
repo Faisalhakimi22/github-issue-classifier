@@ -2058,3 +2058,85 @@ class TestLegacyRepositoryRoutes:
             "/repositories", headers={"X-GHIC-Token": "wrong-token"}
         )
         assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# /healthz reports LLM and GitHub state
+#
+# The dashboard showed both as "unknown" because nothing here said anything
+# about them. These assert the snapshot says something true instead -- and,
+# just as importantly, that it says it without naming a key.
+# ---------------------------------------------------------------------------
+def test_healthz_reports_llm_disabled_when_not_asked_for():
+    app = create_app(make_settings(), predictor=StubPredictor())
+    body = TestClient(app).get("/healthz").json()
+    assert body["llm"]["status"] == "disabled"
+    assert body["llm"]["providers"] == []
+
+
+def test_healthz_reports_llm_not_configured_when_asked_for_without_a_key():
+    # Wanting LLM analysis and having no key is a different state from not
+    # wanting it, and the difference is the one an operator has to fix.
+    app = create_app(
+        make_settings(use_llm_analysis=True), predictor=StubPredictor()
+    )
+    body = TestClient(app).get("/healthz").json()
+    assert body["llm"]["status"] == "not_configured"
+
+
+def test_healthz_reports_llm_enabled_and_names_the_chain():
+    app = create_app(
+        make_settings(use_llm_analysis=True, groq_api_key="g", openrouter_api_key="o"),
+        predictor=StubPredictor(),
+    )
+    body = TestClient(app).get("/healthz").json()
+    assert body["llm"]["status"] == "enabled"
+    assert body["llm"]["providers"] == ["groq", "openrouter"]
+
+
+def test_healthz_never_reveals_a_key():
+    app = create_app(
+        make_settings(
+            use_llm_analysis=True,
+            groq_api_key="gsk-secret-value",
+            openrouter_api_key="sk-or-secret-value",
+        ),
+        predictor=StubPredictor(),
+    )
+    raw = TestClient(app).get("/healthz").text
+    # /healthz is unauthenticated -- it exists for load balancers -- so a
+    # key appearing here would be readable by anyone.
+    assert "gsk-secret-value" not in raw
+    assert "sk-or-secret-value" not in raw
+
+
+def test_healthz_reports_github_disabled_when_nothing_would_be_written():
+    app = create_app(make_settings(post_comment=False, apply_label=False),
+                     predictor=StubPredictor())
+    body = TestClient(app).get("/healthz").json()
+    assert body["github"]["status"] == "disabled"
+    assert body["github"]["writes"] is False
+
+
+def test_healthz_reports_github_not_configured_when_writes_are_wanted():
+    app = create_app(
+        make_settings(post_comment=True, dry_run=True), predictor=StubPredictor()
+    )
+    body = TestClient(app).get("/healthz").json()
+    assert body["github"]["status"] == "not_configured"
+
+
+def test_healthz_says_writes_are_off_in_dry_run_even_when_configured():
+    # A fully configured GitHub client that writes nothing is the state most
+    # likely to be mistaken for a working one.
+    class FakeGitHub:
+        pass
+
+    app = create_app(
+        make_settings(post_comment=True, dry_run=True),
+        predictor=StubPredictor(),
+        gh_client=FakeGitHub(),
+    )
+    body = TestClient(app).get("/healthz").json()
+    assert body["github"]["status"] == "enabled"
+    assert body["github"]["writes"] is False

@@ -267,6 +267,43 @@ def create_app(
             "repo_thresholds_configured": len(app.state.settings.repo_thresholds),
             "dry_run": app.state.settings.dry_run,
         }
+        # Configuration, not liveness. /healthz is polled by load balancers,
+        # so probing a paid LLM or spending GitHub rate limit on every ping
+        # would cost money to answer a question nobody asked. What this can
+        # say honestly is whether the thing is wired up at all -- which is
+        # what the dashboard was reporting as "unknown" for want of any
+        # signal, a worse answer than "not configured".
+        s = app.state.settings
+        payload["llm"] = {
+            "status": (
+                "enabled"
+                if app.state.llm_service is not None
+                else "not_configured"
+                if s.use_llm_analysis
+                else "disabled"
+            ),
+            # Names the chain, never the keys.
+            "providers": [
+                name
+                for name, present in (
+                    ("groq", bool(s.groq_api_key)),
+                    ("openrouter", bool(s.openrouter_api_key)),
+                )
+                if present
+            ],
+        }
+        payload["github"] = {
+            "status": (
+                "enabled"
+                if app.state.gh is not None
+                else "not_configured"
+                if (s.post_comment or s.apply_label)
+                else "disabled"
+            ),
+            # Whether writes would actually reach GitHub, which dry_run
+            # silently prevents however well configured everything else is.
+            "writes": bool(app.state.gh is not None and not s.dry_run),
+        }
         if app.state.settings.use_repo_intelligence:
             # Reports durability explicitly: "enabled but nothing persists"
             # looks identical to a healthy deploy until someone wonders why
