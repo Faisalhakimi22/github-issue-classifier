@@ -760,8 +760,13 @@ def _build_llm_provider(settings: ServiceSettings) -> Any:
     if settings.groq_api_key:
         providers.append(GroqProvider(api_key=settings.groq_api_key, model=settings.llm_model))
     if settings.openrouter_api_key:
+        # The fallback model was measured at ~17s per answer, so the shared
+        # 8s default meant it timed out every time it was needed. 25s with
+        # a single attempt keeps the worst case (cold start + enrichment +
+        # Groq failing at 8s + this) inside vercel.json's 60s maxDuration.
         providers.append(OpenRouterProvider(
             api_key=settings.openrouter_api_key, model=settings.openrouter_model,
+            timeout=settings.llm_fallback_timeout, max_retries=1,
         ))
 
     provider = providers[0] if len(providers) == 1 else FallbackLLMProvider(providers)

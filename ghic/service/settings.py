@@ -161,6 +161,7 @@ class ServiceSettings:
     groq_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    llm_fallback_timeout: float = 25.0  # OpenRouter only; see app._build_llm_provider
 
     # Repository Intelligence: semantic code retrieval over the repo an
     # issue was opened on, fed to the LLM as evidence and surfaced as a
@@ -347,6 +348,7 @@ def load_settings() -> ServiceSettings:
         openrouter_api_key=os.environ.get("OPENROUTER_API_KEY", ""),
         openrouter_model=os.environ.get("OPENROUTER_MODEL")
         or "nvidia/nemotron-3-ultra-550b-a55b:free",
+        llm_fallback_timeout=_env_float("GHIC_LLM_FALLBACK_TIMEOUT", 25.0),
         use_repo_intelligence=_env_bool("GHIC_USE_REPO_INTELLIGENCE", False),
         use_engineering_intelligence=_env_bool("GHIC_ENGINEERING_INTELLIGENCE", False),
         use_async_processing=_env_bool("GHIC_USE_ASYNC_PROCESSING", False),

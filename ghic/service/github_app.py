@@ -7,6 +7,7 @@ performs the few REST calls the service needs:
   read  — GET /users/{login}            (author enrichment)
         — GET /repos/{full}/releases/latest
   write — POST /repos/{full}/issues/{n}/comments
+        — PATCH /repos/{full}/issues/comments/{id}  (retry-safe upsert)
         — POST /repos/{full}/issues/{n}/labels
 
 All read failures degrade to None so a GitHub hiccup never blocks a
@@ -25,6 +26,13 @@ logger = utils.get_logger(__name__)
 
 _TOKEN_EXPIRY_MARGIN_S = 120       # refresh installation tokens 2 min early
 _JWT_LIFETIME_S = 540              # GitHub max is 600; stay under clock skew
+_COMMENT_SCAN_PAGES = 3            # the analysis lands early; 300 comments is plenty
+
+# Hidden in the rendered comment. It is how a retried job recognises the
+# comment an earlier attempt already posted. Never change it: comments
+# posted under an old marker would stop being found, and retries would
+# double-post on exactly those issues.
+ANALYSIS_MARKER = "<!-- ghic:analysis -->"
 
 
 class GitHubAppClient:
@@ -149,8 +157,60 @@ class GitHubAppClient:
         return None
 
     # -- writes (raise on failure so the caller can report it) ---------------
+    def find_analysis_comment(self, full_name: str, issue_number: int,
+                              installation_id: int) -> int | None:
+        """Return the id of this App's earlier analysis comment, if any.
+
+        Only bot-authored comments carrying ANALYSIS_MARKER count: a person
+        who quotes the marker must never have their comment rewritten.
+        Raises on a failed listing -- guessing "none" here is exactly how a
+        retry ends up posting a second comment.
+        """
+        for page in range(1, _COMMENT_SCAN_PAGES + 1):
+            resp = self._session.get(
+                f"{self.base_url}/repos/{full_name}/issues/{issue_number}/comments",
+                headers={
+                    "Authorization": f"Bearer {self.installation_token(installation_id)}",
+                    "Accept": "application/vnd.github+json",
+                },
+                params={"per_page": 100, "page": page},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            comments = resp.json() or []
+            for comment in comments:
+                user = comment.get("user") or {}
+                if user.get("type") != "Bot":
+                    continue
+                if ANALYSIS_MARKER in (comment.get("body") or ""):
+                    return int(comment["id"])
+            if len(comments) < 100:
+                break
+        return None
+
     def post_comment(self, full_name: str, issue_number: int, body: str,
                      installation_id: int) -> None:
+        """Create the analysis comment, or update it if one already exists.
+
+        A job can run more than once for the same issue: QStash retries a
+        callback that timed out or returned 5xx, and the function may have
+        been killed after GitHub accepted the comment. Upserting on a hidden
+        marker makes that retry rewrite the one comment instead of adding a
+        second.
+        """
+        if ANALYSIS_MARKER not in body:
+            body = f"{body}\n\n{ANALYSIS_MARKER}"
+        existing = self.find_analysis_comment(full_name, issue_number, installation_id)
+        if existing is not None:
+            resp = self._request(
+                "PATCH",
+                f"/repos/{full_name}/issues/comments/{existing}",
+                installation_id,
+                json_body={"body": body},
+            )
+            resp.raise_for_status()
+            logger.info("updated analysis comment on %s#%d", full_name, issue_number)
+            return
         resp = self._request(
             "POST",
             f"/repos/{full_name}/issues/{issue_number}/comments",
