@@ -411,6 +411,8 @@ def create_app(
             result = handle_installation_event(
                 s.database_url, event, payload, app.state.gh
             )
+            if result.get("ok", True):
+                _queue_indexing_for_new_repositories(app, event, payload)
             if not result.get("ok", True) and result.get("retryable"):
                 # This delivery was marked consumed before the handler ran, so
                 # GitHub's retry would be discarded as a duplicate unless the
@@ -640,57 +642,19 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid qstash signature")
 
         payload = await request.json()
-        repo = str(payload.get("repo") or "")
-        if not repo:
+        if not str(payload.get("repo") or ""):
             raise HTTPException(status_code=422, detail="missing repo")
 
-        # Carried from the webhook that queued this job, minutes and a
-        # process boundary ago -- it's what joins the two in the logs.
-        from ..repository_intelligence.metrics import set_correlation_id
+        from .index_job import run_index_job
 
-        set_correlation_id(str(payload.get("correlation_id") or ""))
-
-        # A durable job must carry the installation identity that authorized
-        # it. Process-local observations are intentionally not a fallback.
-        installation_id = payload.get("installation_id")
-        decision = _authorize_index_job(app, installation_id, repo)
-        if not decision["authorized"]:
-            return {
-                "ok": True,
-                "repo": repo,
-                "indexed": False,
-                "skipped": True,
-                "authorization": "rejected",
-                "reason": decision["reason"],
-            }
-        # Keep the authoritative rows locked for the whole token/clone/index
-        # operation. A disconnect or revoke therefore cannot race this job
-        # after the check and before repository contents are read.
-        with app.state.authorization_lease(
-            s.database_url, installation_id, repo
-        ) as lease:
-            if not lease["authorized"]:
-                return {
-                    "ok": True,
-                    "repo": repo,
-                    "indexed": False,
-                    "skipped": True,
-                    "authorization": "rejected",
-                    "reason": lease["reason"],
-                }
-            token = ""
-            if app.state.gh is not None and installation_id:
-                try:
-                    token = app.state.gh.installation_token(int(installation_id))
-                except Exception as e:
-                    # A public repo still clones without a token, so this is a
-                    # degradation (private repos fail later), not a hard stop.
-                    logger.warning("could not mint installation token for %s: %s", repo, e)
-
-            indexed = app.state.repo_intelligence.index_repository(
-                repo, token=token, workspace_id=lease.get("workspace_id")
-            )
-        return {"ok": True, "repo": repo, "indexed": indexed}
+        return run_index_job(
+            payload,
+            database_url=s.database_url,
+            repo_intelligence=app.state.repo_intelligence,
+            gh=app.state.gh,
+            authorization_gate=app.state.authorization_gate,
+            authorization_lease=app.state.authorization_lease,
+        )
 
     return app
 
@@ -922,6 +886,55 @@ def _process_issue_job(
     return result
 
 
+def _queue_indexing_for_new_repositories(
+    app: FastAPI, event: str, payload: dict[str, Any]
+) -> None:
+    """Index a customer's repositories when they connect them, so the
+    first issue already has repository evidence instead of arriving to an
+    empty index. Best-effort: indexing is advisory and this must never
+    fail the installation delivery."""
+    service = app.state.repo_intelligence
+    if service is None or not hasattr(service, "request_index"):
+        return
+    action = payload.get("action")
+    if event == "installation" and action == "created":
+        repos = payload.get("repositories") or []
+    elif event == "installation_repositories" and action == "added":
+        repos = payload.get("repositories_added") or []
+    else:
+        return
+    installation_id = (payload.get("installation") or {}).get("id")
+    if not installation_id:
+        return
+    # GitHub omits the list for "all repositories" installs above a size;
+    # those repos are indexed on their first issue instead.
+    for repo in repos[:_MAX_INSTALL_INDEX_REQUESTS]:
+        name = (repo or {}).get("full_name")
+        if not name:
+            continue
+        try:
+            # Only once a workspace has claimed this installation. Before
+            # that the worker would refuse the job, and the repository
+            # would sit in QUEUED (blocking a real request) until the
+            # in-flight timeout. Unclaimed installs index on first issue.
+            decision = app.state.authorization_gate(
+                app.state.settings.database_url, installation_id, name, app.state.gh,
+            )
+            if not decision.get("authorized"):
+                continue
+            service.request_index(
+                name, installation_id=installation_id, reason=f"{event}.{action}",
+                workspace_id=decision.get("workspace_id"),
+            )
+        except Exception as e:
+            logger.warning("could not queue indexing for %s: %s", name, e)
+
+
+# An install that grants hundreds of repositories should not start hundreds
+# of runner jobs at once; the rest are indexed when their first issue lands.
+_MAX_INSTALL_INDEX_REQUESTS = 20
+
+
 def _authorize_issue(
     app: FastAPI, payload: dict[str, Any], repo: str, number: int
 ) -> dict[str, Any]:
@@ -948,17 +961,6 @@ def _authorize_issue(
     except Exception as error:
         logger.warning("could not persist authorization skip: %s", error)
     return decision
-
-
-def _authorize_index_job(app: FastAPI, installation_id: Any, repo: str) -> dict[str, Any]:
-    if installation_id is None:
-        return {"authorized": False, "reason": "unknown_installation"}
-    return app.state.authorization_gate(
-        app.state.settings.database_url,
-        installation_id,
-        repo,
-        app.state.gh,
-    )
 
 
 def _quota_skip_response(

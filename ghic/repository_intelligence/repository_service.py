@@ -668,6 +668,29 @@ class RepositoryIntelligenceService:
             return False
         return record.embedding_dimensions != current.dimensions
 
+    def request_index(
+        self, repo: str, *, installation_id: Any = None, reason: str = "",
+        workspace_id: Any = None,
+    ) -> bool:
+        """Queue an index now, ahead of the first issue -- used when an App
+        is installed or a repository is added to it. Same in-flight and
+        already-indexed checks as the read path, so a re-delivered install
+        event does not queue duplicate work. Never raises."""
+        try:
+            workspace_id = self._workspace_context(repo, workspace_id)
+            record = (
+                self.state_store.get(repo, workspace_id=workspace_id)
+                if self.state_store is not None else None
+            )
+            if record is not None and record.state.is_searchable:
+                return False
+            return self._request_indexing(
+                repo, record, reason or "installation", installation_id, workspace_id
+            )
+        except Exception as e:
+            logger.warning("could not request indexing for %s: %s", repo, e)
+            return False
+
     def is_indexed(self, repo: str, *, workspace_id: Any = None) -> bool:
         workspace_id = self._workspace_context(repo, workspace_id)
         if self.state_store is not None:

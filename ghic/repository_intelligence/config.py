@@ -231,7 +231,14 @@ class RepositoryIntelligenceConfig:
     # nothing else in the engine branches on these strings.
     vector_provider: str = "local"        # local | postgres
     state_provider: str = "auto"          # auto | postgres | file | memory
-    queue_provider: str = "auto"          # auto | qstash | inline | none
+    queue_provider: str = "auto"          # auto | github_actions | qstash | inline | none
+    # github_actions: the repository whose index-on-demand.yml is started,
+    # and a token allowed to start it (fine-grained PAT, Actions: write on
+    # that one repository only).
+    actions_dispatch_repo: str = ""
+    actions_dispatch_token: str = ""
+    actions_workflow: str = "index-on-demand.yml"
+    actions_ref: str = "main"
     database_url: str = ""                # shared with the ledger/idempotency store
 
     # --- Feature flags --------------------------------------------------
@@ -329,6 +336,12 @@ class RepositoryIntelligenceConfig:
             queue_provider=os.environ.get(
                 "GHIC_INDEX_QUEUE_PROVIDER", cls.queue_provider
             ).strip().lower(),
+            actions_dispatch_repo=os.environ.get("GHIC_INDEX_DISPATCH_REPO", "").strip(),
+            actions_dispatch_token=os.environ.get("GHIC_INDEX_DISPATCH_TOKEN", "").strip(),
+            actions_workflow=os.environ.get(
+                "GHIC_INDEX_DISPATCH_WORKFLOW", cls.actions_workflow
+            ).strip(),
+            actions_ref=os.environ.get("GHIC_INDEX_DISPATCH_REF", cls.actions_ref).strip(),
             # Same precedence the ledger uses, so one Postgres serves every
             # subsystem without a second connection string to configure.
             database_url=(

@@ -419,6 +419,53 @@ The workflow also accepts `repository_dispatch` events with type
 That is the hook to trigger indexing from another service later without
 changing the worker.
 
+### Automatic indexing for customers (production)
+
+`index-repositories.yml` above is for repositories *you* choose. Customers'
+repositories are indexed by `.github/workflows/index-on-demand.yml`, which
+the service starts itself:
+
+- when a workspace's installation is authorized and repositories are added
+  (`installation.created`, `installation_repositories.added`; capped at 20
+  per event), and
+- when an issue arrives on a repository with no index yet. That first
+  issue is analyzed from text alone; later ones get repository evidence.
+
+The worker (`python -m ghic.index_worker`) re-checks the installation and
+repository in Postgres before cloning, using the same code as the QStash
+callback, and clones with a short-lived installation token, never a PAT.
+
+**Run it from a private repository.** Actions logs on a public repository
+are public and would show which repositories your customers connected. The
+worker suppresses INFO logs and masks the repo name, but that is defense in
+depth. Either make this repository private, or create a private worker
+repository containing this code and point `GHIC_INDEX_DISPATCH_REPO` at it.
+
+Setup:
+
+1. In the worker repository, add Actions **secrets** `DATABASE_URL` (same
+   database as Vercel), `GHIC_APP_ID`, `GHIC_PRIVATE_KEY` (the App's PEM),
+   and the embedding key (`GHIC_REPO_INTEL_EMBEDDING_API_KEY` or
+   `OPENAI_API_KEY`), plus the same `GHIC_REPO_INTEL_EMBEDDING_*`
+   **variables** Vercel uses. They must match, or the index is unreadable.
+2. Create a fine-grained token scoped to **only** the worker repository,
+   permission **Actions: Read and write**.
+3. On the Vercel backend project set:
+
+   ```bash
+   GHIC_INDEX_QUEUE_PROVIDER=github_actions
+   GHIC_INDEX_DISPATCH_REPO=owner/worker-repo
+   GHIC_INDEX_DISPATCH_TOKEN=<token from step 2>
+   GHIC_REPO_AUTO_INDEX=true
+   ```
+
+4. Redeploy and check `/healthz`: `repository_intelligence.can_index` is
+   `true` and `indexing_runtime` is `github_actions`.
+
+Cost: a private repository on a free account gets 2,000 Actions minutes a
+month. An index takes a few minutes, so watch usage once you have more
+than a few hundred repositories connected.
+
 ### Semantic embeddings
 
 The default embedding provider is still `hashing-512`: free, deterministic,

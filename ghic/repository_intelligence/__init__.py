@@ -42,7 +42,13 @@ from .models import (
 )
 from .metrics import METRICS, RepositoryIntelligenceMetrics
 from .providers import build_service, health_snapshot
-from .queue import IndexQueue, InlineIndexQueue, NullIndexQueue, QStashIndexQueue
+from .queue import (
+    GitHubActionsIndexQueue,
+    IndexQueue,
+    InlineIndexQueue,
+    NullIndexQueue,
+    QStashIndexQueue,
+)
 from .repository_service import RepositoryIntelligenceService
 from .retriever import SemanticRetriever, build_query
 from .state import (
@@ -63,6 +69,7 @@ __all__ = [
     "build_state_store",
     "IndexQueue",
     "QStashIndexQueue",
+    "GitHubActionsIndexQueue",
     "InlineIndexQueue",
     "NullIndexQueue",
     "METRICS",

@@ -1,0 +1,110 @@
+name: Index on demand
+
+# Started by the service (GitHubActionsIndexQueue) when an issue arrives on
+# a repository that has no index yet. Vercel has no git; this runner does.
+#
+# The inputs are a request, not a grant: ghic.index_worker re-checks the
+# installation and repository against PostgreSQL before cloning anything.
+#
+# PRIVACY: run this from a PRIVATE repository. Actions logs on a public
+# repository are public, and they would reveal which repositories your
+# customers have connected. The worker suppresses INFO logs and the repo
+# name is masked below, but that is defense in depth, not a substitute.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "owner/name"
+        required: true
+        type: string
+      installation_id:
+        description: "GitHub App installation id that grants access"
+        required: true
+        type: string
+      reason:
+        required: false
+        type: string
+        default: ""
+      correlation_id:
+        required: false
+        type: string
+        default: ""
+      force:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One index per repository at a time; a second dispatch waits rather than
+# racing the first on the same rows.
+concurrency:
+  group: ghic-index-${{ inputs.repo }}
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      GHIC_DATABASE_URL: ${{ secrets.GHIC_DATABASE_URL }}
+      GHIC_APP_ID: ${{ secrets.GHIC_APP_ID }}
+      GHIC_PRIVATE_KEY: ${{ secrets.GHIC_PRIVATE_KEY }}
+      GHIC_VECTOR_PROVIDER: postgres
+      GHIC_STATE_PROVIDER: postgres
+      GHIC_INDEX_QUEUE_PROVIDER: none
+      GHIC_REPO_AUTO_INDEX: "false"
+      GHIC_REPO_INTEL_EMBEDDING_PROVIDER: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_PROVIDER }}
+      GHIC_REPO_INTEL_EMBEDDING_MODEL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_MODEL }}
+      GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS }}
+      GHIC_REPO_INTEL_EMBEDDING_BASE_URL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_BASE_URL }}
+      GHIC_REPO_INTEL_EMBEDDING_API_KEY: ${{ secrets.GHIC_REPO_INTEL_EMBEDDING_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      INPUT_REPO: ${{ inputs.repo }}
+      INPUT_INSTALLATION_ID: ${{ inputs.installation_id }}
+      INPUT_CORRELATION_ID: ${{ inputs.correlation_id }}
+      INPUT_FORCE: ${{ inputs.force }}
+
+    steps:
+      - name: Validate and mask inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Inputs arrive through env, never interpolated into the script,
+          # so a crafted repo name cannot inject shell.
+          if [[ ! "$INPUT_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::invalid repo input"; exit 1
+          fi
+          if [[ ! "$INPUT_INSTALLATION_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::invalid installation_id input"; exit 1
+          fi
+          echo "::add-mask::$INPUT_REPO"
+          echo "::add-mask::${INPUT_REPO%%/*}"
+          echo "::add-mask::${INPUT_REPO##*/}"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install worker
+        run: python -m pip install -e ".[service,postgres]"
+
+      - name: Index
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GHIC_REPO_INTEL_CACHE_DIR="${RUNNER_TEMP}/ghic-repo-intel"
+          args=(--repo "$INPUT_REPO" --installation-id "$INPUT_INSTALLATION_ID"
+                --correlation-id "$INPUT_CORRELATION_ID")
+          if [ "$INPUT_FORCE" = "true" ]; then args+=(--force); fi
+          python -m ghic.index_worker "${args[@]}"
+
+      - name: Remove the clone
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/ghic-repo-intel"

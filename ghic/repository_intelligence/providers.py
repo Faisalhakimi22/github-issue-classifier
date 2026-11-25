@@ -29,7 +29,13 @@ from .config import (
 )
 from .embeddings import EmbeddingProvider, build_embedding_provider
 from .indexer import VectorStore, build_vector_store
-from .queue import IndexQueue, InlineIndexQueue, NullIndexQueue, QStashIndexQueue
+from .queue import (
+    GitHubActionsIndexQueue,
+    IndexQueue,
+    InlineIndexQueue,
+    NullIndexQueue,
+    QStashIndexQueue,
+)
 from .state import (
     FileStateStore,
     MemoryStateStore,
@@ -111,8 +117,20 @@ def build_index_queue(
     qstash_region: str = "us-east-1",
     inline_worker: Callable[[str, Any], Any] | None = None,
 ) -> IndexQueue:
-    """Resolve the queue. "auto" prefers QStash, then inline, then none."""
+    """Resolve the queue. "auto" prefers GitHub Actions (when a dispatch
+    repo and token are configured), then QStash, then inline, then none."""
     provider = cfg.queue_provider
+
+    def actions() -> IndexQueue:
+        if not (cfg.actions_dispatch_repo and cfg.actions_dispatch_token):
+            raise ProviderUnavailable(
+                "queue provider 'github_actions' requires GHIC_INDEX_DISPATCH_REPO "
+                "and GHIC_INDEX_DISPATCH_TOKEN"
+            )
+        return GitHubActionsIndexQueue(
+            cfg.actions_dispatch_token, cfg.actions_dispatch_repo,
+            workflow=cfg.actions_workflow, ref=cfg.actions_ref,
+        )
 
     def qstash() -> IndexQueue:
         if not (qstash_token and callback_url):
@@ -121,6 +139,8 @@ def build_index_queue(
             )
         return QStashIndexQueue(qstash_token, callback_url, region=qstash_region)
 
+    if provider == "github_actions":
+        return actions()
     if provider == "qstash":
         return qstash()
     if provider == "inline":
@@ -132,10 +152,12 @@ def build_index_queue(
     if provider not in ("auto", ""):
         raise ProviderUnavailable(
             f"queue provider {provider!r} is not implemented. Available: "
-            "'qstash', 'inline' (dev only), 'none'. Implement IndexQueue in "
+            "'github_actions', 'qstash', 'inline' (dev only), 'none'. Implement IndexQueue in "
             "queue.py to add Redis/Celery/RabbitMQ."
         )
 
+    if cfg.actions_dispatch_repo and cfg.actions_dispatch_token:
+        return actions()
     if qstash_token and callback_url:
         return QStashIndexQueue(qstash_token, callback_url, region=qstash_region)
     if inline_worker is not None:
@@ -258,6 +280,9 @@ def health_snapshot(service: Any | None, cfg: RepositoryIntelligenceConfig | Non
     import shutil
 
     git_available = shutil.which("git") is not None
+    # Indexing does not have to happen in this process: a GitHub Actions
+    # queue runs it on a runner that has git.
+    offloaded = isinstance(service.index_queue, GitHubActionsIndexQueue)
 
     embedding = service.embedder.metadata()
     return {
@@ -274,10 +299,13 @@ def health_snapshot(service: Any | None, cfg: RepositoryIntelligenceConfig | Non
         "queue": service.index_queue.name if service.index_queue else None,
         "queue_durable": service.index_queue.durable if service.index_queue else False,
         "incremental_indexing": service.cfg.incremental_indexing,
-        "can_index": git_available,
+        "can_index": git_available or offloaded,
+        "indexing_runtime": (
+            "github_actions" if offloaded else ("local" if git_available else "none")
+        ),
         "indexing_note": (
             ""
-            if git_available
+            if git_available or offloaded
             else "git is not available in this runtime; index out of band with "
                  "`python -m ghic.repo_index` against the same database. Retrieval "
                  "works without it."

@@ -9,6 +9,8 @@ what this phase is meant to undo.
   `QStashIndexQueue` -- production. Wraps the QStash publisher the service
   already uses for async issue processing, so there is one queue to operate
   rather than two.
+  `GitHubActionsIndexQueue` -- production on Vercel, which has no git:
+  starts a workflow run on a runner that does.
   `InlineIndexQueue`  -- development and single-box Docker. Runs the job on
   a background *thread* rather than pretending to enqueue it.
 
@@ -120,6 +122,94 @@ class QStashIndexQueue(IndexQueue):
             self.metrics.increment("index_jobs_enqueue_failed")
             logger.warning("could not enqueue index job for %s: %s", repo, e)
             return False
+
+
+class GitHubActionsIndexQueue(IndexQueue):
+    """Durable delivery by starting a GitHub Actions workflow run.
+
+    Exists because the Vercel runtime has no `git`, so a QStash callback
+    into the same deploy can never clone anything. An Actions runner has
+    git, writes the index to the same Postgres the service reads, and GitHub
+    keeps the run (and its retry button) whether or not anything here
+    survives.
+
+    The workflow (`.github/workflows/index-on-demand.yml`) receives only the
+    repository and installation id. It re-derives authorization from the
+    database itself: a dispatch is a request, never a grant.
+    """
+
+    API = "https://api.github.com"
+
+    def __init__(
+        self,
+        token: str,
+        dispatch_repo: str,
+        *,
+        workflow: str = "index-on-demand.yml",
+        ref: str = "main",
+        timeout: float = 10.0,
+        metrics: RepositoryIntelligenceMetrics | None = None,
+        session: Any = None,
+    ) -> None:
+        if not token or not dispatch_repo:
+            raise ValueError("token and dispatch_repo are required")
+        self.token = token
+        self.dispatch_repo = dispatch_repo
+        self.workflow = workflow
+        self.ref = ref
+        self.timeout = timeout
+        self.metrics = metrics or METRICS
+        if session is None:
+            import requests
+
+            session = requests.Session()
+        self._session = session
+
+    def enqueue(
+        self, repo: str, *, installation_id: Any = None, reason: str = "",
+        workspace_id: Any = None,
+    ) -> bool:
+        if installation_id in (None, ""):
+            # The worker refuses a job it cannot authorize, so dispatching
+            # one would only burn runner minutes.
+            logger.info("not dispatching index for %s: no installation id", repo)
+            return False
+        url = (
+            f"{self.API}/repos/{self.dispatch_repo}/actions/workflows/"
+            f"{self.workflow}/dispatches"
+        )
+        try:
+            resp = self._session.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                json={
+                    "ref": self.ref,
+                    "inputs": {
+                        "repo": repo,
+                        "installation_id": str(installation_id),
+                        "reason": (reason or "")[:100],
+                        "correlation_id": get_correlation_id() or "",
+                    },
+                },
+                timeout=self.timeout,
+            )
+        except Exception as e:
+            self.metrics.increment("index_jobs_enqueue_failed")
+            logger.warning("could not dispatch index workflow for %s: %s", repo, e)
+            return False
+        if resp.status_code != 204:
+            self.metrics.increment("index_jobs_enqueue_failed")
+            logger.warning(
+                "index workflow dispatch for %s returned HTTP %s: %s",
+                repo, resp.status_code, (resp.text or "")[:200],
+            )
+            return False
+        self.metrics.increment("index_jobs_enqueued")
+        return True
 
 
 class InlineIndexQueue(IndexQueue):
