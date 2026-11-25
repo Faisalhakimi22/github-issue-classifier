@@ -57,9 +57,16 @@ jobs:
       GHIC_STATE_PROVIDER: postgres
       GHIC_INDEX_QUEUE_PROVIDER: none
       GHIC_REPO_AUTO_INDEX: "false"
-      GHIC_REPO_INTEL_EMBEDDING_PROVIDER: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_PROVIDER }}
+      # Free defaults: the local hashing embedder (no API, no cost, code
+      # never leaves the runner) at 1536 dimensions, which is the width of
+      # the existing ghic_repo_chunks.embedding column, and a per-repository
+      # chunk cap that keeps ~40 repositories inside Neon's free 1 GB.
+      # Vercel must use the same provider and dimensions, or every index is
+      # treated as stale.
+      GHIC_REPO_INTEL_EMBEDDING_PROVIDER: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_PROVIDER || 'hashing' }}
       GHIC_REPO_INTEL_EMBEDDING_MODEL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_MODEL }}
-      GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS }}
+      GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS || '1536' }}
+      GHIC_REPO_INTEL_MAX_CHUNKS: ${{ vars.GHIC_REPO_INTEL_MAX_CHUNKS || '2000' }}
       GHIC_REPO_INTEL_EMBEDDING_BASE_URL: ${{ vars.GHIC_REPO_INTEL_EMBEDDING_BASE_URL }}
       GHIC_REPO_INTEL_EMBEDDING_API_KEY: ${{ secrets.GHIC_REPO_INTEL_EMBEDDING_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

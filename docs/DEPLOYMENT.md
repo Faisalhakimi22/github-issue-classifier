@@ -579,6 +579,53 @@ Feature flags let you narrow the rollout without redeploying:
   `TestFallback` and by a webhook-level test that injects a component
   violating its own non-raising contract.
 
+## 10. Running on free tiers (the free beta)
+
+GHIC currently runs entirely on free plans and takes no payments. This is a
+deliberate constraint, not a default to forget about: each free tier caps
+something, and the caps are what the product promises customers.
+
+| Service | Free limit | What it bounds |
+|---|---|---|
+| Groq | ~1,000 requests and 200K tokens/day (gpt-oss-120b) | ~40-60 full AI analyses/day for the **whole service** |
+| OpenRouter `:free` models | 50 requests/day (1,000 after a lifetime $10 purchase) | the fallback when Groq is exhausted |
+| Upstash QStash | 1,000 messages/day (retries count) | async issue jobs |
+| Neon | 1 GB storage and 100 CU-hours/month per project | repository indexes; how long the database may stay awake |
+| GitHub Actions | unlimited on a public repo, 2,000 min/month private | repository indexing |
+| Vercel Hobby | non-commercial use only | **no charging while on Hobby** |
+
+When both AI providers are exhausted the analysis still posts, with the
+classifier's verdict and without the AI sections; nothing fails.
+
+Settings that keep it free:
+
+```bash
+# Backend (Vercel) AND the indexing workflow (Actions variables) must match,
+# or every index is treated as stale and rebuilt.
+GHIC_REPO_INTEL_EMBEDDING_PROVIDER=hashing   # local, no API, code stays in-house
+GHIC_REPO_INTEL_EMBEDDING_DIMENSIONS=1536    # width of the existing pgvector column
+# Remove GHIC_REPO_INTEL_EMBEDDING_MODEL / _BASE_URL / _API_KEY: they point at
+# paid Codestral embeddings on OpenRouter.
+
+# Actions only (it writes the index): ~40 repositories fit in 1 GB.
+GHIC_REPO_INTEL_MAX_CHUNKS=2000
+
+# Hub (Vercel): leave unset. Checkout is refused until this is "true".
+GHIC_BILLING_ENABLED=
+```
+
+After switching embeddings, existing indexes are refused (no evidence, never
+mixed vectors) and rebuilt on each repository's next issue.
+
+Uptime monitoring: every backend cold start opens a Neon connection, and Neon
+suspends after 5 idle minutes. A monitor that pings every 5 minutes keeps the
+database awake permanently (~180 CU-hours/month against 100). Ping `/healthz`
+**every 30 minutes** at most.
+
+Before charging anyone: move off Vercel Hobby (Pro, or a host whose free tier
+allows commercial use), and use a payment provider available where you
+operate. Stripe does not onboard Pakistan-registered businesses.
+
 ## Security posture
 
 - HMAC (`X-Hub-Signature-256`) verified on every webhook with a constant-time
