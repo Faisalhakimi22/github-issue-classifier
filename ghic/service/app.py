@@ -80,6 +80,9 @@ def create_app(
     `llm_service` / `idempotency` / `repo_intelligence` are injectable for
     tests."""
     settings = settings or load_settings()
+    from .monitoring import init_monitoring
+
+    init_monitoring(__version__)
     if predictor is None:
         settings.validate()
         predictor = IssuePredictor(settings.model_path, settings.threshold)
@@ -91,7 +94,7 @@ def create_app(
             timeout=settings.request_timeout,
         )
 
-    app = FastAPI(title="GitHub Issue Triage Bot", version=__version__)
+    app = FastAPI(title="GHIC", version=__version__)
     app.state.settings = settings
     app.state.predictor = predictor
     app.state.gh = gh_client
@@ -362,9 +365,16 @@ def create_app(
     @app.get("/dashboard")
     def dashboard() -> Any:
         """Read-only operator view over /stats (data loads with the token,
-        client-side; the page itself carries no repo data)."""
+        client-side; the page itself carries no repo data).
+
+        Off unless GHIC_OPERATOR_DASHBOARD=true. Customers use the Hub; a
+        second, unbranded login page on the public API host only invites
+        guessing at the webhook secret it asks for.
+        """
         from fastapi.responses import HTMLResponse
 
+        if not app.state.settings.operator_dashboard:
+            raise HTTPException(status_code=404, detail="Not Found")
         return HTMLResponse(_DASHBOARD_HTML)
 
     @app.post("/webhook")
@@ -1589,7 +1599,7 @@ _DASHBOARD_HTML = """<!doctype html>
  .muted { opacity: .65; font-size: .85rem; }
  .err { color: #c33; }
 </style></head><body>
-<h1>Issue Triage Bot — dashboard</h1>
+<h1>GHIC — operator view</h1>
 <p><input id="token" type="password" placeholder="webhook secret (X-GHIC-Token)">
 <button onclick="load()">Load</button> <span id="msg" class="muted"></span></p>
 <div id="content" hidden>

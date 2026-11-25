@@ -9,6 +9,7 @@ exists and is already tested; no logic lives here beyond argument routing.
   ghic serve              -> ghic.service.app (uvicorn)
   ghic benchmark [...]    -> ghic.backtest    (held-out replay through the webhook)
   ghic dashboard          -> open the running service's /dashboard
+                             (start it with GHIC_OPERATOR_DASHBOARD=true)
   ghic collect / label    -> data pipeline stages
 """
 from __future__ import annotations

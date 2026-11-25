@@ -1233,7 +1233,7 @@ class TestDashboardAnalytics:
         assert a["component_analytics"]["a/b"]["scored"] == 1   # still counted everywhere else
 
     def test_dashboard_page_renders_all_facets(self):
-        client = make_client(make_settings())
+        client = make_client(make_settings(operator_dashboard=True))
         html = client.get("/dashboard").text
         for element_id in ("trends", "duprate", "resolutions", "confhist",
                            "labelstats", "components"):
@@ -1916,11 +1916,15 @@ class TestObservability:
         assert lat["n"] == 3 and lat["p50"] >= 0 and lat["p99"] >= lat["p50"]
 
     def test_dashboard_serves_html_without_token(self):
-        client = make_client(make_settings())
+        client = make_client(make_settings(operator_dashboard=True))
         resp = client.get("/dashboard")
         assert resp.status_code == 200
-        assert "Issue Triage Bot" in resp.text
+        assert "GHIC" in resp.text
         assert "X-GHIC-Token" in resp.text     # data still requires the token
+
+    def test_dashboard_is_off_by_default(self):
+        client = make_client(make_settings())
+        assert client.get("/dashboard").status_code == 404
 
     def test_openapi_spec_covers_all_endpoints(self, tmp_path):
         import json

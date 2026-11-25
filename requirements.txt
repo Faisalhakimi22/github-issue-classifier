@@ -28,3 +28,5 @@ PyJWT==2.13.0
 cryptography==49.0.0
 httpx==0.28.1
 pg8000>=1.30
+# Error reporting; inert unless SENTRY_DSN is set (ghic/service/monitoring.py).
+sentry-sdk==2.77.0

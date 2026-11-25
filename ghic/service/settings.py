@@ -91,6 +91,7 @@ class ServiceSettings:
     enrich: bool = True
     api_base_url: str = "https://api.github.com"
     request_timeout: float = 15.0
+    operator_dashboard: bool = False      # GET /dashboard; local operator use only
 
     # Online-evaluation ledger (predictions graded at issue close). None
     # keeps the ledger in memory only (tests, backtests).
@@ -326,6 +327,7 @@ def load_settings() -> ServiceSettings:
         enrich=_env_bool("GHIC_ENRICH", True),
         api_base_url=os.environ.get("GHIC_API_BASE_URL", "https://api.github.com"),
         request_timeout=_env_float("GHIC_REQUEST_TIMEOUT", 15.0),
+        operator_dashboard=_env_bool("GHIC_OPERATOR_DASHBOARD", False),
         ledger_path=_load_ledger_path(),
         database_url=(
             os.environ.get("GHIC_DATABASE_URL")

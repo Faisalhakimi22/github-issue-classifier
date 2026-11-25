@@ -213,7 +213,7 @@ Then: App settings → *List in Marketplace* → draft the listing (category:
 ## 6. Operations
 
 - `/healthz` — liveness for load balancers; reports model + thresholds + dry-run.
-- `/dashboard` — read-only operator view (enter the webhook secret in the
+- `/dashboard` — off unless `GHIC_OPERATOR_DASHBOARD=true`; read-only operator view (enter the webhook secret in the
   page; data is fetched client-side with the token).
 - `/stats` — token-gated (`X-GHIC-Token: <webhook secret>`): totals, positive
   rate, mean probability, the last 20 scored issues, **and the online
