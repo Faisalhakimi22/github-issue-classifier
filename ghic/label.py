@@ -19,6 +19,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import dataclasses
 import json
@@ -37,6 +38,13 @@ logger = utils.get_logger(__name__)
 # csv field size limit is too low for the JSON-encoded cross_referenced_prs
 # column on issues with many long PR bodies attached.
 csv.field_size_limit(2**31 - 1)
+
+# UTF-8, with or without the byte-order mark Excel adds to "CSV UTF-8" files.
+DEFAULT_INPUT_ENCODING = "utf-8-sig"
+
+
+class InputEncodingError(ValueError):
+    """The input CSV is not valid text in the expected encoding."""
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +206,20 @@ def _coerce_row(row: dict[str, str]) -> dict[str, Any]:
     return out
 
 
-def _read_collected_csv(path: Path) -> list[dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        return [_coerce_row(r) for r in csv.DictReader(f)]
+def _read_collected_csv(
+    path: Path, encoding: str = DEFAULT_INPUT_ENCODING,
+) -> list[dict[str, Any]]:
+    """Read a collected-issues CSV, naming the file and encoding on decode errors."""
+    try:
+        with path.open("r", encoding=encoding) as f:
+            return [_coerce_row(r) for r in csv.DictReader(f)]
+    except UnicodeDecodeError as e:
+        bad_byte = e.object[e.start:e.start + 1].hex()
+        raise InputEncodingError(
+            f"{path} is not valid {encoding} text (byte 0x{bad_byte} at position {e.start}). "
+            "Re-save the file as UTF-8, or pass --encoding with the file's encoding, "
+            "for example --encoding cp1252 for a CSV saved by Excel as Windows-1252."
+        ) from e
 
 
 def _write_labeled_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -243,14 +262,32 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print the audit and exit without writing the output CSV.",
     )
+    parser.add_argument(
+        "--encoding",
+        default=DEFAULT_INPUT_ENCODING,
+        help=(
+            "Text encoding of the input CSV (default: utf-8-sig, which also reads plain UTF-8). "
+            "Use cp1252 for a CSV saved by Excel as Windows-1252."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.input.exists():
         logger.error("Input not found: %s. Run `python -m ghic.collect` first.", args.input)
         return 1
 
+    try:
+        codecs.lookup(args.encoding)
+    except LookupError:
+        logger.error("Unknown encoding: %s", args.encoding)
+        return 1
+
     logger.info("Reading %s", args.input)
-    issues = _read_collected_csv(args.input)
+    try:
+        issues = _read_collected_csv(args.input, encoding=args.encoding)
+    except InputEncodingError as e:
+        logger.error("%s", e)
+        return 1
     logger.info("Loaded %d issues", len(issues))
 
     kept, audit = label_dataset(issues)

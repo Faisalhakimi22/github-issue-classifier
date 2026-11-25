@@ -26,9 +26,12 @@ from ghic.label import (
     R3_NON_ACTIONABLE_LABEL,
     R3B_STATE_NOT_PLANNED,
     R4_DEFAULT,
+    InputEncodingError,
     LabelResult,
+    _read_collected_csv,
     label_dataset,
     label_issue,
+    main,
 )
 
 
@@ -257,3 +260,75 @@ class TestDataset:
         assert kept == []
         assert audit[DROP_BOT] == 1
         assert audit[DROP_QUESTION] == 1
+
+
+# ---------------------------------------------------------------------------
+# Input CSV encoding (issue #1: Windows-1252 CSV saved by Excel)
+# ---------------------------------------------------------------------------
+_CSV_HEADER = (
+    "number,title,author_login,locked,state_reason,labels_at_close,"
+    "closed_by_merged_pr,cross_referenced_prs\n"
+)
+_CSV_ROW = '7,Export for café accounts fails,alice,False,completed,[],False,[]\n'
+
+
+def _write_csv(tmp_path, encoding: str, bom: bytes = b""):
+    path = tmp_path / "issues.csv"
+    path.write_bytes(bom + (_CSV_HEADER + _CSV_ROW).encode(encoding))
+    return path
+
+
+@pytest.fixture
+def label_log():
+    """Collect ghic.label log messages (the logger does not propagate to caplog)."""
+    import logging
+
+    from ghic import label as label_module
+
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    label_module.logger.addHandler(handler)
+    yield records
+    label_module.logger.removeHandler(handler)
+
+
+def _messages(records) -> str:
+    return "\n".join(r.getMessage() for r in records)
+
+
+class TestInputEncoding:
+    def test_cp1252_file_gives_clear_error_by_default(self, tmp_path):
+        path = _write_csv(tmp_path, "cp1252")
+        with pytest.raises(InputEncodingError) as exc:
+            _read_collected_csv(path)
+        message = str(exc.value)
+        assert str(path) in message
+        assert "0xe9" in message
+        assert "--encoding cp1252" in message
+
+    def test_cp1252_file_reads_with_encoding_option(self, tmp_path):
+        path = _write_csv(tmp_path, "cp1252")
+        rows = _read_collected_csv(path, encoding="cp1252")
+        assert rows[0]["title"] == "Export for café accounts fails"
+        assert rows[0]["number"] == 7
+
+    def test_utf8_with_excel_bom_reads_by_default(self, tmp_path):
+        path = _write_csv(tmp_path, "utf-8", bom=b"\xef\xbb\xbf")
+        rows = _read_collected_csv(path)
+        assert "number" in rows[0]
+        assert rows[0]["title"] == "Export for café accounts fails"
+
+    def test_cli_reports_encoding_error_without_traceback(self, tmp_path, label_log):
+        path = _write_csv(tmp_path, "cp1252")
+        assert main(["--input", str(path), "--audit-only"]) == 1  # returns, does not raise
+        assert "--encoding cp1252" in _messages(label_log)
+
+    def test_cli_reads_cp1252_with_encoding_flag(self, tmp_path):
+        path = _write_csv(tmp_path, "cp1252")
+        assert main(["--input", str(path), "--audit-only", "--encoding", "cp1252"]) == 0
+
+    def test_cli_rejects_unknown_encoding(self, tmp_path, label_log):
+        path = _write_csv(tmp_path, "utf-8")
+        assert main(["--input", str(path), "--audit-only", "--encoding", "not-a-codec"]) == 1
+        assert "Unknown encoding" in _messages(label_log)
