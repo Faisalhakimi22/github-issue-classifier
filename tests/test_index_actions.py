@@ -89,12 +89,19 @@ def test_auto_keeps_qstash_without_actions_config() -> None:
 
 # -- the shared job ------------------------------------------------------------
 class _Service:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.forgotten: list[tuple[str, Any]] = []
+        self.events = events if events is not None else []
 
     def index_repository(self, repo: str, **kwargs: Any) -> bool:
+        self.events.append("index")
         self.calls.append({"repo": repo, **kwargs})
         return True
+
+    def forget(self, repo: str, *, workspace_id: Any = None) -> None:
+        self.events.append("forget")
+        self.forgotten.append((repo, workspace_id))
 
 
 class _GH:
@@ -102,22 +109,37 @@ class _GH:
         return f"token-{installation_id}"
 
 
-def _lease(result: dict[str, Any]):
+def _lease(result: dict[str, Any], events: list[str] | None = None):
     @contextmanager
     def lease(database_url: str, installation_id: Any, repo: str):
-        yield result
+        if events is not None:
+            events.append("lease-open")
+        try:
+            yield result
+        finally:
+            if events is not None:
+                events.append("lease-closed")
     return lease
 
 
-def _job(payload: dict[str, Any], *, gate: dict[str, Any], lease: dict[str, Any]):
-    service = _Service()
+def _job(payload: dict[str, Any], *, gate: Any, lease: dict[str, Any],
+         events: list[str] | None = None):
+    """`gate` is one decision for every check, or a list consumed in order
+    (first check, then the post-index re-check)."""
+    events = events if events is not None else []
+    service = _Service(events)
+    decisions = list(gate) if isinstance(gate, list) else None
+
+    def authorization_gate(*_a: Any) -> dict[str, Any]:
+        return decisions.pop(0) if decisions is not None else gate
+
     result = run_index_job(
         payload,
         database_url="postgres://x",
         repo_intelligence=service,
         gh=_GH(),
-        authorization_gate=lambda *a: gate,
-        authorization_lease=_lease(lease),
+        authorization_gate=authorization_gate,
+        authorization_lease=_lease(lease, events),
     )
     return result, service
 
@@ -150,6 +172,28 @@ def test_revoked_between_check_and_lease_is_refused() -> None:
     )
     assert result["reason"] == "revoked_installation"
     assert service.calls == []
+
+
+def test_no_lock_is_held_while_indexing() -> None:
+    # Holding row locks for a multi-minute index froze every Hub request in
+    # production and let the database drop the idle locking transaction.
+    events: list[str] = []
+    ok = {"authorized": True, "workspace_id": "ws1"}
+    result, _ = _job({"repo": "c/a", "installation_id": "7"}, gate=ok, lease=ok, events=events)
+    assert result["indexed"] is True
+    assert events == ["lease-open", "lease-closed", "index"]
+
+
+def test_access_revoked_during_indexing_removes_the_new_index() -> None:
+    ok = {"authorized": True, "workspace_id": "ws1"}
+    revoked = {"authorized": False, "reason": "revoked_installation"}
+    result, service = _job(
+        {"repo": "c/a", "installation_id": "7"}, gate=[ok, revoked], lease=ok,
+    )
+    assert service.calls, "indexing ran"
+    assert service.forgotten == [("c/a", "ws1")]
+    assert result["indexed"] is False
+    assert result["reason"] == "revoked_during_index:revoked_installation"
 
 
 def test_missing_installation_is_refused() -> None:
