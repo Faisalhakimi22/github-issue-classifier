@@ -2144,3 +2144,46 @@ def test_healthz_says_writes_are_off_in_dry_run_even_when_configured():
     body = TestClient(app).get("/healthz").json()
     assert body["github"]["status"] == "enabled"
     assert body["github"]["writes"] is False
+
+
+class TestPriorIssueEnrichment:
+    """The author's history reaches the model, on open and on re-score."""
+
+    def _client(self, prior):
+        class HistoryGitHub(StubGitHub):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lookups: list[tuple[Any, ...]] = []
+
+            def author_has_prior_issues(self, full_name, login, before_iso, installation_id):
+                self.lookups.append((full_name, login, before_iso, installation_id))
+                return prior
+
+        gh = HistoryGitHub()
+        predictor = StubPredictor()
+        return make_client(make_settings(), predictor=predictor, gh=gh), gh, predictor
+
+    def test_history_lookup_reaches_the_predictor(self):
+        client, gh, predictor = self._client(True)
+        assert post_webhook(client, issue_opened_payload()).status_code == 200
+        assert gh.lookups == [("acme/widgets", "alice", "2024-07-01T10:00:00Z", 123)]
+        assert predictor.calls[-1]["author_has_prior_issues"] is True
+
+    def test_unknown_history_reaches_the_predictor_as_unknown(self):
+        client, _, predictor = self._client(None)
+        assert post_webhook(client, issue_opened_payload()).status_code == 200
+        assert predictor.calls[-1]["author_has_prior_issues"] is None
+
+    def test_a_client_without_the_lookup_still_scores(self):
+        predictor = StubPredictor()
+        client = make_client(make_settings(), predictor=predictor, gh=StubGitHub())
+        assert post_webhook(client, issue_opened_payload()).status_code == 200
+        assert predictor.calls[-1]["author_has_prior_issues"] is None
+
+    def test_an_edit_rescore_uses_the_history_too(self):
+        client, _, predictor = self._client(False)
+        payload = issue_opened_payload()
+        payload["action"] = "edited"
+        payload["issue"]["state"] = "open"
+        assert post_webhook(client, payload).status_code == 200
+        assert predictor.calls[-1]["author_has_prior_issues"] is False

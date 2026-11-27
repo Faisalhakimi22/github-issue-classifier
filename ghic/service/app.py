@@ -753,12 +753,18 @@ def _build_llm_provider(settings: ServiceSettings) -> Any:
 
 def _enrich(
     s: ServiceSettings, gh: GitHubAppClient | None, author: str, repo: str,
-    installation_id: Any,
-) -> tuple[Any, Any, Any, Any]:
-    """Author profile + latest release. Best-effort — any failure degrades to
-    NaN features, which the pipeline imputes."""
+    installation_id: Any, created_at: str | None = None,
+) -> tuple[Any, Any, Any, Any, bool | None]:
+    """Author profile, latest release, and whether the author has filed an
+    issue in this repository during the past year.
+
+    Best-effort. A missing profile or release degrades to NaN features,
+    which the pipeline imputes; an unknown history degrades to None, which
+    keeps the single-issue default (first-time).
+    """
     author_created_at = author_public_repos = author_followers = None
     latest_release = None
+    prior_issues: bool | None = None
     if s.enrich and gh is not None and installation_id:
         user = gh.get_user(author, installation_id)
         if user:
@@ -766,7 +772,18 @@ def _enrich(
             author_public_repos = user.get("public_repos")
             author_followers = user.get("followers")
         latest_release = gh.get_latest_release_date(repo, installation_id)
-    return author_created_at, author_public_repos, author_followers, latest_release
+        # getattr: an injected stand-in client (tests, older harnesses) may
+        # not implement it, and that must mean "unknown", not a failed job.
+        lookup = getattr(gh, "author_has_prior_issues", None)
+        if callable(lookup):
+            try:
+                prior_issues = lookup(repo, author, created_at, installation_id)
+            except Exception as e:
+                logger.warning("prior-issue lookup failed for %s: %s", repo, e)
+    return (
+        author_created_at, author_public_repos, author_followers, latest_release,
+        prior_issues,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1036,9 +1053,10 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
     number = int(issue.get("number", 0))
     author = ((issue.get("user") or {}).get("login")) or ""
 
-    author_created_at, author_public_repos, author_followers, latest_release = _enrich(
-        s, gh, author, repo, installation_id
-    )
+    (
+        author_created_at, author_public_repos, author_followers, latest_release,
+        prior_issues,
+    ) = _enrich(s, gh, author, repo, installation_id, issue.get("created_at"))
 
     pred = predictor.predict(
         repo_full_name=repo,
@@ -1051,6 +1069,7 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
         author_public_repos=author_public_repos,
         author_followers=author_followers,
         latest_release_iso=latest_release,
+        author_has_prior_issues=prior_issues,
         threshold=s.threshold_for(repo),
         explain=s.post_comment and not s.dry_run,  # only pay for it if it ships
     )
@@ -1110,6 +1129,7 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
                 author_public_repos=author_public_repos,
                 author_followers=author_followers,
                 latest_release_iso=latest_release,
+                author_has_prior_issues=prior_issues,
             )
         except Exception as e:
             logger.warning("aux feature frame failed: %s", e)
@@ -1490,9 +1510,10 @@ def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         )
         return {"ok": True, "skipped": True, "quota": "exhausted", "rescored": False}
 
-    author_created_at, author_public_repos, author_followers, latest_release = _enrich(
-        s, gh, author, repo, installation_id
-    )
+    (
+        author_created_at, author_public_repos, author_followers, latest_release,
+        prior_issues,
+    ) = _enrich(s, gh, author, repo, installation_id, issue.get("created_at"))
     pred = predictor.predict(
         repo_full_name=repo,
         issue_number=number,
@@ -1504,6 +1525,7 @@ def _handle_issue_edited(app: FastAPI, payload: dict[str, Any]) -> dict[str, Any
         author_public_repos=author_public_repos,
         author_followers=author_followers,
         latest_release_iso=latest_release,
+        author_has_prior_issues=prior_issues,
         threshold=s.threshold_for(repo),
         explain=False,
     )

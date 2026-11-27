@@ -6,6 +6,7 @@ performs the few REST calls the service needs:
 
   read  — GET /users/{login}            (author enrichment)
         — GET /repos/{full}/releases/latest
+        — GET /search/issues               (has the author filed here before?)
   write — POST /repos/{full}/issues/{n}/comments
         — PATCH /repos/{full}/issues/comments/{id}  (retry-safe upsert)
         — POST /repos/{full}/issues/{n}/labels
@@ -15,7 +16,9 @@ prediction — missing author fields are imputed by the model pipeline anyway.
 """
 from __future__ import annotations
 
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -33,6 +36,29 @@ _COMMENT_SCAN_PAGES = 3            # the analysis lands early; 300 comments is p
 # posted under an old marker would stop being found, and retries would
 # double-post on exactly those issues.
 ANALYSIS_MARKER = "<!-- ghic:analysis -->"
+
+# The classifier's `author_is_first_time_contributor` feature was learned
+# from 2024 data as "no earlier issue by this author in this repository
+# within the collected window"; for the held-out issues the reported metrics
+# come from, that window reached back about 9-12 months. A one-year lookback
+# reproduces that definition at serving time. Changing it changes what the
+# feature means to the model.
+PRIOR_ISSUE_LOOKBACK_DAYS = 365
+
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class GitHubAppClient:
@@ -155,6 +181,53 @@ class GitHubAppClient:
         except requests.RequestException as e:
             logger.warning("latest release %s failed: %s", full_name, e)
         return None
+
+    def author_has_prior_issues(
+        self,
+        full_name: str,
+        login: str,
+        before_iso: str | None,
+        installation_id: int,
+        *,
+        lookback_days: int = PRIOR_ISSUE_LOOKBACK_DAYS,
+    ) -> bool | None:
+        """Did `login` open an issue in `full_name` in the `lookback_days`
+        before `before_iso`? None when it can't be known (bad input, search
+        refused, rate-limited, network): the caller then keeps the old
+        default rather than guess.
+
+        One search call. The window ends a second before this issue, so the
+        issue being scored never counts as its own history.
+        """
+        if not (_LOGIN_RE.match(login or "") and _REPO_RE.match(full_name or "")):
+            return None
+        before = _parse_utc(before_iso)
+        if before is None:
+            return None
+        lo = before - timedelta(days=lookback_days)
+        hi = before - timedelta(seconds=1)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        query = (
+            f"repo:{full_name} is:issue author:{login} "
+            f"created:{lo.strftime(fmt)}..{hi.strftime(fmt)}"
+        )
+        try:
+            resp = self._session.get(
+                f"{self.base_url}/search/issues",
+                headers={
+                    "Authorization": f"Bearer {self.installation_token(installation_id)}",
+                    "Accept": "application/vnd.github+json",
+                },
+                params={"q": query, "per_page": 1},
+                timeout=self.timeout,
+            )
+            if resp.status_code != 200:
+                logger.warning("prior-issue search for %s -> HTTP %d", full_name, resp.status_code)
+                return None
+            return int(resp.json().get("total_count", 0)) > 0
+        except Exception as e:  # enrichment is best-effort, never a reason to fail
+            logger.warning("prior-issue search for %s failed: %s", full_name, e)
+            return None
 
     # -- writes (raise on failure so the caller can report it) ---------------
     def find_analysis_comment(self, full_name: str, issue_number: int,

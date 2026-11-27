@@ -5,9 +5,13 @@ so there is no train/serve skew: the same regexes, the same cyclical encodings,
 the same imputation (inside the fitted pipeline) that handled missing author
 fields at training time handles them at serving time.
 
-Known serving-time degradations, mirrored from the training docs:
-  - author_is_first_time_contributor degrades to 1 for a single issue (no
-    history in the frame); documented limitation.
+Serving-time feature notes, mirrored from the training docs:
+  - author_is_first_time_contributor needs the author's history, which a
+    single-issue frame doesn't have. The service supplies it from one
+    GitHub search (`author_has_prior_issues`, a one-year lookback matching
+    how the feature was built in training). When that lookup fails it
+    falls back to 1, the old behaviour, which costs about 4.5 points of
+    recall on the held-out set.
   - days_since_last_release comes from the repo's latest release at event
     time; NaN (imputed) when the repo has no releases or enrichment is off.
 """
@@ -68,11 +72,16 @@ def build_feature_frame(
     author_public_repos: int | None = None,
     author_followers: int | None = None,
     latest_release_iso: str | None = None,
+    author_has_prior_issues: bool | None = None,
 ) -> pd.DataFrame:
     """One issue -> the engineered single-row frame every model head consumes.
 
     Shared by the actionability and category predictors so an issue is
     feature-engineered exactly once per event.
+
+    `author_has_prior_issues` is the author's history in this repository,
+    looked up by the caller. None means unknown: the training code's
+    single-row default (first-time) stands.
     """
     raw = pd.DataFrame([{
         "repo_name": repo_full_name,
@@ -95,7 +104,10 @@ def build_feature_frame(
     release_dates = {
         repo_full_name: [latest_release_iso] if latest_release_iso else []
     }
-    return features.engineer_features(raw, cfg, repo_release_dates=release_dates)
+    frame = features.engineer_features(raw, cfg, repo_release_dates=release_dates)
+    if author_has_prior_issues is not None:
+        frame["author_is_first_time_contributor"] = 0 if author_has_prior_issues else 1
+    return frame
 
 
 class IssuePredictor:
@@ -128,6 +140,7 @@ class IssuePredictor:
         latest_release_iso: str | None = None,
         explain: bool = True,
         threshold: float | None = None,
+        author_has_prior_issues: bool | None = None,
     ) -> Prediction:
         threshold = self.threshold if threshold is None else threshold
         feats = build_feature_frame(
@@ -142,6 +155,7 @@ class IssuePredictor:
             author_public_repos=author_public_repos,
             author_followers=author_followers,
             latest_release_iso=latest_release_iso,
+            author_has_prior_issues=author_has_prior_issues,
         )
 
         with self._lock:

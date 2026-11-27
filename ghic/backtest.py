@@ -41,8 +41,10 @@ from typing import Any
 import numpy as np
 
 from . import evaluate, train, utils
+from .service.github_app import PRIOR_ISSUE_LOOKBACK_DAYS
 from .service.inference import IssuePredictor
 from .service.settings import ServiceSettings
+from .service.usage import Plan, UsageDecision
 
 logger = utils.get_logger(__name__)
 
@@ -56,12 +58,30 @@ THRESHOLD_GRID = np.round(np.arange(0.10, 0.91, 0.02), 2)
 class ReplayGitHub:
     """Stands in for GitHubAppClient. Author fields come from the collected
     dataset (the same snapshot the API would return); the latest release is
-    the newest one at or before the issue's creation time, from releases.json.
+    the newest one at or before the issue's creation time, from releases.json;
+    an author's prior issues come from the whole labeled dataset, the same
+    population the training-time first-time flag was computed over.
     Write methods refuse loudly — a backtest must never touch GitHub."""
 
-    def __init__(self, releases: dict[str, list[str]] | None) -> None:
+    def __init__(
+        self,
+        releases: dict[str, list[str]] | None,
+        history: Any = None,
+    ) -> None:
+        import pandas as pd
+
         self.releases = releases or {}
         self.current_row: dict[str, Any] = {}
+        # (repo, author) -> sorted UTC creation times of their issues.
+        self._history: dict[tuple[str, str], list[Any]] = {}
+        if history is not None:
+            created = pd.to_datetime(history["created_at"], utc=True, errors="coerce")
+            for repo, author, ts in zip(history["repo_name"], history["author_login"], created):
+                if pd.isna(ts):
+                    continue
+                self._history.setdefault((str(repo), str(author)), []).append(ts)
+            for times in self._history.values():
+                times.sort()
 
     def get_user(self, login: str, installation_id: int) -> dict[str, Any]:
         row = self.current_row
@@ -76,10 +96,53 @@ class ReplayGitHub:
         prior = [r for r in self.releases.get(full_name, []) if r <= created]
         return prior[-1] if prior else None
 
+    def author_has_prior_issues(
+        self, full_name: str, login: str, before_iso: str | None, installation_id: int,
+        *, lookback_days: int = PRIOR_ISSUE_LOOKBACK_DAYS,
+    ) -> bool | None:
+        """Same question, same window as GitHubAppClient's search."""
+        import pandas as pd
+
+        if not self._history or not before_iso:
+            return None
+        before = pd.Timestamp(before_iso)
+        before = before.tz_localize("UTC") if before.tzinfo is None else before.tz_convert("UTC")
+        lo = before - pd.Timedelta(days=lookback_days)
+        hi = before - pd.Timedelta(seconds=1)
+        return any(lo <= ts <= hi for ts in self._history.get((full_name, login), []))
+
     def post_comment(self, *a: Any, **k: Any) -> None:
         raise AssertionError("backtest tried to write to GitHub")
 
     add_labels = post_comment
+
+
+class UnmeteredUsage:
+    """A backtest measures the model; it is not a customer. Every replayed
+    issue is allowed, and nothing is charged or recorded.
+
+    Without this the quota gate, which reads plans from the database, finds
+    none here and refuses every issue as usage_unavailable, so the replay
+    scores nothing. That is what happened from the day the gate landed
+    until this was added.
+    """
+
+    _PLAN = Plan(plan="backtest", enforced=True)
+
+    def reserve(self, database_url: str, workspace_id: Any, repo: str, issue_number: Any) -> UsageDecision:
+        return UsageDecision(True, "unlimited", self._PLAN, "backtest")
+
+    def release(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def record(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def has_capacity(self, database_url: str, workspace_id: Any) -> bool:
+        return True
+
+    def usage_summary(self, database_url: str, workspace_id: Any) -> dict[str, Any]:
+        return {"available": True, "enforced": False, "used": 0, "limit": None}
 
 
 def _clean(v: Any) -> Any:
@@ -139,11 +202,26 @@ def _replay_authorization(
     }
 
 
+def replay_app(settings: ServiceSettings, predictor: Any, gh: ReplayGitHub) -> Any:
+    """The service exactly as replay() runs it: the real webhook and
+    pipeline, with GitHub replayed from the dataset, authorization granted,
+    and no quota. One function, so a test can hold the wiring to "every
+    issue is scored" -- the property that broke when the quota gate landed.
+    """
+    from .service.app import create_app
+
+    return create_app(
+        settings,
+        predictor=predictor,
+        gh_client=gh,
+        authorization_gate=_replay_authorization,
+        usage_meter=UnmeteredUsage(),
+    )
+
+
 def replay(model_path: Path, limit_per_repo: int | None = None) -> list[dict[str, Any]]:
     """Send every test-split issue through the service; return scored records."""
     from fastapi.testclient import TestClient
-
-    from .service.app import create_app
 
     labeled = utils.DATA_PROCESSED / "labeled.csv"
     if not labeled.exists():
@@ -158,16 +236,9 @@ def replay(model_path: Path, limit_per_repo: int | None = None) -> list[dict[str
         webhook_secret=REPLAY_SECRET,
         dry_run=True,
     )
-    gh = ReplayGitHub(train._load_release_dates())
+    gh = ReplayGitHub(train._load_release_dates(), history=df)
     predictor = IssuePredictor(model_path, settings.threshold)
-    client = TestClient(
-        create_app(
-            settings,
-            predictor=predictor,
-            gh_client=gh,
-            authorization_gate=_replay_authorization,
-        )
-    )
+    client = TestClient(replay_app(settings, predictor, gh))
 
     records: list[dict[str, Any]] = []
     started = time.time()

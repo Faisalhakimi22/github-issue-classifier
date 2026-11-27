@@ -42,7 +42,9 @@ tensorflow/tensorflow (calendar 2024), labeled by deterministic rules
   communities is unverified — run `python -m ghic.backtest` and start
   in dry-run mode.
 - Author public_repos/followers are collection-time snapshots.
-- first_time_contributor degrades to 'first-time' at single-issue inference.
+- first_time_contributor is looked up at inference (one GitHub search,
+  365-day lookback, matching training); if that lookup fails it falls
+  back to 'first-time', which costs ~4.6 points of recall.
 - Labels are rule-derived, not human-annotated; Rule 4 (conservative
   default) contributes 31% of Class 0.
 
