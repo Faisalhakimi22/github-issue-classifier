@@ -18,6 +18,7 @@ from .. import utils
 from .exceptions import LLMError, LLMResponseError
 from .models import IssueAnalysis, IssueContext, parse_issue_analysis
 from .provider import LLMProvider
+from .sanitize import sanitize_analysis
 
 logger = utils.get_logger(__name__)
 
@@ -41,11 +42,12 @@ class LLMService:
         ML-only comment. Never raises: every LLM/cache failure is caught
         and logged here."""
         key = self._cache_key(context)
+        source_text = f"{context.title}\n{context.body}"
 
         cached = self._cache_get(key)
         if cached is not None:
             logger.info("llm analysis cache hit for %s", key)
-            return cached
+            return sanitize_analysis(cached, source_text=source_text)
 
         try:
             analysis = self.provider.analyze(context)
@@ -53,14 +55,28 @@ class LLMService:
             logger.warning("llm analysis failed (%s: %s); falling back to ML-only comment",
                           type(e).__name__, e)
             return None
+        except Exception:
+            # The contract is "never raises". A provider bug that throws
+            # something other than LLMError must cost the AI section, not
+            # the whole job (which QStash would then retry, identically).
+            logger.exception("llm analysis crashed; falling back to ML-only comment")
+            return None
 
         self._cache_put(key, analysis)
-        return analysis
+        # Sanitized on the way out, never on the way in: the cache keeps the
+        # model's raw answer, so tightening these rules applies to old
+        # entries too.
+        return sanitize_analysis(analysis, source_text=source_text)
 
     def _cache_key(self, context: IssueContext) -> str:
         return utils.cache_key(
             "issue-analysis", context.repo, context.title, context.body,
             round(context.ml_probability, 4),
+            # The prompt differs when the score is withheld or code evidence
+            # is present, so the answer may too.
+            context.score_calibrated,
+            context.repository_context is not None
+            and not getattr(context.repository_context, "is_empty", True),
         )
 
     def _cache_get(self, key: str) -> IssueAnalysis | None:

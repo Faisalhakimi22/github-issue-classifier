@@ -1225,6 +1225,7 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
             ml_probability=pred.proba,
             ml_predicted_label=pred.predicted_label,
             repository_context=repo_context,
+            score_calibrated=s.score_is_calibrated_for(repo),
         )
         llm_analysis = app.state.llm_service.analyze_issue(context)
 

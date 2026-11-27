@@ -152,9 +152,18 @@ class ChatCompletionsProvider(LLMProvider):
 
 def _extract_content(data: dict[str, Any]) -> str:
     try:
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise LLMResponseError(f"unexpected chat completions response shape: {e}") from e
+    # Reasoning models return content=null (or "") when they spend the whole
+    # token budget thinking: finish_reason is then "length". That is a
+    # provider failure like any other, and has to reach the fallback chain
+    # as one rather than crash on .strip().
+    if not isinstance(content, str) or not content.strip():
+        finish = choice.get("finish_reason") if isinstance(choice, dict) else None
+        raise LLMResponseError(f"empty response content (finish_reason={finish})")
+    return content
 
 
 def _parse_json_content(content: str) -> Any:

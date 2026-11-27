@@ -44,6 +44,10 @@ class IssueContext:
     # ghic.repository_intelligence -- the LLM layer works identically with
     # or without that subsystem installed. See prompts.build_user_prompt().
     repository_context: Any = None
+    # False on a repository the classifier was not calibrated for. The
+    # comment already withholds the score there; the prompt must too,
+    # rather than tell the model to trust a number GHIC itself won't show.
+    score_calibrated: bool = True
 
 
 @dataclass(frozen=True)
