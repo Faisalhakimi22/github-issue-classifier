@@ -170,3 +170,33 @@ def test_cache_key_separates_calibrated_from_uncalibrated() -> None:
     assert service._cache_key(_context(score_calibrated=True)) != service._cache_key(
         _context(score_calibrated=False)
     )
+
+
+# -- truncation (found with `ghic preview`, 2026-11-28) -------------------------------
+def _captured_payload(model: str) -> dict:
+    import json as _json
+
+    seen: dict = {}
+
+    def handler(request):
+        seen.update(_json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": (
+            '{"category":"bug","priority":"low","severity":"low","confidence":0.7,'
+            '"summary":"s","reasoning":["r"],"recommended_action":"a","risk_level":"low",'
+            '"risk_reasons":["x"]}'
+        )}}]})
+
+    GroqProvider(api_key="k", model=model,
+                 http_client=httpx.Client(transport=httpx.MockTransport(handler))).analyze(_context())
+    return seen
+
+
+def test_gpt_oss_on_groq_reasons_at_low_effort_with_room_for_the_answer() -> None:
+    payload = _captured_payload("openai/gpt-oss-120b")
+    assert payload["reasoning_effort"] == "low"
+    # Reasoning counts against max_tokens; 1024 truncated answers mid-JSON.
+    assert payload["max_tokens"] >= 2048
+
+
+def test_reasoning_effort_is_never_sent_to_models_that_reject_it() -> None:
+    assert "reasoning_effort" not in _captured_payload("llama-3.3-70b-versatile")

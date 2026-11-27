@@ -54,7 +54,11 @@ class ChatCompletionsProvider(LLMProvider):
         retry_base_delay: float = 0.3,
         retry_max_delay: float = 2.0,
         temperature: float = 0.2,
-        max_tokens: int = 1024,
+        # Reasoning models count their reasoning against this budget too:
+        # measured on gpt-oss-120b, ~400-600 reasoning tokens plus a ~430-token
+        # answer. 1024 truncated answers mid-JSON; tokens are billed only
+        # when used, so headroom costs nothing on short answers.
+        max_tokens: int = 2048,
         http_client: httpx.Client | None = None,
     ) -> None:
         if not api_key:
