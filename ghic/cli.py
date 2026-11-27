@@ -8,6 +8,7 @@ exists and is already tested; no logic lives here beyond argument routing.
   ghic explain [...]      -> predict + top feature contributions
   ghic serve              -> ghic.service.app (uvicorn)
   ghic benchmark [...]    -> ghic.backtest    (held-out replay through the webhook)
+  ghic preview URL        -> ghic.preview     (the comment GHIC would post; never posts)
   ghic dashboard          -> open the running service's /dashboard
                              (start it with GHIC_OPERATOR_DASHBOARD=true)
   ghic collect / label    -> data pipeline stages
@@ -67,6 +68,8 @@ def _passthrough(command: str, rest: list[str]) -> int:
         from .label import main as target
     elif command == "benchmark":
         from .backtest import main as target
+    elif command == "preview":
+        from .preview import main as target
     elif command == "serve":
         from .service.app import main as serve_main
 
@@ -82,6 +85,7 @@ _PASSTHROUGH_HELP = {
     "collect": "collect issues via the GitHub GraphQL API",
     "label": "apply the deterministic labeling rules",
     "benchmark": "replay the held-out set through the real webhook (ghic.backtest)",
+    "preview": "show the comment GHIC would post on a public issue (never posts)",
     "serve": "run the webhook service",
 }
 

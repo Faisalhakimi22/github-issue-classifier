@@ -49,6 +49,25 @@ _LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
+def prior_issue_query(
+    full_name: str, login: str, before_iso: str | None,
+    lookback_days: int = PRIOR_ISSUE_LOOKBACK_DAYS,
+) -> str | None:
+    """The GitHub search query behind `author_has_prior_issues`, or None when
+    the inputs can't be trusted into a query (so nothing can be injected).
+    Shared by the App client and the read-only preview client, so a preview
+    asks GitHub exactly what production asks."""
+    if not (_LOGIN_RE.match(login or "") and _REPO_RE.match(full_name or "")):
+        return None
+    before = _parse_utc(before_iso)
+    if before is None:
+        return None
+    lo = before - timedelta(days=lookback_days)
+    hi = before - timedelta(seconds=1)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    return f"repo:{full_name} is:issue author:{login} created:{lo.strftime(fmt)}..{hi.strftime(fmt)}"
+
+
 def _parse_utc(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -199,18 +218,9 @@ class GitHubAppClient:
         One search call. The window ends a second before this issue, so the
         issue being scored never counts as its own history.
         """
-        if not (_LOGIN_RE.match(login or "") and _REPO_RE.match(full_name or "")):
+        query = prior_issue_query(full_name, login, before_iso, lookback_days)
+        if query is None:
             return None
-        before = _parse_utc(before_iso)
-        if before is None:
-            return None
-        lo = before - timedelta(days=lookback_days)
-        hi = before - timedelta(seconds=1)
-        fmt = "%Y-%m-%dT%H:%M:%SZ"
-        query = (
-            f"repo:{full_name} is:issue author:{login} "
-            f"created:{lo.strftime(fmt)}..{hi.strftime(fmt)}"
-        )
         try:
             resp = self._session.get(
                 f"{self.base_url}/search/issues",

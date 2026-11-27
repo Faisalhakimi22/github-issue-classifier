@@ -54,6 +54,10 @@ pip install -e ".[service]"
 GHIC_ALLOW_UNSIGNED=true python -m ghic.service.app
 curl -X POST localhost:8000/api/predict -H "Content-Type: application/json" \
   -d '{"title": "Crash on startup", "body": "Steps to reproduce: ..."}'
+
+# see the exact comment GHIC would post on any public issue; never posts
+# (add GROQ_API_KEY or OPENROUTER_API_KEY to .env to include the AI analysis)
+ghic preview https://github.com/owner/repo/issues/123
 ```
 
 Production runs as a GitHub App in Docker — registration, staged rollout,

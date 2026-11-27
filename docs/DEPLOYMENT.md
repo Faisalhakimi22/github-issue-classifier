@@ -608,8 +608,18 @@ something, and the caps are what the product promises customers.
 | GitHub Actions | unlimited on a public repo, 2,000 min/month private | repository indexing |
 | Vercel Hobby | non-commercial use only | **no charging while on Hobby** |
 
-When both AI providers are exhausted the analysis still posts, with the
-classifier's verdict and without the AI sections; nothing fails.
+When both AI providers are exhausted, nothing fails. On a repository the
+classifier is calibrated for, the comment shows the classifier's verdict. On
+any other repository (every customer repository today) it shows no score and
+no verdict, only repository evidence, and GHIC posts nothing at all when there
+is no evidence either: a "no verdict" note costs maintainers attention and
+gives them nothing.
+
+To see exactly what GHIC would post on any public issue, without installing
+it or writing anything: `python -m ghic.preview https://github.com/owner/repo/issues/N`
+(or `ghic preview ...` once the package is installed)
+(see `ghic/preview.py`; set GROQ_API_KEY / OPENROUTER_API_KEY to include the AI
+analysis).
 
 Settings that keep it free:
 
