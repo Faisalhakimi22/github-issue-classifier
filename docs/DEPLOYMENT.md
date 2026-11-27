@@ -436,31 +436,45 @@ repository in Postgres before cloning, using the same code as the QStash
 callback, and clones with a short-lived installation token, never a PAT.
 
 **Run it from a private repository.** Actions logs on a public repository
-are public and would show which repositories your customers connected. The
-worker suppresses INFO logs and masks the repo name, but that is defense in
-depth. Either make this repository private, or create a private worker
-repository containing this code and point `GHIC_INDEX_DISPATCH_REPO` at it.
+are public and would show which repositories your customers connected. This
+repository is public (MIT), so indexing runs from a separate private
+**worker repository** that holds only the workflow file and the secrets, and
+checks out the public code at run time.
 
-Setup:
+Setup (all free):
 
-1. In the worker repository, add Actions **secrets** `DATABASE_URL` (same
-   database as Vercel), `GHIC_APP_ID`, `GHIC_PRIVATE_KEY` (the App's PEM),
-   and the embedding key (`GHIC_REPO_INTEL_EMBEDDING_API_KEY` or
-   `OPENAI_API_KEY`), plus the same `GHIC_REPO_INTEL_EMBEDDING_*`
-   **variables** Vercel uses. They must match, or the index is unreadable.
-2. Create a fine-grained token scoped to **only** the worker repository,
-   permission **Actions: Read and write**.
-3. On the Vercel backend project set:
+1. **Create the worker repo.** On GitHub: New repository, name it e.g.
+   `ghic-indexer`, set it to **Private**, add a README so it has a `main`
+   branch.
+2. **Copy the workflow.** Add this repository's
+   `.github/workflows/index-on-demand.yml`, unchanged, at the same path in the
+   worker repo.
+3. **Worker repo, Settings, Secrets and variables, Actions.**
+   - Secrets: `DATABASE_URL` (same database as Vercel), `GHIC_APP_ID`, and
+     `GHIC_PRIVATE_KEY` (the full contents of the App's `.pem` file).
+   - Variables: `GHIC_SOURCE_REPO` = `Faisalhakimi22/github-issue-classifier`.
+     Embeddings default to the free settings (hashing, 1536 dimensions,
+     2,000 chunks per repository), so nothing else is needed.
+4. **Create a token that can start it.** GitHub, Settings, Developer settings,
+   Fine-grained tokens: repository access **only `ghic-indexer`**,
+   permission **Actions: Read and write**. Set an expiry and a reminder:
+   when it expires, indexing stops and only a warning is logged.
+5. **Backend Vercel project** environment variables, then redeploy:
 
    ```bash
    GHIC_INDEX_QUEUE_PROVIDER=github_actions
-   GHIC_INDEX_DISPATCH_REPO=owner/worker-repo
-   GHIC_INDEX_DISPATCH_TOKEN=<token from step 2>
+   GHIC_INDEX_DISPATCH_REPO=Faisalhakimi22/ghic-indexer
+   GHIC_INDEX_DISPATCH_TOKEN=<token from step 4>
    GHIC_REPO_AUTO_INDEX=true
    ```
 
-4. Redeploy and check `/healthz`: `repository_intelligence.can_index` is
-   `true` and `indexing_runtime` is `github_actions`.
+6. **Check** `/healthz`: `repository_intelligence.can_index` is `true` and
+   `indexing_runtime` is `github_actions`. Then open an issue on a connected
+   repository and watch the run appear under the worker repo's Actions tab.
+
+Security note: the worker runs whatever is on `main` of the public repository
+with the worker's secrets. Only you can push there, and pull requests from
+forks never run in the worker. Keep it that way (branch protection on `main`).
 
 Cost: a private repository on a free account gets 2,000 Actions minutes a
 month. An index takes a few minutes, so watch usage once you have more

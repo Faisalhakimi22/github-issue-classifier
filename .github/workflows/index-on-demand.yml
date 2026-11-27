@@ -10,6 +10,12 @@ name: Index on demand
 # repository are public, and they would reveal which repositories your
 # customers have connected. The worker suppresses INFO logs and the repo
 # name is masked below, but that is defense in depth, not a substitute.
+#
+# Because GHIC's own repository is public (MIT), the intended setup is a
+# small private "worker" repository holding only a copy of this file, with
+# the Actions variable GHIC_SOURCE_REPO=Faisalhakimi22/github-issue-classifier.
+# The checkout step below then runs the public code from `main` with the
+# worker's private secrets and private logs. See docs/DEPLOYMENT.md.
 
 on:
   workflow_dispatch:
@@ -92,7 +98,13 @@ jobs:
           echo "::add-mask::${INPUT_REPO%%/*}"
           echo "::add-mask::${INPUT_REPO##*/}"
 
+      # Run from a separate private worker repo: check out the public GHIC
+      # code (no token needed for a public repo). Run from GHIC itself:
+      # GHIC_SOURCE_REPO is unset and this checks out this repository.
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GHIC_SOURCE_REPO || github.repository }}
+          ref: ${{ vars.GHIC_SOURCE_REF || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
