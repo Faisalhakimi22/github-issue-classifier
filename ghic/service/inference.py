@@ -184,9 +184,38 @@ def format_comment(
     related: list[dict[str, Any]] | None = None,
     category: dict[str, Any] | None = None,
     repository_context: Any = None,
+    score_is_calibrated: bool = True,
 ) -> str:
-    """Markdown comment the bot posts on a scored issue."""
+    """Markdown comment the bot posts on a scored issue when no AI analysis
+    is available.
+
+    On a repository the classifier was not calibrated for, the score is a
+    confident-looking number about a population it never saw, so no score,
+    verdict or confidence is shown -- the same rule format_llm_comment()
+    applies. What remains is the repository evidence. (The caller skips the
+    comment entirely when there is no evidence either; see
+    worth_commenting_without_ai().)
+    """
     from .explain import confidence_bar, explain_prediction
+
+    if not score_is_calibrated:
+        lines = [
+            "### GHIC · Needs maintainer review",
+            "",
+            "No verdict is given for this issue: GHIC's statistical score isn't "
+            "calibrated for this repository, and its AI review wasn't available "
+            "this time. The files below are where the reported behavior most "
+            "likely lives.",
+        ]
+        if related:
+            lines += ["", "**Possibly related prior issues** (by text similarity — please verify):"]
+            lines += [
+                f"- #{r['number']} — {r['title']} (similarity {r['similarity']:.2f})"
+                for r in related
+            ]
+        lines += _repository_evidence_lines(repository_context)
+        lines += ["", "_Automated triage aid — a maintainer's judgement always wins._"]
+        return "\n".join(lines)
 
     verdict = (
         "likely an **actionable bug**"
@@ -237,6 +266,24 @@ def format_comment(
         "it can be wrong. A maintainer's judgement always wins._",
     ]
     return "\n".join(lines)
+
+
+def worth_commenting_without_ai(
+    score_is_calibrated: bool, repository_context: Any, related: list[dict[str, Any]] | None,
+) -> bool:
+    """Whether a classifier-only comment has anything worth posting.
+
+    On a calibrated repository the score itself is the content. On any other
+    repository only repository evidence or related issues are; a comment with
+    neither would be a note saying "no verdict", which costs the maintainer
+    attention and buys nothing.
+    """
+    if score_is_calibrated:
+        return True
+    has_evidence = repository_context is not None and not getattr(
+        repository_context, "is_empty", True
+    )
+    return bool(has_evidence or related)
 
 
 _MAX_EVIDENCE_FILES = 5

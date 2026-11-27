@@ -32,7 +32,12 @@ from ..config import get_config
 from ..label import label_issue
 from ..llm import IssueContext, LLMService
 from .github_app import GitHubAppClient
-from .inference import IssuePredictor, format_comment, format_llm_comment
+from .inference import (
+    IssuePredictor,
+    format_comment,
+    format_llm_comment,
+    worth_commenting_without_ai,
+)
 from .settings import ServiceSettings, load_settings
 from .tracking import PredictionTracker
 
@@ -1307,13 +1312,25 @@ def _process_issue_job_impl(app: FastAPI, payload: dict[str, Any]) -> dict[str, 
                         score_is_calibrated=s.score_is_calibrated_for(repo),
                     )
                 else:
-                    comment = format_comment(
-                        pred, related, category, repository_context=repo_context,
-                    )
-                    if info_request:
-                        comment += "\n\n---\n\n" + info_request["draft"]
-                gh.post_comment(repo, number, comment, installation_id)
-                actions.append("comment")
+                    calibrated = s.score_is_calibrated_for(repo)
+                    if worth_commenting_without_ai(calibrated, repo_context, related) or info_request:
+                        comment = format_comment(
+                            pred, related, category, repository_context=repo_context,
+                            score_is_calibrated=calibrated,
+                        )
+                        if info_request:
+                            comment += "\n\n---\n\n" + info_request["draft"]
+                    else:
+                        # No AI analysis, a score that means nothing here, and
+                        # no evidence: a comment would say only "no verdict".
+                        comment = None
+                        logger.info(
+                            "no comment on %s#%d: AI unavailable, score uncalibrated, no evidence",
+                            repo, number,
+                        )
+                if comment is not None:
+                    gh.post_comment(repo, number, comment, installation_id)
+                    actions.append("comment")
             if s.apply_label and pred.predicted_label == 1:
                 gh.add_labels(repo, number, [s.label_name], installation_id)
                 actions.append("label")

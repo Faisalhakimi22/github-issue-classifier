@@ -136,6 +136,10 @@ def make_settings(**overrides: Any) -> ServiceSettings:
         suggest_category=False,  # ...nor on models/category.joblib
         estimate_effort=False,   # ...nor on models/effort.joblib
         suggest_assignees=False,  # ...nor on data/processed/assignments.json
+        # The fixture repository counts as calibrated, so the classifier-only
+        # comment tests exercise the scored comment. Uncalibrated behaviour
+        # (no score, no verdict, no empty comments) has its own tests below.
+        calibrated_repos=frozenset({"acme/widgets"}),
     )
     defaults.update(overrides)
     return ServiceSettings(**defaults)
@@ -2187,3 +2191,66 @@ class TestPriorIssueEnrichment:
         payload["issue"]["state"] = "open"
         assert post_webhook(client, payload).status_code == 200
         assert predictor.calls[-1]["author_has_prior_issues"] is False
+
+class TestUncalibratedFallbackComment:
+    """With no AI analysis, an uncalibrated repository gets no score and no
+    verdict; and no comment at all when there is no evidence to show."""
+
+    def _settings(self, **overrides):
+        values = {"dry_run": False, "post_comment": True, "calibrated_repos": frozenset()}
+        values.update(overrides)
+        return make_settings(**values)
+
+    def test_no_evidence_means_no_comment(self):
+        gh = StubGitHub()
+        client = make_client(self._settings(), predictor=StubPredictor(proba=0.2), gh=gh)
+        data = post_webhook(client, issue_opened_payload()).json()
+        assert gh.comments == []
+        assert "comment" not in data["actions"]
+        assert "prediction" in data  # still scored and recorded
+
+    def test_evidence_only_comment_shows_no_score_or_verdict(self):
+        from ghic.service.inference import format_comment
+
+        class Context:
+            is_empty = False
+            indexed = True
+            relevant_files = ["src/save.py"]
+            chunks: list = []
+            code_chunks: list = []
+            history_chunks: list = []
+            metadata = None
+            note = ""
+
+        pred = Prediction(repo="acme/widgets", issue_number=1, proba=0.2, threshold=0.5,
+                          predicted_label=0, model_name="stub")
+        comment = format_comment(pred, [], {"predicted": "bug", "confidence": 0.9},
+                                 repository_context=Context(), score_is_calibrated=False)
+        assert comment.startswith("### GHIC · Needs maintainer review")
+        for leaked in ("non-actionable", "actionable bug", "Confidence", "20%", "Suggested category"):
+            assert leaked not in comment, leaked
+
+    def test_calibrated_repository_keeps_the_scored_comment(self):
+        gh = StubGitHub()
+        client = make_client(
+            self._settings(calibrated_repos=frozenset({"acme/widgets"})),
+            predictor=StubPredictor(proba=0.2), gh=gh,
+        )
+        post_webhook(client, issue_opened_payload())
+        assert len(gh.comments) == 1
+        assert "non-actionable" in gh.comments[0][2]
+
+    def test_worth_commenting_rule(self):
+        from ghic.service.inference import worth_commenting_without_ai
+
+        class Empty:
+            is_empty = True
+
+        class Found:
+            is_empty = False
+
+        assert worth_commenting_without_ai(True, None, None) is True
+        assert worth_commenting_without_ai(False, None, None) is False
+        assert worth_commenting_without_ai(False, Empty(), []) is False
+        assert worth_commenting_without_ai(False, Found(), []) is True
+        assert worth_commenting_without_ai(False, None, [{"number": 1}]) is True
